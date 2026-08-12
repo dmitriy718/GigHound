@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gighound
+      POSTGRES_PASSWORD: gighound
+      POSTGRES_DB: gighound
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  # Optional: run the backend in Docker. Ollama URL defaults to
+  # http://ollama:11434/v1 inside containers (expects an 'ollama' service
+  # or container on the same network); override via OLLAMA_BASE_URL.
+  # backend:
+  #   build: ./backend
+  #   environment:
+  #     DATABASE_URL: postgresql+psycopg2://gighound:gighound@db:5432/gighound
+  #     REDIS_URL: redis://redis:6379/0
+  #     OLLAMA_BASE_URL: http://ollama:11434/v1
+  #   ports:
+  #     - "8000:8000"
+  #   depends_on: [db, redis]
+
+volumes:
+  pgdata:
