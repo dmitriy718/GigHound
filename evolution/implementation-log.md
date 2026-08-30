@@ -523,3 +523,26 @@ green** after the fix.
 
 **Still unverified (unchanged, environmental):** Docker image builds, live-platform selectors,
 worker↔backend loop against a live stack, real LLM output quality.
+
+---
+
+## 2026-08-30 — CI check + real-LLM generation test + output-quality fixes
+
+**CI:** the pushed commit's CI run failed all 4 jobs in seconds — NOT a code issue: GitHub
+Actions refused to start them ("account is locked due to a billing issue"). Workflow validates
+locally; runs will execute once the account's billing is resolved. (User action required on
+github.com billing settings.)
+
+**Real-LLM test (LAN Ollama, qwen3:4b, live HTTP path):** ingest → score (62.6) → analysis →
+draft. The pipeline genuinely works with a real model: correct skill/deliverable extraction,
+platform-tuned draft, one clarifying question, word cap respected, gap-honesty visible
+("No NestJS backend experience on my end, but…"). Two real output-quality issues found & fixed:
+1. **Bid above client max:** calculate_bid's cap only triggered at >1.2× budget_max and the
+   won-bid nudge ran after it → bid $6,300 on a $4–6k job. Now: hard cap at budget_max × 0.98,
+   applied after the nudge (verified live: $5,880 with transparent rationale).
+2. **Personality marker misfire:** inject_personality prepended "Funny enough," to a
+   subordinate clause ("Funny enough, since your WebSocket endpoints…") — the exact
+   security-theater behavior pass2 flagged. Now: only first-person declarative mid-text
+   sentences are eligible; no eligible sentence → text untouched. Verified live: marker lands
+   naturally ("Here's the thing — my portfolio includes…").
+Suite: **217/217 green**.
