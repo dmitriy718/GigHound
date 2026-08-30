@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gighound
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gighound
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gighound -d gighound"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r backend/requirements-dev.txt
+      - name: Run tests (SQLite)
+        working-directory: backend
+        run: python -m pytest -q
+      # Second pass against real services: endpoint tests still override the
+      # DB dependency with SQLite, but app-level code (config, SessionLocal
+      # users, Redis-backed cache/rate paths) now runs against Postgres +
+      # Redis instead of the graceful-degradation fallbacks.
+      - name: Run tests (Postgres + Redis services)
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+psycopg2://gighound:postgres@localhost:5432/gighound
+          REDIS_URL: redis://localhost:6379/0
+        run: python -m pytest -q
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r worker/requirements.txt
+      - name: Run tests
+        run: python -m pytest -q worker/tests
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Type-check
+        working-directory: frontend
+        run: npx tsc -b
+      - name: Build
+        working-directory: frontend
+        run: npx vite build
+
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install pip-audit
+        run: pip install pip-audit
+      # Fails the build on known vulnerabilities.
+      #
+      # Documented ignore list (re-check on every dependency refresh, drop
+      # entries as fixes become installable):
+      #   starlette — fastapi 0.115.* caps starlette <0.47; all fixes below
+      #   land in starlette 0.47.2+ / 1.x, i.e. they require a fastapi
+      #   major-line upgrade, which is a dedicated task (app uses only the
+      #   FastAPI surface; risk accepted for now, revisit by 2026-10).
+      - name: Audit runtime dependencies
+        run: >-
+          pip-audit -r backend/requirements.txt
+          --ignore-vuln PYSEC-2026-161
+          --ignore-vuln PYSEC-2026-248
+          --ignore-vuln PYSEC-2026-249
+          --ignore-vuln PYSEC-2026-1941
+          --ignore-vuln PYSEC-2026-1942
+          --ignore-vuln PYSEC-2026-2280
+          --ignore-vuln PYSEC-2026-2281

@@ -1,0 +1,21 @@
+# Stealth-browser worker override (AD-4). Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.worker.yml up worker
+# The base compose file provides the `backend` service; if you run the backend
+# outside Docker instead, point GIGHOUND_API_URL at it.
+services:
+  worker:
+    build: ./worker
+    env_file:
+      - path: .env
+        required: false  # worker also takes plain environment variables
+    environment:
+      GIGHOUND_API_URL: ${GIGHOUND_API_URL:-http://backend:8000}
+      GIGHOUND_WORKER_TOKEN: ${GIGHOUND_WORKER_TOKEN:?set GIGHOUND_WORKER_TOKEN}
+      WORKER_SESSION_DIR: /app/.sessions
+    volumes:
+      # persistent per-(platform, user) browser sessions
+      - worker_sessions:/app/.sessions
+    depends_on: [backend]
+
+volumes:
+  worker_sessions:

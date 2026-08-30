@@ -134,6 +134,11 @@ export default function SearchFineTuning() {
     <div>
       <h1>Search Fine-Tuning</h1>
       <p className="page-sub">Manage search filter presets and preview what they match.</p>
+      <p className="muted" style={{ fontSize: 12, marginTop: -18, marginBottom: 24 }}>
+        A filter linked to a search profile gates what gets drafted — jobs that fail it never
+        reach the proposal queue. Jobs scoring below the lowest quality_threshold across your
+        filters are auto-archived at ingest.
+      </p>
       <ErrorBanner error={error} />
       {notice && <div className="info-banner">{notice}</div>}
 

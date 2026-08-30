@@ -29,10 +29,10 @@ def _mock_transport(handler):
 
 # ---------------- provider resolution ----------------
 
-def test_default_provider_is_ollama_lan(monkeypatch):
+def test_default_provider_is_ollama_local(monkeypatch):
     monkeypatch.setattr(textgen, "_running_in_docker", lambda: False)
     assert resolve_provider() == "ollama"
-    assert textgen.ollama_base_url() == "http://192.168.1.68:11434/v1"
+    assert textgen.ollama_base_url() == "http://localhost:11434/v1"
 
 
 def test_default_provider_is_ollama_docker(monkeypatch):

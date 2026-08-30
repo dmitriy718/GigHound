@@ -5,13 +5,13 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.auth import hash_password
 from app.boolquery import BooleanQueryError, matches_boolean_query, parse_boolean_query
 from app.database import Base
 from app.models import (Keyword, KeywordGroup, PortfolioItem, ProfileTemplate,
                         ProposalQueueItem, RateCardEntry, SearchFilter,
-                        SearchProfile, Job)
-from app.orchestrator import (generate_proposal, maybe_queue_proposal,
-                              select_portfolio_items)
+                        SearchProfile, Job, User)
+from app.orchestrator import maybe_queue_proposal, select_portfolio_items
 from app.schemas import ClientInfo, JobIngest
 from app.scoring import compute_quality_score
 
@@ -23,6 +23,15 @@ def db():
     session = sessionmaker(bind=engine)()
     yield session
     session.close()
+
+
+@pytest.fixture()
+def user(db):
+    u = User(email="orch-test@example.com",
+             password_hash=hash_password("password123"), display_name="Orch Test")
+    db.add(u)
+    db.commit()
+    return u
 
 
 class KW:
@@ -136,48 +145,38 @@ def test_boolean_syntax_error():
 
 # ---------------- Orchestrator ----------------
 
-def _seed_profile_assets(db):
-    db.add(ProfileTemplate(platform="upwork", name="Default",
-                           pitch_template="About \"{job_title}\": I work with {skills}. "
-                                          "See {portfolio_links}. Rate: {rate_line}"))
-    db.add(PortfolioItem(title="React SaaS Dashboard", url="https://pf/1", tags=["react", "typescript"]))
-    db.add(PortfolioItem(title="Logo Pack", url="https://pf/2", tags=["logo", "branding"]))
-    db.add(RateCardEntry(skill_category="React", hourly_rate=75, fixed_min=1500, currency="USD"))
+def _seed_profile_assets(db, user_id):
+    db.add(ProfileTemplate(user_id=user_id, platform="upwork", name="Default",
+                           pitch_template="Hi {{client_name}}, about \"{{job_title}}\": "
+                                          "I deliver {{deliverable}}. See {{portfolio_piece}}. "
+                                          "Rate: {{rate_line}} — {{your_name}}"))
+    db.add(PortfolioItem(user_id=user_id, title="React SaaS Dashboard", url="https://pf/1",
+                         tags=["react", "typescript"]))
+    db.add(PortfolioItem(user_id=user_id, title="Logo Pack", url="https://pf/2",
+                         tags=["logo", "branding"]))
+    db.add(RateCardEntry(user_id=user_id, skill_category="React",
+                         hourly_rate=75, fixed_min=1500, currency="USD"))
     db.commit()
 
 
-def test_portfolio_auto_select(db):
-    _seed_profile_assets(db)
-    job = Job(external_id="x", platform="upwork", title="React dashboard",
+def test_portfolio_auto_select(db, user):
+    _seed_profile_assets(db, user.id)
+    job = Job(user_id=user.id, external_id="x", platform="upwork", title="React dashboard",
               skills=["React", "TypeScript"])
-    selected = select_portfolio_items(db, job)
+    selected = select_portfolio_items(db, user.id, job)
     assert [p.title for p in selected] == ["React SaaS Dashboard"]
 
 
-def test_generate_proposal_uses_template_rate_portfolio(db):
-    _seed_profile_assets(db)
-    job = Job(external_id="x", platform="upwork", title="React dashboard build",
-              skills=["React"], job_type="fixed", budget_usd_min=4000, budget_usd_max=6000,
-              client_info={"country": "US"})
-    db.add(job)
-    db.commit()
-    draft = generate_proposal(db, job)
-    assert "React dashboard build" in draft["proposal_text"]
-    assert "https://pf/1" in draft["proposal_text"]
-    assert "$75/hr" in draft["proposal_text"]
-    assert draft["bid_amount"] == 5000.0
-    assert draft["template_id"] is not None
-
-
 @pytest.mark.asyncio
-async def test_maybe_queue_proposal_pipeline(db):
-    _seed_profile_assets(db)
-    db.add(SearchProfile(name="react only", boolean_query="(React OR Next.js) AND (NOT WordPress)",
+async def test_maybe_queue_proposal_pipeline(db, user):
+    _seed_profile_assets(db, user.id)
+    db.add(SearchProfile(user_id=user.id, name="react only",
+                         boolean_query="(React OR Next.js) AND (NOT WordPress)",
                          auto_queue_proposals=True))
-    good = Job(external_id="g", platform="upwork", title="React app", skills=["React"],
-               description="react work", status="new", job_type="fixed")
-    bad = Job(external_id="b", platform="upwork", title="WordPress site", skills=["WordPress"],
-              description="wordpress work", status="new", job_type="fixed")
+    good = Job(user_id=user.id, external_id="g", platform="upwork", title="React app",
+               skills=["React"], description="react work", status="new", job_type="fixed")
+    bad = Job(user_id=user.id, external_id="b", platform="upwork", title="WordPress site",
+              skills=["WordPress"], description="wordpress work", status="new", job_type="fixed")
     db.add_all([good, bad])
     db.commit()
 

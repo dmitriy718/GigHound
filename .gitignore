@@ -34,6 +34,10 @@ coverage/
 *.sqlite
 *.sqlite3
 celerybeat-schedule*
+.vault-dev-key
+
+# Stealth worker browser sessions (contain login state — never commit)
+worker/.sessions/
 
 # Editor and operating-system files
 .idea/

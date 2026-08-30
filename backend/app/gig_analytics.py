@@ -15,6 +15,7 @@ def record_metrics(db: Session, gig: Gig, impressions: int, clicks: int,
     """Store a weekly snapshot and attach auto-suggestions."""
     week = week or datetime.now(timezone.utc).strftime("%G-W%V")
     metric = GigMetric(
+        user_id=gig.user_id,
         gig_id=gig.id, week=week, impressions=impressions, clicks=clicks,
         orders=orders, revenue=revenue,
         suggestions=build_suggestions(impressions, clicks, orders),
@@ -68,9 +69,10 @@ def competitor_price_analysis(snapshot_gigs: list[dict], my_price: float | None)
     return insights
 
 
-def store_competitor_snapshot(db: Session, platform: str, category: str,
+def store_competitor_snapshot(db: Session, user_id: int, platform: str, category: str,
                               gigs: list[dict], my_price: float | None = None) -> CompetitorSnapshot:
     snap = CompetitorSnapshot(
+        user_id=user_id,
         platform=platform, category=category, gigs=gigs,
         insights=competitor_price_analysis(gigs, my_price),
     )
@@ -80,15 +82,18 @@ def store_competitor_snapshot(db: Session, platform: str, category: str,
     return snap
 
 
-def enqueue_metrics_scrape(db: Session) -> list[StealthTask]:
+def enqueue_metrics_scrape(db: Session, user_id: int) -> list[StealthTask]:
     """Weekly task: one stealth scrape per platform with active gigs."""
-    platforms = [p for (p,) in db.query(Gig.platform).distinct().all()]
+    platforms = [p for (p,) in db.query(Gig.platform).filter(Gig.user_id == user_id).distinct().all()]
     tasks = []
     for platform in platforms:
         allowed, reason = circuit_breaker.check(platform)
         task = StealthTask(
+            user_id=user_id,
             platform=platform, task_type="gig_scrape_metrics",
-            payload={"gigs": [g.id for g in db.query(Gig).filter(Gig.platform == platform).all()]},
+            payload={"gigs": [{"id": g.id, "url": g.url, "title": g.title}
+                              for g in db.query(Gig).filter(
+                                  Gig.user_id == user_id, Gig.platform == platform).all()]},
             status="pending" if allowed else "skipped_circuit_open",
             result={} if allowed else {"reason": reason},
         )
@@ -100,7 +105,7 @@ def enqueue_metrics_scrape(db: Session) -> list[StealthTask]:
     db.commit()
     for t in tasks:
         db.refresh(t)
-    db.add(AuditLog(action_type="gig_metrics_scrape_queued",
+    db.add(AuditLog(user_id=user_id, action_type="gig_metrics_scrape_queued",
                     detail={"platforms": [t.platform for t in tasks]}))
     db.commit()
     return tasks

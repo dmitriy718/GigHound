@@ -216,12 +216,18 @@ export default function AlertsPanel({ messages, status }: Props) {
                 <span className="muted">
                   {new Date(m.receivedAt).toLocaleTimeString()}
                 </span>{' '}
-                <span className={`log-type ${m.type === 'hot_job' ? 'hot' : ''}`}>{m.type}</span>{' '}
-                {'job' in m && m.job
-                  ? (m.job as Job).title
-                  : 'jobs' in m && Array.isArray(m.jobs)
-                    ? `${m.jobs.length} jobs`
-                    : JSON.stringify(m)}
+                <span
+                  className={`log-type ${m.type === 'hot_job' || m.type === 'client_replied' ? 'hot' : ''}`}
+                >
+                  {m.type}
+                </span>{' '}
+                {m.type === 'client_replied' && 'proposal_id' in m
+                  ? `proposal #${m.proposal_id} — ${'snippet' in m && m.snippet ? m.snippet : '(no snippet)'}`
+                  : 'job' in m && m.job
+                    ? (m.job as Job).title
+                    : 'jobs' in m && Array.isArray(m.jobs)
+                      ? `${m.jobs.length} jobs`
+                      : JSON.stringify(m)}
               </div>
             ))}
           </div>

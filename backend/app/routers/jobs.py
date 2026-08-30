@@ -1,19 +1,37 @@
 import logging
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from rapidfuzz import fuzz
 from sqlalchemy.orm import Session
 
+from ..auth import get_current_user, get_owned, scoped
 from ..cache import cache
 from ..database import get_db
-from ..models import AlertSettings, Job, KeywordGroup, SearchFilter
-from ..schemas import IngestResult, JobIngest, JobOut
-from ..scoring import compute_quality_score, to_usd
-from ..ws_manager import alerts
+from ..ingest import run_ingest, scoring_keywords  # noqa: F401 — re-exported
+from ..models import Job, User
+from ..schemas import (BulkArchiveAction, IngestJobsIn, IngestResult, JobOut,
+                       ScorePreviewIn, ScorePreviewOut)
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 log = logging.getLogger(__name__)
+
+INGEST_RATE_LIMIT = 30          # requests per window per user
+INGEST_RATE_WINDOW_SECONDS = 60
+
+
+def _check_ingest_rate(user: User) -> None:
+    """429 when the ingest bucket overflows; graceful no-op if Redis is down."""
+    if cache._r is None:
+        return
+    key = f"ingest_rate:{user.id}"
+    try:
+        hits = cache._r.incr(key)
+        if hits == 1:
+            cache._r.expire(key, INGEST_RATE_WINDOW_SECONDS)
+    except Exception:  # noqa: BLE001 — the limiter must never block ingestion
+        log.warning("ingest rate limiter unavailable; skipping")
+        return
+    if hits > INGEST_RATE_LIMIT:
+        raise HTTPException(429, f"ingest rate limit exceeded ({INGEST_RATE_LIMIT}/min)")
 
 
 @router.get("", response_model=dict)
@@ -24,8 +42,9 @@ def list_jobs(
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    q = db.query(Job)
+    q = scoped(db, Job, user)
     if status:
         q = q.filter(Job.status == status)
     if platform:
@@ -38,16 +57,21 @@ def list_jobs(
 
 
 @router.get("/{job_id}", response_model=JobOut)
-def get_job(job_id: int, db: Session = Depends(get_db)):
-    job = db.get(Job, job_id)
+def get_job(job_id: int, db: Session = Depends(get_db),
+            user: User = Depends(get_current_user)):
+    job = get_owned(db, Job, job_id, user)
     if not job:
         raise HTTPException(404, "job not found")
-    return job
+    from ..client_intel import client_history_for_job
+    out = JobOut.model_validate(job)
+    out.client_history = client_history_for_job(db, user.id, job)
+    return out
 
 
 @router.post("/{job_id}/archive", response_model=JobOut)
-def archive_job(job_id: int, db: Session = Depends(get_db)):
-    job = db.get(Job, job_id)
+def archive_job(job_id: int, db: Session = Depends(get_db),
+                user: User = Depends(get_current_user)):
+    job = get_owned(db, Job, job_id, user)
     if not job:
         raise HTTPException(404, "job not found")
     job.status = "archived"
@@ -57,9 +81,27 @@ def archive_job(job_id: int, db: Session = Depends(get_db)):
     return job
 
 
+@router.post("/bulk-archive", response_model=dict)
+def bulk_archive_jobs(body: BulkArchiveAction, db: Session = Depends(get_db),
+                      user: User = Depends(get_current_user)):
+    """Archive many jobs at once. Unknown/foreign ids land in `skipped`."""
+    archived, skipped = [], []
+    for jid in body.ids:
+        job = get_owned(db, Job, jid, user)
+        if not job or job.status == "archived":
+            skipped.append(jid)
+            continue
+        job.status = "archived"
+        archived.append(jid)
+    db.commit()
+    cache.invalidate_prefix("preview:")
+    return {"archived": archived, "skipped": skipped}
+
+
 @router.post("/{job_id}/unarchive", response_model=JobOut)
-def unarchive_job(job_id: int, db: Session = Depends(get_db)):
-    job = db.get(Job, job_id)
+def unarchive_job(job_id: int, db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    job = get_owned(db, Job, job_id, user)
     if not job:
         raise HTTPException(404, "job not found")
     job.status = "new"
@@ -69,117 +111,25 @@ def unarchive_job(job_id: int, db: Session = Depends(get_db)):
     return job
 
 
-def _market_rate_for(db: Session, item) -> float | None:
-    """Hourly market rate for budget realism: rate card match → None (default)."""
-    from ..orchestrator import pick_rate
-    from ..models import Job as _Job  # pick_rate expects a Job-like with skills/title
-
-    probe = _Job(title=item.title, external_id=item.external_id,
-                 platform=item.platform, skills=item.skills)
-    entry = pick_rate(db, probe)
-    return entry.hourly_rate if entry and entry.hourly_rate else None
-
-
-def _find_duplicate(db: Session, job: Job) -> Job | None:
-    """Cross-platform duplicate detection via fuzzy title+description match."""
-    candidates = (
-        db.query(Job)
-        .filter(Job.status != "archived", Job.id != job.id)
-        .order_by(Job.fetched_at.desc())
-        .limit(200)
-        .all()
-    )
-    for other in candidates:
-        title_sim = fuzz.token_set_ratio(job.title.lower(), other.title.lower())
-        if title_sim >= 90:
-            desc_sim = fuzz.token_set_ratio(
-                (job.description or "")[:500].lower(), (other.description or "")[:500].lower()
-            )
-            if desc_sim >= 80:
-                return other
-    return None
-
-
 @router.post("/ingest", response_model=IngestResult)
-async def ingest_jobs(body: dict, db: Session = Depends(get_db)):
-    """Adapter entry point: score, dedupe, auto-archive, alert."""
-    items = [JobIngest(**j) for j in body.get("jobs", [])]
-    settings = db.query(AlertSettings).first()
-    filters = db.query(SearchFilter).all()
-    groups = {g.id: g for g in db.query(KeywordGroup).all()}
+async def ingest_jobs(body: IngestJobsIn, db: Session = Depends(get_db),
+                      user: User = Depends(get_current_user)):
+    """Adapter entry point: score, dedupe, auto-archive, alert.
 
-    ingested = auto_archived = alerts_sent = 0
-    for item in items:
-        existing = (
-            db.query(Job)
-            .filter(Job.platform == item.platform, Job.external_id == item.external_id)
-            .first()
-        )
-        if existing:
-            continue
+    Typed body (422 on malformed input) + per-user Redis token bucket —
+    this is the untrusted-input entry point and an LLM-cost amplifier.
+    """
+    _check_ingest_rate(user)
+    return await run_ingest(body, db, user)
 
-        job = Job(**item.model_dump())
-        job.budget_usd_min = to_usd(item.budget_min, item.currency)
-        job.budget_usd_max = to_usd(item.budget_max, item.currency)
 
-        # Score against the union of all keyword groups referenced by filters;
-        # fall back to all groups if no filter references one.
-        referenced = {f.keyword_group_id for f in filters if f.keyword_group_id}
-        kws = []
-        for gid in (referenced or set(groups.keys())):
-            g = groups.get(gid)
-            if g:
-                kws.extend(g.keywords)
-        scored = compute_quality_score(item, kws, market_rate=_market_rate_for(db, item))
-        job.quality_score = scored["quality_score"]
-        job.score_breakdown = scored["score_breakdown"]
-        job.red_flags = scored["red_flags"]
+@router.post("/score-preview", response_model=ScorePreviewOut)
+def score_preview(body: ScorePreviewIn, db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    """Dry-run scoring (ScoringConfig playground): pure scoring, persists
+    nothing, queues nothing. Negative-keyword semantics identical to ingest."""
+    from ..ingest import _market_rate_for
+    from ..scoring import compute_quality_score
 
-        db.add(job)
-        db.flush()  # assign id before dedup check
-
-        dup = _find_duplicate(db, job)
-        if dup:
-            job.is_duplicate = True
-            job.duplicate_of = dup.id
-            job.red_flags = (job.red_flags or []) + ["duplicate posting"]
-
-        # Auto-archive below the strictest (lowest) active threshold
-        thresholds = [f.quality_threshold for f in filters]
-        if thresholds and job.quality_score < min(thresholds):
-            job.status = "archived"
-            auto_archived += 1
-            db.commit()
-            continue
-
-        db.commit()
-        db.refresh(job)
-        ingested += 1
-
-        # Real-time feed: every ingested job streams to the dashboard
-        job_payload = JobOut.model_validate(job).model_dump(mode="json")
-        await alerts.broadcast({"type": "job_ingested", "job": job_payload})
-
-        # Auto-match pipeline: score cleared threshold → draft proposal → review queue
-        from ..orchestrator import maybe_queue_proposal
-        queued = await maybe_queue_proposal(db, job)
-        if queued:
-            db.refresh(job)
-
-        # Real-time / hot-job alerts (hot: ≥90 score, <5 proposals, posted <1h by default)
-        if settings and settings.realtime_enabled and job.quality_score >= settings.min_score_alert:
-            now = datetime.now(timezone.utc)
-            posted = job.posted_at
-            if posted and posted.tzinfo is None:
-                posted = posted.replace(tzinfo=timezone.utc)
-            fresh = posted and (now - posted).total_seconds() / 3600 <= settings.hot_job_posted_hours
-            quiet = (job.proposals_count or 0) < settings.hot_job_max_proposals
-            strong = job.quality_score >= getattr(settings, "hot_job_min_score", 90.0)
-            msg_type = "hot_job" if (settings.hot_job_enabled and fresh and quiet and strong) else "job_alert"
-            await alerts.broadcast({"type": msg_type, "job": job_payload})
-            job.status = "notified"
-            db.commit()
-            alerts_sent += 1
-
-    cache.invalidate_prefix("preview:")
-    return IngestResult(ingested=ingested, auto_archived=auto_archived, alerts_sent=alerts_sent)
+    return compute_quality_score(body.job, scoring_keywords(db, user),
+                                 market_rate=_market_rate_for(db, user.id, body.job))

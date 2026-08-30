@@ -4,7 +4,7 @@ import logging
 
 import httpx
 
-from .ratelimit import AsyncRateLimiter, request_with_retry
+from .ratelimit import consume_daily_action, get_limiter, request_with_retry
 from .schema import JobPosting
 
 log = logging.getLogger(__name__)
@@ -25,15 +25,25 @@ class QuotaDepletedError(AdapterError):
 class PlatformAdapter(abc.ABC):
     platform: str = ""
     rate_per_sec: float = 2.0
+    principal: str = "default"
 
-    def __init__(self, client: httpx.AsyncClient | None = None):
+    def __init__(self, client: httpx.AsyncClient | None = None,
+                 principal: str | None = None):
         self._owns_client = client is None
         self.client = client or httpx.AsyncClient(timeout=30.0)
-        self.limiter = AsyncRateLimiter(self.rate_per_sec)
+        if principal is not None:
+            self.principal = principal
+        # Shared per (platform, principal): routers/tasks build a fresh
+        # adapter per request, so pacing must outlive the instance.
+        self.limiter = get_limiter(self.platform, self.principal, self.rate_per_sec)
 
     async def close(self):
         if self._owns_client:
             await self.client.aclose()
+
+    def _consume_daily_action(self) -> int:
+        """Count one platform-touching action against today's budget."""
+        return consume_daily_action(self.platform, self.principal)
 
     async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
         return await request_with_retry(self.client, method, url, limiter=self.limiter, **kwargs)

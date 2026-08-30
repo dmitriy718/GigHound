@@ -1,23 +1,31 @@
 import { useEffect, useState } from 'react';
-import { archiveJob, getJobs, unarchiveJob } from '../api/client';
-import type { Job, JobStatus, Platform } from '../types';
+import { archiveJob, bulkArchiveJobs, getJob, getJobs, unarchiveJob } from '../api/client';
+import type { ClientHistory, Job, JobStatus, Platform } from '../types';
 import { PLATFORMS } from '../types';
-import type { AlertMessage } from '../hooks/useAlertsSocket';
+import { useNewAlertMessages, type AlertMessage } from '../hooks/useAlertsSocket';
 import { ErrorBanner, ScoreBadge, ScoreBars, formatDate } from '../components/common';
+import OnboardingChecklist from '../components/OnboardingChecklist';
+import type { ViewKey } from '../App';
 
 interface Props {
-  lastMessage: AlertMessage | null;
+  messages: AlertMessage[];
+  onNavigate: (view: ViewKey) => void;
 }
 
-export default function JobFeed({ lastMessage }: Props) {
+export default function JobFeed({ messages, onNavigate }: Props) {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [total, setTotal] = useState(0);
   const [status, setStatus] = useState<JobStatus | ''>('new');
   const [platform, setPlatform] = useState<Platform | ''>('');
   const [minScore, setMinScore] = useState(0);
   const [selected, setSelected] = useState<Job | null>(null);
+  // Phase 3: client outcome history — only on the job detail endpoint, so fetched on drawer open
+  const [clientHistory, setClientHistory] = useState<ClientHistory | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [toast, setToast] = useState<Job | null>(null);
+  const [checked, setChecked] = useState<Set<number>>(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const load = () => {
     getJobs({
@@ -36,25 +44,34 @@ export default function JobFeed({ lastMessage }: Props) {
 
   useEffect(load, [status, platform, minScore]);
 
-  // Live updates from the shared alerts socket
-  useEffect(() => {
-    if (!lastMessage) return;
-    if (
-      lastMessage.type === 'job_alert' ||
-      lastMessage.type === 'hot_job' ||
-      lastMessage.type === 'job_ingested'
-    ) {
-      const job = lastMessage.job;
+  // Live updates from the shared alerts socket — every unseen message is processed,
+  // so bursts collapsed by React batching are not dropped
+  useNewAlertMessages(messages, (msg) => {
+    if (msg.type === 'job_alert' || msg.type === 'hot_job' || msg.type === 'job_ingested') {
+      const job = msg.job;
       if (job) {
         // Dedupe by id — job_alert/hot_job/job_ingested may carry the same job
         setJobs((prev) => (prev.some((j) => j.id === job.id) ? prev : [job, ...prev]));
-        if (lastMessage.type === 'hot_job') {
+        if (msg.type === 'hot_job') {
           setToast(job);
           window.setTimeout(() => setToast(null), 8000);
         }
       }
     }
-  }, [lastMessage]);
+  });
+
+  const openJob = (job: Job) => {
+    setSelected(job);
+    setClientHistory(null);
+    getJob(job.id)
+      .then((detail) => setClientHistory(detail.client_history ?? null))
+      .catch(() => setClientHistory(null)); // history is cosmetic — ignore failure
+  };
+
+  const closeDrawer = () => {
+    setSelected(null);
+    setClientHistory(null);
+  };
 
   const toggleArchive = async (job: Job) => {
     try {
@@ -67,11 +84,43 @@ export default function JobFeed({ lastMessage }: Props) {
     }
   };
 
+  const toggleChecked = (id: number) =>
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  // Selects every job matching the current filter (i.e. all loaded rows)
+  const selectAllVisible = () => setChecked(new Set(jobs.map((j) => j.id)));
+
+  const bulkArchive = async () => {
+    setBulkBusy(true);
+    try {
+      const res = await bulkArchiveJobs([...checked]);
+      setNotice(
+        `Archived ${res.archived.length} job${res.archived.length === 1 ? '' : 's'}` +
+          (res.skipped.length > 0 ? ` · ${res.skipped.length} skipped` : ''),
+      );
+      window.setTimeout(() => setNotice(null), 5000);
+      setChecked(new Set());
+      setError(null);
+      load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
   return (
     <div>
       <h1>Job Feed</h1>
       <p className="page-sub">{total} jobs total · live updates via WebSocket</p>
+      <OnboardingChecklist onNavigate={onNavigate} />
       <ErrorBanner error={error} />
+      {notice && <div className="info-banner">{notice}</div>}
 
       {toast && (
         <div className="toast">
@@ -116,12 +165,37 @@ export default function JobFeed({ lastMessage }: Props) {
         <button className="btn secondary" onClick={load}>
           Refresh
         </button>
+        <button className="btn secondary" onClick={selectAllVisible} disabled={jobs.length === 0}>
+          Select all
+        </button>
+        {checked.size > 0 && (
+          <>
+            <button className="btn danger" disabled={bulkBusy} onClick={bulkArchive}>
+              {bulkBusy ? 'Archiving…' : `Archive selected (${checked.size})`}
+            </button>
+            <button className="btn secondary" onClick={() => setChecked(new Set())}>
+              Clear
+            </button>
+          </>
+        )}
       </div>
 
       <div className="job-list">
         {jobs.length === 0 && !error && <p className="muted">No jobs match these filters.</p>}
         {jobs.map((job) => (
-          <div className="job-row" key={job.id} onClick={() => setSelected(job)}>
+          <div
+            className={`job-row ${checked.has(job.id) ? 'checked' : ''}`}
+            key={job.id}
+            onClick={() => openJob(job)}
+          >
+            <input
+              type="checkbox"
+              className="row-check job-check"
+              checked={checked.has(job.id)}
+              onClick={(e) => e.stopPropagation()}
+              onChange={() => toggleChecked(job.id)}
+              aria-label="Select for bulk archive"
+            />
             <ScoreBadge score={job.quality_score} />
             <div>
               <div className="job-title">{job.title}</div>
@@ -145,9 +219,9 @@ export default function JobFeed({ lastMessage }: Props) {
 
       {selected && (
         <>
-          <div className="drawer-backdrop" onClick={() => setSelected(null)} />
+          <div className="drawer-backdrop" onClick={closeDrawer} />
           <div className="drawer">
-            <button className="btn secondary small drawer-close" onClick={() => setSelected(null)}>
+            <button className="btn secondary small drawer-close" onClick={closeDrawer}>
               Close
             </button>
             <h2>{selected.title}</h2>
@@ -222,6 +296,26 @@ export default function JobFeed({ lastMessage }: Props) {
                 </tr>
               </tbody>
             </table>
+
+            {clientHistory && (
+              <>
+                <h3>Client history</h3>
+                <p
+                  style={{
+                    marginTop: 0,
+                    color:
+                      clientHistory.hired > 0
+                        ? 'var(--green)'
+                        : clientHistory.ghosted > clientHistory.hired
+                          ? 'var(--amber)'
+                          : 'var(--text-dim)',
+                  }}
+                >
+                  Bid {clientHistory.past_proposals}× before — {clientHistory.hired} hired ·{' '}
+                  {clientHistory.rejected} rejected · {clientHistory.ghosted} ghosted
+                </p>
+              </>
+            )}
 
             <h3>Description</h3>
             <p style={{ whiteSpace: 'pre-wrap' }}>{selected.description}</p>

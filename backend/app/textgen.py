@@ -6,7 +6,9 @@ Provider resolution (first match wins):
   3. LLM_API_KEY set              — hosted OpenAI-compatible provider
   4. fallback: Ollama with environment-based default URL:
        - Docker container:  http://ollama:11434/v1
-       - direct on LAN:     http://192.168.1.68:11434/v1
+       - local machine:     http://localhost:11434/v1
+     Anything else (remote Ollama host, LAN box, …) must set OLLAMA_BASE_URL
+     explicitly.
 
 Ollama configuration (all env-driven, nothing hardcoded in call sites):
   OLLAMA_BASE_URL     — see defaults above
@@ -32,7 +34,7 @@ PROMPT_VERSION = "v1.1"
 # --- env config (resolved lazily so tests can monkeypatch) ---
 
 _DOCKER_OLLAMA_DEFAULT = "http://ollama:11434/v1"
-_LAN_OLLAMA_DEFAULT = "http://192.168.1.68:11434/v1"
+_LOCAL_OLLAMA_DEFAULT = "http://localhost:11434/v1"
 
 
 def _running_in_docker() -> bool:
@@ -43,7 +45,7 @@ def ollama_base_url() -> str:
     url = os.getenv("OLLAMA_BASE_URL")
     if url:
         return url.rstrip("/")
-    return (_DOCKER_OLLAMA_DEFAULT if _running_in_docker() else _LAN_OLLAMA_DEFAULT)
+    return (_DOCKER_OLLAMA_DEFAULT if _running_in_docker() else _LOCAL_OLLAMA_DEFAULT)
 
 
 def ollama_model() -> str:

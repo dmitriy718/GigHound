@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import (JSON, Boolean, DateTime, Float, ForeignKey, Integer,
-                        String, Text)
+                        String, Text, UniqueConstraint)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -16,10 +16,30 @@ def utcnow():
 JSONType = JSON().with_variant(JSONB, "postgresql")
 
 
+class User(Base):
+    """A tenant account. Every tenant-owned row references users.id."""
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(200), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(200), default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+def _user_fk():
+    """Tenant ownership column: indexed, non-null FK to users.id (AD-1)."""
+    return mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+
 class KeywordGroup(Base):
     __tablename__ = "keyword_groups"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     service_type: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -45,6 +65,7 @@ class SearchFilter(Base):
     __tablename__ = "search_filters"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     keyword_group_id: Mapped[int | None] = mapped_column(
         ForeignKey("keyword_groups.id", ondelete="SET NULL"), nullable=True
@@ -65,8 +86,13 @@ class SearchFilter(Base):
 
 class Job(Base):
     __tablename__ = "jobs"
+    __table_args__ = (
+        UniqueConstraint("user_id", "platform", "external_id",
+                         name="uq_jobs_user_platform_external"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     external_id: Mapped[str] = mapped_column(String(300), nullable=False, index=True)
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -80,6 +106,9 @@ class Job(Base):
     budget_usd_max: Mapped[float | None] = mapped_column(Float, nullable=True)
     experience_level: Mapped[str | None] = mapped_column(String(20), nullable=True)
     client_info: Mapped[dict] = mapped_column(JSONType, default=dict)
+    # denormalized client identity key (see client_intel.client_key_for) —
+    # indexed so client-history lookups are keyed queries, not table scans
+    client_key: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
     proposals_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     skills: Mapped[list] = mapped_column(JSONType, default=list)
     languages: Mapped[list] = mapped_column(JSONType, default=list)
@@ -98,8 +127,12 @@ class Job(Base):
 
 class AlertSettings(Base):
     __tablename__ = "alert_settings"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_alert_settings_user"),  # per-user singleton
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     realtime_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     min_score_alert: Mapped[float] = mapped_column(Float, default=70.0)
     digest_mode: Mapped[str] = mapped_column(String(10), default="off")  # off|hourly|daily
@@ -113,6 +146,7 @@ class ProfileTemplate(Base):
     __tablename__ = "profile_templates"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     pitch_template: Mapped[str] = mapped_column(Text, default="")
@@ -123,6 +157,7 @@ class PortfolioItem(Base):
     __tablename__ = "portfolio_items"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     url: Mapped[str] = mapped_column(String(1000), default="")
@@ -134,6 +169,7 @@ class RateCardEntry(Base):
     __tablename__ = "rate_card"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     skill_category: Mapped[str] = mapped_column(String(200), nullable=False)
     hourly_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     fixed_min: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -148,8 +184,13 @@ class AdapterCredential(Base):
     tokens/secrets; plaintext never touches the DB.
     """
     __tablename__ = "adapter_credentials"
+    __table_args__ = (
+        UniqueConstraint("user_id", "platform", "principal",
+                         name="uq_adapter_credentials_user_platform_principal"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     principal: Mapped[str] = mapped_column(String(100), nullable=False, default="default")
     blob: Mapped[str] = mapped_column(Text, nullable=False)  # Fernet-encrypted JSON
@@ -161,8 +202,13 @@ class AdapterCredential(Base):
 class AdapterState(Base):
     """Key-value operational state per adapter (bid quotas, cursors, etc.)."""
     __tablename__ = "adapter_state"
+    __table_args__ = (
+        UniqueConstraint("user_id", "platform", "key",
+                         name="uq_adapter_state_user_platform_key"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     key: Mapped[str] = mapped_column(String(100), nullable=False)
     value: Mapped[dict] = mapped_column(JSONType, default=dict)
@@ -192,12 +238,15 @@ class PlatformAccount(Base):
     __tablename__ = "platform_accounts"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     label: Mapped[str] = mapped_column(String(200), nullable=False)
     principal: Mapped[str] = mapped_column(String(100), default="default")
     mode: Mapped[str] = mapped_column(String(20), default="api")  # api|stealth|hybrid|disabled
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     credential_ref: Mapped[str] = mapped_column(String(200), default="")
+    # Platform-specific knobs: bidder_id (freelancer user id), on_behalf_of (upwork agency member)
+    settings: Mapped[dict] = mapped_column(JSONType, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -206,6 +255,7 @@ class SearchProfile(Base):
     __tablename__ = "search_profiles"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     keyword_group_id: Mapped[int | None] = mapped_column(
         ForeignKey("keyword_groups.id", ondelete="SET NULL"), nullable=True
@@ -223,6 +273,7 @@ class ProposalQueueItem(Base):
     __tablename__ = "proposal_queue"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
     platform: Mapped[str] = mapped_column(String(30), nullable=False)
     proposal_text: Mapped[str] = mapped_column(Text, default="")  # current working text
@@ -231,6 +282,8 @@ class ProposalQueueItem(Base):
     bid_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
     bid_period_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     bid_rationale: Mapped[str] = mapped_column(String(500), default="")
+    # go/no-go market intel computed at queue time: {recommendation, reason} | None
+    bid_advice: Mapped[dict | None] = mapped_column(JSONType, nullable=True)
     portfolio_item_ids: Mapped[list] = mapped_column(JSONType, default=list)
     portfolio_match: Mapped[dict] = mapped_column(JSONType, default=dict)  # id → overlap %
     template_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -239,7 +292,8 @@ class ProposalQueueItem(Base):
     needs_review: Mapped[bool] = mapped_column(Boolean, default=False)  # confidence < 50
     versions: Mapped[list] = mapped_column(JSONType, default=list)  # [{text,bid,by,at}]
     status: Mapped[str] = mapped_column(String(20), default="pending_review", index=True)
-    # pending_review | generation_failed | approved | rejected | submitted | failed
+    # pending_review | generation_failed | approved | rejected | submitted |
+    # queued_for_browser (upwork: awaiting external browser worker) | failed
     rejection_reason: Mapped[str | None] = mapped_column(String(50), nullable=True)
     rejection_notes: Mapped[str] = mapped_column(Text, default="")
     outcome: Mapped[str] = mapped_column(String(20), default="pending")
@@ -247,7 +301,11 @@ class ProposalQueueItem(Base):
     reviewed_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     submission_result: Mapped[dict] = mapped_column(JSONType, default=dict)
-    request_type: Mapped[str] = mapped_column(String(30), default="job")  # job|buyer_request
+    request_type: Mapped[str] = mapped_column(String(30), default="job")  # job|buyer_request|follow_up
+    # when False, approving does NOT mint a new Template (reviewer opt-out)
+    save_as_template: Mapped[bool] = mapped_column(Boolean, default=True)
+    client_replied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True)  # first client message after submission
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -256,6 +314,7 @@ class Template(Base):
     __tablename__ = "templates"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     text: Mapped[str] = mapped_column(Text, default="")
@@ -274,6 +333,7 @@ class RejectionFeedback(Base):
     __tablename__ = "rejection_feedback"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     proposal_id: Mapped[int] = mapped_column(ForeignKey("proposal_queue.id", ondelete="CASCADE"))
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     reason: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -286,6 +346,7 @@ class GigTemplate(Base):
     __tablename__ = "gig_templates"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     template_json: Mapped[dict] = mapped_column(JSONType, default=dict)
@@ -299,6 +360,7 @@ class Gig(Base):
     __tablename__ = "gigs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     template_id: Mapped[int | None] = mapped_column(
         ForeignKey("gig_templates.id", ondelete="SET NULL"), nullable=True
@@ -317,6 +379,7 @@ class GigMetric(Base):
     __tablename__ = "gig_metrics"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     gig_id: Mapped[int] = mapped_column(ForeignKey("gigs.id", ondelete="CASCADE"), index=True)
     week: Mapped[str] = mapped_column(String(10), nullable=False)  # ISO week, e.g. 2026-W32
     impressions: Mapped[int] = mapped_column(Integer, default=0)
@@ -331,6 +394,7 @@ class CompetitorSnapshot(Base):
     __tablename__ = "competitor_snapshots"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     category: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
     gigs: Mapped[list] = mapped_column(JSONType, default=list)  # top-N competitor gig data
@@ -349,13 +413,19 @@ class StealthTask(Base):
     __tablename__ = "stealth_tasks"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     platform: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
     task_type: Mapped[str] = mapped_column(String(50), nullable=False)
-    # fiverr_create_gig | fiverr_fetch_buyer_requests | fiverr_send_offer
-    # upwork_catalog_upsert | gig_scrape_metrics | competitor_scrape
+    # canonical kinds (app.stealth): fetch_buyer_requests | scrape_gig_metrics |
+    # scrape_competitors | create_gig_draft | submit_upwork_proposal |
+    # submit_fiverr_offer | submit_proposal
+    # legacy types still emitted by older enqueue paths: fiverr_create_gig |
+    # fiverr_fetch_buyer_requests | gig_scrape_metrics | upwork_catalog_upsert
     payload: Mapped[dict] = mapped_column(JSONType, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     # pending | claimed | done | failed | skipped_circuit_open
+    claimed_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     result: Mapped[dict] = mapped_column(JSONType, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -366,6 +436,7 @@ class AuditLog(Base):
     __tablename__ = "audit_log"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
     action_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     # proposal_generated | proposal_approved | proposal_submitted |
     # gig_created | gig_published | buyer_request_sent | ...
@@ -373,3 +444,18 @@ class AuditLog(Base):
     detail: Mapped[dict] = mapped_column(JSONType, default=dict)
     # llm_model, prompt_version, latency_ms, humanized, approved_by, platform_response...
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+from sqlalchemy import event  # noqa: E402
+
+
+@event.listens_for(Job, "before_insert")
+@event.listens_for(Job, "before_update")
+def _sync_job_client_key(mapper, connection, target: Job) -> None:
+    """Keep `client_key` derived from `client_info`+`platform` on every write,
+    so all ingest paths (HTTP ingest, discovery, buyer-request monitor) get a
+    keyed client identity without each call site opting in. Null client_info
+    identity → NULL key → no history (no backfill required for old rows)."""
+    from .client_intel import client_key_for
+
+    target.client_key = client_key_for(target.client_info, target.platform)

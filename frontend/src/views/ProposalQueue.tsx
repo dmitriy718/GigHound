@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import {
   approveProposal,
   bulkApproveProposals,
+  followUpProposal,
+  getInterviewPrep,
   getPortfolioItems,
   getProposals,
   markProposalOutcome,
@@ -11,19 +13,24 @@ import {
   suggestProposalTemplates,
 } from '../api/client';
 import type {
+  BidAdvice,
+  InterviewPrep,
+  Platform,
   PortfolioItem,
   ProposalOutcome,
   ProposalQueueItem,
   ProposalStatus,
   RejectionReason,
   Template,
+  User,
 } from '../types';
 import { PROPOSAL_STATUSES, REJECTION_REASONS } from '../types';
-import type { AlertMessage } from '../hooks/useAlertsSocket';
+import { useNewAlertMessages, type AlertMessage } from '../hooks/useAlertsSocket';
 import { ErrorBanner, ScoreBadge, formatDate, scoreClass } from '../components/common';
 
 interface Props {
-  lastMessage: AlertMessage | null;
+  messages: AlertMessage[];
+  user?: User | null;
 }
 
 interface DraftEdits {
@@ -41,16 +48,32 @@ const STATUS_COLORS: Record<ProposalStatus, string> = {
   pending_review: 'var(--amber)',
   approved: 'var(--accent)',
   rejected: 'var(--red)',
+  queued_for_browser: 'var(--accent)',
   submitted: 'var(--green)',
   failed: 'var(--red)',
   generation_failed: 'var(--red)',
 };
+
+// Platforms with no compliant submission channel — submit is manual (copy the text)
+const MANUAL_SUBMIT_PLATFORMS: Platform[] = [
+  'fiverr',
+  'linkedin',
+  'indeed',
+  'peopleperhour',
+  'guru',
+];
 
 const OUTCOME_COLORS: Record<ProposalOutcome, string> = {
   pending: 'var(--text-dim)',
   hired: 'var(--green)',
   rejected: 'var(--red)',
   ghosted: 'var(--amber)',
+};
+
+const BID_ADVICE_COLORS: Record<BidAdvice['recommendation'], string> = {
+  bid: 'var(--green)',
+  caution: 'var(--amber)',
+  skip: 'var(--red)',
 };
 
 const editsFrom = (item: ProposalQueueItem): DraftEdits => ({
@@ -61,25 +84,44 @@ const editsFrom = (item: ProposalQueueItem): DraftEdits => ({
 
 const truncate = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
-// win_rate may arrive as 0–1 fraction or 0–100 percentage depending on backend
-const winRatePct = (t: Template) =>
-  Math.round(t.win_rate <= 1 ? t.win_rate * 100 : t.win_rate);
+const PAGE_SIZE = 50;
 
-export default function ProposalQueue({ lastMessage }: Props) {
+export default function ProposalQueue({ messages, user }: Props) {
   const [proposals, setProposals] = useState<ProposalQueueItem[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
   const [portfolio, setPortfolio] = useState<PortfolioItem[]>([]);
   const [statusFilter, setStatusFilter] = useState<ProposalStatus | ''>('pending_review');
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [edits, setEdits] = useState<Record<number, DraftEdits>>({});
   const [rejectDrafts, setRejectDrafts] = useState<Record<number, RejectDraft>>({});
   const [suggestions, setSuggestions] = useState<Record<number, Template[]>>({});
+  // template the reviewer picked via "Start from template" — sent as template_id on approve
+  const [chosenTemplates, setChosenTemplates] = useState<Record<number, Template>>({});
+  // per-item "Save as new template" checkbox (checked by default)
+  const [saveAsTemplate, setSaveAsTemplate] = useState<Record<number, boolean>>({});
+  // Phase 3: interview prep cached per item so re-expanding doesn't refetch
+  const [prep, setPrep] = useState<Record<number, InterviewPrep>>({});
+  const [prepLoading, setPrepLoading] = useState<Set<number>>(new Set());
+  const [adviceFilter, setAdviceFilter] = useState<BidAdvice['recommendation'] | ''>('');
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [reviewer, setReviewer] = useState(() => localStorage.getItem('gh_reviewer') ?? '');
+  const [reviewer, setReviewer] = useState(
+    () => localStorage.getItem('gh_reviewer') || user?.display_name || '',
+  );
   const [error, setError] = useState<string | null>(null);
   const [rowError, setRowError] = useState<Record<number, string>>({});
   const [busyId, setBusyId] = useState<number | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  // proposals the socket told us got a client reply (badges even before the reload lands)
+  const [repliedIds, setRepliedIds] = useState<Set<number>>(new Set());
+
+  // Default the reviewer to the logged-in user's display name once it hydrates
+  useEffect(() => {
+    if (user?.display_name) {
+      setReviewer((prev) => prev || user.display_name);
+    }
+  }, [user]);
 
   const showToast = (text: string) => {
     setToast(text);
@@ -87,16 +129,17 @@ export default function ProposalQueue({ lastMessage }: Props) {
   };
 
   const load = () => {
-    getProposals(statusFilter || undefined)
-      .then((items) => {
-        setProposals(items);
+    getProposals({ status: statusFilter || undefined, limit: PAGE_SIZE, offset })
+      .then((page) => {
+        setProposals(page.items);
+        setTotal(page.total);
         setSelected(new Set());
         setError(null);
       })
       .catch((e: Error) => setError(e.message));
   };
 
-  useEffect(load, [statusFilter]);
+  useEffect(load, [statusFilter, offset]);
 
   useEffect(() => {
     getPortfolioItems()
@@ -104,21 +147,27 @@ export default function ProposalQueue({ lastMessage }: Props) {
       .catch(() => setPortfolio([])); // titles are cosmetic — ignore failure
   }, []);
 
-  // Live updates from the shared alerts socket
-  useEffect(() => {
-    if (!lastMessage) return;
-    if (lastMessage.type === 'proposal_queued') {
+  // Live updates from the shared alerts socket — every unseen message is processed,
+  // so bursts collapsed by React batching are not dropped
+  useNewAlertMessages(messages, (msg) => {
+    if (msg.type === 'proposal_queued') {
       // the generic fallback variant also allows type 'proposal_queued' — narrow via `in`
-      const proposalId = 'proposal_id' in lastMessage ? lastMessage.proposal_id : 0;
-      const job = 'job' in lastMessage ? lastMessage.job : undefined;
+      const proposalId = 'proposal_id' in msg ? msg.proposal_id : 0;
+      const job = 'job' in msg ? msg.job : undefined;
       showToast(job ? `New proposal drafted: ${job.title}` : `New proposal #${proposalId} drafted`);
       load();
-    } else if (lastMessage.type === 'generation_failed') {
-      const err = 'error' in lastMessage && lastMessage.error ? `: ${lastMessage.error}` : '';
+    } else if (msg.type === 'generation_failed') {
+      const err = 'error' in msg && msg.error ? `: ${msg.error}` : '';
       showToast(`Proposal generation failed${err}`);
       load();
+    } else if (msg.type === 'client_replied' && 'proposal_id' in msg) {
+      // highest-value alert in freelancing — surface prominently and refresh
+      const snippet = 'snippet' in msg && msg.snippet ? ` — “${truncate(msg.snippet, 80)}”` : '';
+      setRepliedIds((prev) => new Set(prev).add(msg.proposal_id));
+      showToast(`Client replied on proposal #${msg.proposal_id}${snippet}`);
+      load();
     }
-  }, [lastMessage]);
+  });
 
   const changeReviewer = (name: string) => {
     setReviewer(name);
@@ -150,11 +199,12 @@ export default function ProposalQueue({ lastMessage }: Props) {
     });
 
   const replaceItem = (updated: ProposalQueueItem) => {
-    setProposals((prev) =>
-      statusFilter && updated.status !== statusFilter
-        ? prev.filter((p) => p.id !== updated.id)
-        : prev.map((p) => (p.id === updated.id ? updated : p)),
-    );
+    if (statusFilter && updated.status !== statusFilter) {
+      setProposals((prev) => prev.filter((p) => p.id !== updated.id));
+      setTotal((t) => Math.max(0, t - 1));
+    } else {
+      setProposals((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+    }
     setEdits((prev) => ({ ...prev, [updated.id]: editsFrom(updated) }));
   };
 
@@ -181,12 +231,15 @@ export default function ProposalQueue({ lastMessage }: Props) {
   const approve = (item: ProposalQueueItem) => {
     if (!requireReviewer(item.id)) return;
     const draft = edits[item.id] ?? editsFrom(item);
+    const chosen = chosenTemplates[item.id];
     void run(item.id, () =>
       approveProposal(item.id, {
         reviewer: reviewer.trim(),
         proposal_text: draft.proposal_text,
         ...(draft.bid_amount !== '' ? { bid_amount: Number(draft.bid_amount) } : {}),
         ...(draft.bid_period_days !== '' ? { bid_period_days: Number(draft.bid_period_days) } : {}),
+        ...(chosen ? { template_id: chosen.id } : {}),
+        save_as_template: saveAsTemplate[item.id] ?? true,
       }),
     );
   };
@@ -215,6 +268,40 @@ export default function ProposalQueue({ lastMessage }: Props) {
     void run(item.id, () => revertProposal(item.id, versionIndex));
   };
 
+  // Phase 3: draft a follow-up for a submitted proposal — 409 when not eligible
+  const draftFollowUp = (item: ProposalQueueItem) => {
+    setBusyId(item.id);
+    setRowError((prev) => ({ ...prev, [item.id]: '' }));
+    followUpProposal(item.id)
+      .then((newItem) => {
+        showToast(`Follow-up drafted for proposal #${item.id} — it's in pending review`);
+        // new item lands in pending_review; prepend it when that matches the current filter
+        if (!statusFilter || statusFilter === 'pending_review') {
+          setProposals((prev) => [newItem, ...prev]);
+          setTotal((t) => t + 1);
+        }
+        setError(null);
+      })
+      .catch((e: Error) => setRowError((prev) => ({ ...prev, [item.id]: e.message })))
+      .finally(() => setBusyId(null));
+  };
+
+  // Phase 3: interview prep — fetched once per item, then served from state
+  const loadPrep = (item: ProposalQueueItem) => {
+    if (prep[item.id] || prepLoading.has(item.id)) return;
+    setPrepLoading((prev) => new Set(prev).add(item.id));
+    getInterviewPrep(item.id)
+      .then((p) => setPrep((prev) => ({ ...prev, [item.id]: p })))
+      .catch((e: Error) => setRowError((prev) => ({ ...prev, [item.id]: e.message })))
+      .finally(() =>
+        setPrepLoading((prev) => {
+          const next = new Set(prev);
+          next.delete(item.id);
+          return next;
+        }),
+      );
+  };
+
   const applyTemplate = (item: ProposalQueueItem, templateId: string) => {
     const tpl = (suggestions[item.id] ?? []).find((t) => String(t.id) === templateId);
     if (!tpl) return;
@@ -222,7 +309,16 @@ export default function ProposalQueue({ lastMessage }: Props) {
       proposal_text: tpl.text,
       ...(tpl.bid != null ? { bid_amount: String(tpl.bid) } : {}),
     });
+    // remember provenance — approve sends template_id so the template is reused, not re-minted
+    setChosenTemplates((prev) => ({ ...prev, [item.id]: tpl }));
   };
+
+  const clearChosenTemplate = (id: number) =>
+    setChosenTemplates((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
 
   const toggleSelected = (id: number) =>
     setSelected((prev) => {
@@ -240,7 +336,7 @@ export default function ProposalQueue({ lastMessage }: Props) {
     setBulkBusy(true);
     bulkApproveProposals([...selected], reviewer.trim())
       .then((res) => {
-        showToast(`Bulk approve: ${res.approved} approved, ${res.skipped} skipped`);
+        showToast(`Bulk approve: ${res.approved.length} approved, ${res.skipped.length} skipped`);
         load();
       })
       .catch((e: Error) => setError(e.message))
@@ -268,7 +364,10 @@ export default function ProposalQueue({ lastMessage }: Props) {
           <label>Status</label>
           <select
             value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value as ProposalStatus | '')}
+            onChange={(e) => {
+              setStatusFilter(e.target.value as ProposalStatus | '');
+              setOffset(0);
+            }}
           >
             <option value="">All</option>
             {PROPOSAL_STATUSES.map((s) => (
@@ -276,6 +375,18 @@ export default function ProposalQueue({ lastMessage }: Props) {
                 {s.replace(/_/g, ' ')}
               </option>
             ))}
+          </select>
+        </div>
+        <div className="field" style={{ marginBottom: 0 }}>
+          <label>Bid advice</label>
+          <select
+            value={adviceFilter}
+            onChange={(e) => setAdviceFilter(e.target.value as BidAdvice['recommendation'] | '')}
+          >
+            <option value="">All</option>
+            <option value="bid">bid</option>
+            <option value="caution">caution</option>
+            <option value="skip">skip</option>
           </select>
         </div>
         <div className="field" style={{ marginBottom: 0 }}>
@@ -301,7 +412,9 @@ export default function ProposalQueue({ lastMessage }: Props) {
         {proposals.length === 0 && !error && (
           <p className="muted">No proposals with this status.</p>
         )}
-        {proposals.map((item) => {
+        {proposals
+          .filter((p) => !adviceFilter || p.bid_advice?.recommendation === adviceFilter)
+          .map((item) => {
           const draft = edits[item.id];
           const isOpen = expandedId === item.id;
           return (
@@ -332,6 +445,11 @@ export default function ProposalQueue({ lastMessage }: Props) {
                         buyer request
                       </span>
                     )}
+                    {item.request_type === 'follow_up' && (
+                      <span className="pill" style={{ marginLeft: 8, color: 'var(--amber)' }}>
+                        follow-up
+                      </span>
+                    )}
                   </div>
                   <div className="job-meta">
                     {item.platform} ·{' '}
@@ -343,6 +461,27 @@ export default function ProposalQueue({ lastMessage }: Props) {
                 <span className="pill" style={{ color: STATUS_COLORS[item.status] }}>
                   {item.status.replace(/_/g, ' ')}
                 </span>
+                {item.bid_advice && (
+                  <span
+                    className="pill"
+                    title={item.bid_advice.reason}
+                    style={{ color: BID_ADVICE_COLORS[item.bid_advice.recommendation] }}
+                  >
+                    {item.bid_advice.recommendation}
+                  </span>
+                )}
+                {(item.client_replied_at != null || repliedIds.has(item.id)) && (
+                  <span
+                    className="pill"
+                    style={{
+                      color: 'var(--green)',
+                      borderColor: 'rgba(52, 211, 153, 0.45)',
+                      background: 'rgba(52, 211, 153, 0.1)',
+                    }}
+                  >
+                    client replied
+                  </span>
+                )}
                 {item.outcome !== 'pending' && (
                   <span className="pill" style={{ color: OUTCOME_COLORS[item.outcome] }}>
                     {item.outcome}
@@ -384,11 +523,32 @@ export default function ProposalQueue({ lastMessage }: Props) {
                     <div className="error-banner">{rowError[item.id]}</div>
                   )}
 
+                  {item.request_type === 'follow_up' &&
+                    typeof item.submission_result?.parent_proposal_id === 'number' && (
+                      <p className="muted" style={{ marginTop: 0, fontSize: 12 }}>
+                        Follow-up for proposal #{item.submission_result.parent_proposal_id}
+                      </p>
+                    )}
+
                   {item.status === 'generation_failed' && (
                     <div className="error-banner">
                       Generation failed
                       {typeof item.submission_result?.error === 'string' &&
                         `: ${item.submission_result.error}`}
+                    </div>
+                  )}
+
+                  {item.status === 'queued_for_browser' && (
+                    <div className="info-banner">
+                      Queued — the browser worker will submit this; it flips to Submitted when
+                      done.
+                    </div>
+                  )}
+
+                  {item.client_replied_at && (
+                    <div className="info-banner">
+                      Client replied {formatDate(item.client_replied_at)} — answer fast; reply
+                      speed wins contracts.
                     </div>
                   )}
 
@@ -419,6 +579,15 @@ export default function ProposalQueue({ lastMessage }: Props) {
                         <span className={`score-badge wide ${scoreClass(item.confidence)}`}>
                           {Math.round(item.confidence)}% confident
                         </span>
+                        {item.bid_advice && (
+                          <span
+                            className="pill"
+                            title={item.bid_advice.reason}
+                            style={{ color: BID_ADVICE_COLORS[item.bid_advice.recommendation] }}
+                          >
+                            {item.bid_advice.recommendation}
+                          </span>
+                        )}
                         {item.needs_review && (
                           <span className="chip flag">needs review</span>
                         )}
@@ -508,10 +677,32 @@ export default function ProposalQueue({ lastMessage }: Props) {
                         </option>
                         {(suggestions[item.id] ?? []).map((t) => (
                           <option key={t.id} value={t.id}>
-                            {t.title} — win rate {winRatePct(t)}%
+                            {t.title} — win rate {Math.round(t.win_rate)}%
                           </option>
                         ))}
                       </select>
+                      {chosenTemplates[item.id] && (
+                        <span
+                          className="pill"
+                          style={{ alignSelf: 'flex-start', color: 'var(--accent)' }}
+                        >
+                          based on template: {chosenTemplates[item.id].title}
+                          <button
+                            type="button"
+                            title="Clear template choice"
+                            style={{
+                              background: 'none',
+                              border: 'none',
+                              color: 'var(--text-dim)',
+                              cursor: 'pointer',
+                              padding: '0 0 0 4px',
+                            }}
+                            onClick={() => clearChosenTemplate(item.id)}
+                          >
+                            ×
+                          </button>
+                        </span>
+                      )}
                     </div>
                   )}
 
@@ -640,6 +831,81 @@ export default function ProposalQueue({ lastMessage }: Props) {
                     </>
                   )}
 
+                  <h3>Interview prep</h3>
+                  {prep[item.id] ? (
+                    <>
+                      {prep[item.id].questions.length > 0 && (
+                        <div className="item-list" style={{ marginBottom: 10 }}>
+                          {prep[item.id].questions.map((q, i) => (
+                            <details
+                              className="item-row"
+                              key={`${item.id}-q${i}`}
+                              style={{ display: 'block', cursor: 'default' }}
+                            >
+                              <summary style={{ cursor: 'pointer' }}>{q.question}</summary>
+                              <p className="muted" style={{ margin: '8px 0 2px' }}>
+                                {q.suggested_answer}
+                              </p>
+                            </details>
+                          ))}
+                        </div>
+                      )}
+                      {(prep[item.id].pain_points.length > 0 ||
+                        prep[item.id].talking_points.length > 0) && (
+                        <div className="form-row">
+                          {prep[item.id].pain_points.length > 0 && (
+                            <div style={{ flex: 1, minWidth: 180 }}>
+                              <div className="section-title" style={{ marginTop: 0 }}>
+                                Pain points
+                              </div>
+                              <div className="chips">
+                                {prep[item.id].pain_points.map((p) => (
+                                  <span className="chip" key={p} style={{ color: 'var(--amber)' }}>
+                                    {p}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          {prep[item.id].talking_points.length > 0 && (
+                            <div style={{ flex: 1, minWidth: 180 }}>
+                              <div className="section-title" style={{ marginTop: 0 }}>
+                                Talking points
+                              </div>
+                              <div className="chips">
+                                {prep[item.id].talking_points.map((t) => (
+                                  <span className="chip" key={t} style={{ color: 'var(--green)' }}>
+                                    {t}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {prep[item.id].red_flags.length > 0 && (
+                        <>
+                          <div className="section-title">Red flags</div>
+                          <div className="chips">
+                            {prep[item.id].red_flags.map((f) => (
+                              <span className="chip flag" key={f}>
+                                {f}
+                              </span>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </>
+                  ) : (
+                    <button
+                      className="btn small secondary"
+                      disabled={prepLoading.has(item.id)}
+                      onClick={() => loadPrep(item)}
+                    >
+                      {prepLoading.has(item.id) ? 'Loading prep…' : 'Load interview prep'}
+                    </button>
+                  )}
+
                   <div className="form-row" style={{ marginTop: 12, marginBottom: 0 }}>
                     {item.status === 'pending_review' && (
                       <>
@@ -650,6 +916,23 @@ export default function ProposalQueue({ lastMessage }: Props) {
                         >
                           Approve
                         </button>
+                        <label
+                          className="checkbox-row"
+                          style={{ alignSelf: 'center' }}
+                          title="Mint a reusable template from this approval (off when reusing a picked template)"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={saveAsTemplate[item.id] ?? true}
+                            onChange={(e) =>
+                              setSaveAsTemplate((prev) => ({
+                                ...prev,
+                                [item.id]: e.target.checked,
+                              }))
+                            }
+                          />
+                          Save as new template
+                        </label>
                         <div className="field" style={{ marginBottom: 0 }}>
                           <label>Reject reason</label>
                           <select
@@ -683,15 +966,33 @@ export default function ProposalQueue({ lastMessage }: Props) {
                         </button>
                       </>
                     )}
-                    {item.status === 'approved' && (
-                      <button
-                        className="btn"
-                        disabled={busyId === item.id}
-                        onClick={() => submit(item)}
-                      >
-                        {busyId === item.id ? 'Submitting…' : 'Submit to platform'}
-                      </button>
-                    )}
+                    {item.status === 'approved' &&
+                      (MANUAL_SUBMIT_PLATFORMS.includes(item.platform) ? (
+                        <button
+                          className="btn"
+                          disabled
+                          title="No submission channel — copy the text manually"
+                        >
+                          Submit to platform
+                        </button>
+                      ) : item.platform === 'upwork' ? (
+                        <button
+                          className="btn"
+                          disabled={busyId === item.id}
+                          title="Queued for the external browser worker — it flips to Submitted when done"
+                          onClick={() => submit(item)}
+                        >
+                          {busyId === item.id ? 'Queueing…' : 'Queue for browser worker'}
+                        </button>
+                      ) : (
+                        <button
+                          className="btn"
+                          disabled={busyId === item.id}
+                          onClick={() => submit(item)}
+                        >
+                          {busyId === item.id ? 'Submitting…' : 'Submit to platform'}
+                        </button>
+                      ))}
                     {item.status === 'submitted' && (
                       <>
                         <span className="muted" style={{ fontSize: 12, alignSelf: 'center' }}>
@@ -709,6 +1010,17 @@ export default function ProposalQueue({ lastMessage }: Props) {
                         ))}
                       </>
                     )}
+                    {(item.status === 'submitted' || item.status === 'queued_for_browser') &&
+                      item.outcome === 'pending' && (
+                        <button
+                          className="btn small secondary"
+                          disabled={busyId === item.id}
+                          title="Draft a follow-up message for this proposal"
+                          onClick={() => draftFollowUp(item)}
+                        >
+                          {busyId === item.id ? 'Drafting…' : 'Draft follow-up'}
+                        </button>
+                      )}
                   </div>
                 </div>
               )}
@@ -716,6 +1028,28 @@ export default function ProposalQueue({ lastMessage }: Props) {
           );
         })}
       </div>
+
+      {total > 0 && (
+        <div className="filters-bar" style={{ marginTop: 12 }}>
+          <button
+            className="btn secondary small"
+            disabled={offset === 0}
+            onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+          >
+            ← Prev
+          </button>
+          <span className="muted" style={{ fontSize: 12, alignSelf: 'center' }}>
+            {offset + 1}–{Math.min(offset + PAGE_SIZE, total)} of {total}
+          </span>
+          <button
+            className="btn secondary small"
+            disabled={offset + PAGE_SIZE >= total}
+            onClick={() => setOffset(offset + PAGE_SIZE)}
+          >
+            Next →
+          </button>
+        </div>
+      )}
     </div>
   );
 }

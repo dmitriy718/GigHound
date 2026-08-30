@@ -1,7 +1,18 @@
 import { useEffect, useState } from 'react';
-import { approveProposal, getBuyerRequests, getProposals } from '../api/client';
-import type { ProposalQueueItem } from '../types';
+import {
+  approveProposal,
+  getBuyerRequests,
+  getProposals,
+  rejectProposal,
+} from '../api/client';
+import type { ProposalQueueItem, RejectionReason } from '../types';
+import { REJECTION_REASONS } from '../types';
+import { useNewAlertMessages, type AlertMessage } from '../hooks/useAlertsSocket';
 import { ErrorBanner, formatDate } from '../components/common';
+
+interface Props {
+  messages: AlertMessage[];
+}
 
 interface OfferEdits {
   proposal_text: string;
@@ -13,21 +24,23 @@ const editsFrom = (item: ProposalQueueItem): OfferEdits => ({
   bid_amount: item.bid_amount != null ? String(item.bid_amount) : '',
 });
 
-export default function BuyerRequestInbox() {
+export default function BuyerRequestInbox({ messages }: Props) {
   const [offers, setOffers] = useState<{ offers_remaining_today: number; daily_limit: number } | null>(null);
   const [items, setItems] = useState<ProposalQueueItem[]>([]);
   const [edits, setEdits] = useState<Record<number, OfferEdits>>({});
+  const [rejectReasons, setRejectReasons] = useState<Record<number, RejectionReason>>({});
   const [reviewer, setReviewer] = useState(() => localStorage.getItem('gh_reviewer') ?? '');
   const [error, setError] = useState<string | null>(null);
   const [rowError, setRowError] = useState<Record<number, string>>({});
   const [busyId, setBusyId] = useState<number | null>(null);
 
   const load = () => {
-    getProposals()
-      .then((all) => {
+    // only actionable (pending) offers — the API filters by status server-side
+    getProposals({ status: 'pending_review', limit: 200 })
+      .then((page) => {
         // buyer requests only, deduped by id
         const seen = new Set<number>();
-        const brs = all.filter((p) => {
+        const brs = page.items.filter((p) => {
           if (p.request_type !== 'buyer_request' || seen.has(p.id)) return false;
           seen.add(p.id);
           return true;
@@ -46,6 +59,11 @@ export default function BuyerRequestInbox() {
       .catch(() => setOffers(null)); // quota banner is cosmetic — ignore failure
   }, []);
 
+  // Live updates from the shared alerts socket — new buyer-request offers appear live
+  useNewAlertMessages(messages, (msg) => {
+    if (msg.type === 'proposal_queued' || msg.type === 'generation_failed') load();
+  });
+
   const changeReviewer = (name: string) => {
     setReviewer(name);
     localStorage.setItem('gh_reviewer', name);
@@ -54,11 +72,14 @@ export default function BuyerRequestInbox() {
   const patchEdit = (id: number, patch: Partial<OfferEdits>) =>
     setEdits((prev) => ({ ...prev, [id]: { ...editsFrom(items.find((i) => i.id === id)!), ...prev[id], ...patch } }));
 
+  const requireReviewer = (id: number): boolean => {
+    if (reviewer.trim()) return true;
+    setRowError((prev) => ({ ...prev, [id]: 'Enter a reviewer name first.' }));
+    return false;
+  };
+
   const approve = (item: ProposalQueueItem) => {
-    if (!reviewer.trim()) {
-      setRowError((prev) => ({ ...prev, [item.id]: 'Enter a reviewer name first.' }));
-      return;
-    }
+    if (!requireReviewer(item.id)) return;
     const draft = edits[item.id] ?? editsFrom(item);
     setBusyId(item.id);
     setRowError((prev) => ({ ...prev, [item.id]: '' }));
@@ -66,6 +87,22 @@ export default function BuyerRequestInbox() {
       reviewer: reviewer.trim(),
       proposal_text: draft.proposal_text,
       ...(draft.bid_amount !== '' ? { bid_amount: Number(draft.bid_amount) } : {}),
+    })
+      .then(() => {
+        setItems((prev) => prev.filter((p) => p.id !== item.id));
+        setError(null);
+      })
+      .catch((e: Error) => setRowError((prev) => ({ ...prev, [item.id]: e.message })))
+      .finally(() => setBusyId(null));
+  };
+
+  const reject = (item: ProposalQueueItem) => {
+    if (!requireReviewer(item.id)) return;
+    setBusyId(item.id);
+    setRowError((prev) => ({ ...prev, [item.id]: '' }));
+    rejectProposal(item.id, {
+      reviewer: reviewer.trim(),
+      reason: rejectReasons[item.id] ?? 'too_generic',
     })
       .then(() => {
         setItems((prev) => prev.filter((p) => p.id !== item.id));
@@ -153,13 +190,40 @@ export default function BuyerRequestInbox() {
                   />
                 </div>
                 {item.status === 'pending_review' && (
-                  <button
-                    className="btn touch-btn"
-                    disabled={busyId === item.id}
-                    onClick={() => approve(item)}
-                  >
-                    {busyId === item.id ? 'Approving…' : 'Approve offer'}
-                  </button>
+                  <>
+                    <div className="field" style={{ marginBottom: 0 }}>
+                      <label>Reject reason</label>
+                      <select
+                        value={rejectReasons[item.id] ?? 'too_generic'}
+                        onChange={(e) =>
+                          setRejectReasons((prev) => ({
+                            ...prev,
+                            [item.id]: e.target.value as RejectionReason,
+                          }))
+                        }
+                      >
+                        {REJECTION_REASONS.map((r) => (
+                          <option key={r} value={r}>
+                            {r.replace(/_/g, ' ')}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <button
+                      className="btn danger touch-btn"
+                      disabled={busyId === item.id}
+                      onClick={() => reject(item)}
+                    >
+                      {busyId === item.id ? 'Rejecting…' : 'Reject'}
+                    </button>
+                    <button
+                      className="btn touch-btn"
+                      disabled={busyId === item.id}
+                      onClick={() => approve(item)}
+                    >
+                      {busyId === item.id ? 'Approving…' : 'Approve offer'}
+                    </button>
+                  </>
                 )}
               </div>
             </div>

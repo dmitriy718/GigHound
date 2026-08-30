@@ -40,12 +40,12 @@ class FreelancerAdapter(PlatformAdapter):
     platform = "freelancer"
     rate_per_sec = 2.0  # conservative; Freelancer does not publish exact limits
 
-    def __init__(self, db: Session, client: httpx.AsyncClient | None = None,
+    def __init__(self, db: Session, user_id: int, client: httpx.AsyncClient | None = None,
                  sandbox: bool = False, monthly_bid_quota: int = 50):
-        super().__init__(client)
+        super().__init__(client, principal=f"user{user_id}:default")
         self.base = SANDBOX_BASE if sandbox else API_BASE
-        self.vault = CredentialVault(db)
-        self.state = StateStore(db)
+        self.vault = CredentialVault(db, user_id)
+        self.state = StateStore(db, user_id)
         self.monthly_bid_quota = monthly_bid_quota
 
     # ---------------- OAuth 2.0 ----------------
@@ -124,6 +124,7 @@ class FreelancerAdapter(PlatformAdapter):
                           min_budget: float | None = None, max_budget: float | None = None,
                           job_types: list[str] | None = None, limit: int = 50,
                           offset: int = 0, **_) -> list[JobPosting]:
+        self._consume_daily_action()
         params: dict = {"query": query, "limit": limit, "offset": offset,
                         "project_details": "true", "user_details": "true"}
         if skill_ids:
@@ -174,6 +175,7 @@ class FreelancerAdapter(PlatformAdapter):
             raise QuotaDepletedError(
                 f"freelancer: monthly bid quota of {self.monthly_bid_quota} depleted; paused"
             )
+        self._consume_daily_action()
         data: dict = {
             "project_id": project_id,
             "bidder_id": bidder_id,
@@ -206,9 +208,12 @@ class FreelancerAdapter(PlatformAdapter):
             client = ClientInfo(
                 payment_verified=(owner.get("payment_verified")
                                   or (owner.get("status") or {}).get("payment_verified")),
+                identity_verified=(owner.get("status") or {}).get("identity_verified"),
                 country=(owner.get("location") or {}).get("country", {}).get("name"),
                 rating=(owner.get("reputation") or {}).get("entire_history", {}).get("overall"),
                 reviews_count=(owner.get("reputation") or {}).get("entire_history", {}).get("reviews"),
+                client_id=str(owner["id"]) if owner.get("id") is not None else None,
+                name=owner.get("username") or owner.get("public_name"),
             )
         return JobPosting(
             source_platform="freelancer",

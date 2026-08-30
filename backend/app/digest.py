@@ -7,9 +7,58 @@ generated but only logged/returned — nothing is sent.
 import logging
 import os
 import smtplib
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 
+from sqlalchemy.orm import Session
+
+from .models import AlertSettings, Job
+
 log = logging.getLogger(__name__)
+
+
+def digest_jobs_for_user(db: Session, user_id: int) -> tuple[AlertSettings | None, list]:
+    """Settings + the jobs that would appear in the user's next digest
+    (per digest_mode window). (None, []) when the user has no settings row."""
+    settings = db.query(AlertSettings).filter(AlertSettings.user_id == user_id).first()
+    if settings is None:
+        return None, []
+    hours = {"hourly": 1, "daily": 24}.get(settings.digest_mode, 24)
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    jobs = (
+        db.query(Job)
+        .filter(
+            Job.user_id == user_id,
+            Job.status.in_(["new", "notified"]),
+            Job.quality_score >= settings.min_score_alert,
+            Job.fetched_at >= since,
+        )
+        .order_by(Job.quality_score.desc())
+        .limit(50)
+        .all()
+    )
+    return settings, jobs
+
+
+def due_digest_user_ids(db: Session, now: datetime | None = None) -> list[int]:
+    """User ids whose digest mode is due right now (hourly always; daily only
+    in the 07:00 UTC hour). The tick dispatcher fans out one task per id."""
+    now = now or datetime.now(timezone.utc)
+    rows = (db.query(AlertSettings)
+            .filter(AlertSettings.digest_mode.in_(["hourly", "daily"]))
+            .all())
+    return [s.user_id for s in rows
+            if not (s.digest_mode == "daily" and now.hour != 7)]
+
+
+def send_user_digest(db: Session, user_id: int) -> int:
+    """Send one user's digest. Returns the job count sent (0 when there is
+    nothing to report or the user has no settings row)."""
+    settings, jobs = digest_jobs_for_user(db, user_id)
+    if settings is None or not jobs:
+        return 0
+    send_digest_email(jobs, settings.digest_mode)
+    return len(jobs)
 
 
 def render_digest(jobs: list, mode: str) -> str:

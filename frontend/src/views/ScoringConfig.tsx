@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { getJobs, ingestJobs } from '../api/client';
-import type { Job, JobIngest } from '../types';
+import { scorePreview, type ScorePreviewResult } from '../api/client';
+import type { JobIngest } from '../types';
 import { SCORING_WEIGHTS } from '../types';
 import { ErrorBanner, ScoreBadge, ScoreBars } from '../components/common';
 
@@ -8,19 +8,19 @@ export default function ScoringConfig() {
   const [description, setDescription] = useState('');
   const [budget, setBudget] = useState('');
   const [proposals, setProposals] = useState('');
-  const [result, setResult] = useState<Job | null>(null);
+  const [result, setResult] = useState<ScorePreviewResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const testScorer = async () => {
     setBusy(true);
     setResult(null);
-    const externalId = `test-${Date.now()}`;
     const budgetNum = budget === '' ? null : Number(budget);
+    // Dry-run only — nothing is persisted and no proposal generation is triggered
     const job: JobIngest = {
-      external_id: externalId,
+      external_id: 'score-preview',
       platform: 'upwork',
-      title: `Scorer test ${externalId}`,
+      title: 'Scorer playground sample',
       description,
       url: 'https://example.com/test-job',
       job_type: 'fixed',
@@ -39,12 +39,8 @@ export default function ScoringConfig() {
       apply_deadline: null,
     };
     try {
-      await ingestJobs([job]);
-      // Fetch the freshly ingested job back (ingest response has no job payload)
-      const res = await getJobs({ platform: 'upwork', limit: 100 });
-      const created = res.jobs.find((j) => j.external_id === externalId) ?? null;
-      setResult(created);
-      setError(created ? null : 'Job ingested but not found in feed (it may have been auto-archived).');
+      setResult(await scorePreview(job));
+      setError(null);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -66,6 +62,10 @@ export default function ScoringConfig() {
           quality_score = keyword_match + budget_realism + client_verification +
           description_quality + urgency_ratio − red_flag_penalty, clamped to 0–100. A negative
           keyword hit sets the score to 0 and excludes the job immediately.
+        </p>
+        <p className="muted" style={{ fontSize: 12 }}>
+          Which keyword group is active: scoring matches against the union of the keyword groups
+          referenced by your filters — or all of your groups when no filter references one.
         </p>
         <table className="data">
           <thead>
@@ -145,11 +145,9 @@ export default function ScoringConfig() {
                 </div>
               </>
             )}
-            {result.status === 'archived' && (
-              <p className="muted" style={{ marginTop: 8 }}>
-                This job was auto-archived (below quality threshold or negative keyword hit).
-              </p>
-            )}
+            <p className="muted" style={{ marginTop: 8 }}>
+              Dry run — nothing was saved and no proposals were generated.
+            </p>
           </div>
         )}
       </div>

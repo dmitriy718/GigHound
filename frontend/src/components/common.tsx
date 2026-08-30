@@ -1,10 +1,47 @@
-import { useState } from 'react';
+import { Component, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { ScoreBreakdown } from '../types';
 
 export function ErrorBanner({ error }: { error: string | null }) {
   if (!error) return null;
   return <div className="error-banner">{error}</div>;
+}
+
+interface ErrorBoundaryProps {
+  children: ReactNode;
+  label?: string; // panel name shown in the fallback
+}
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
+
+// Keeps one crashing panel from blanking the whole view.
+export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  render() {
+    const { error } = this.state;
+    if (error) {
+      return (
+        <div className="error-banner">
+          {this.props.label ?? 'This panel'} crashed: {error.message}
+          <button
+            className="btn small secondary"
+            style={{ marginLeft: 10 }}
+            onClick={() => this.setState({ error: null })}
+          >
+            Retry
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 interface ModalProps {

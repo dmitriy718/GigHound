@@ -1,13 +1,53 @@
 from datetime import datetime
 from typing import Literal, Optional
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 Platform = Literal["upwork", "fiverr", "freelancer", "peopleperhour", "guru", "linkedin", "indeed"]
 KeywordKind = Literal["primary", "secondary", "negative"]
 JobType = Literal["fixed", "hourly", "retainer", "contest", "gig"]
 ExperienceLevel = Literal["entry", "intermediate", "expert"]
 WorkArrangement = Literal["remote", "onsite", "hybrid"]
+
+
+# ---------- Auth ----------
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+    display_name: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RegisterIn(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=72)  # 72 = bcrypt input limit
+    display_name: str = Field(default="", max_length=200)
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+
+class PasswordChangeIn(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=72)  # 72 = bcrypt input limit
+
+
+class AccountDeleteIn(BaseModel):
+    password: str
 
 
 # ---------- Keywords ----------
@@ -93,6 +133,8 @@ class ClientInfo(BaseModel):
     country: Optional[str] = None
     rating: Optional[float] = None
     reviews_count: Optional[int] = None
+    client_id: Optional[str] = None  # platform-side client identifier, when the API exposes one
+    name: Optional[str] = None       # client display name/username, when exposed
 
 
 class JobIngest(BaseModel):
@@ -113,6 +155,25 @@ class JobIngest(BaseModel):
     work_arrangement: Optional[WorkArrangement] = None
     posted_at: Optional[datetime] = None
     apply_deadline: Optional[datetime] = None
+
+    @field_validator("url")
+    @classmethod
+    def _url_must_be_http(cls, v: str) -> str:
+        """Job content is untrusted input — no javascript:/file:/data: URLs."""
+        if v and urlparse(v).scheme.lower() not in ("http", "https"):
+            raise ValueError("url must use the http or https scheme")
+        return v
+
+
+class IngestJobsIn(BaseModel):
+    jobs: list[JobIngest] = []
+
+
+class ClientHistoryOut(BaseModel):
+    past_proposals: int
+    hired: int
+    rejected: int
+    ghosted: int
 
 
 class JobOut(BaseModel):
@@ -143,6 +204,8 @@ class JobOut(BaseModel):
     is_duplicate: bool
     duplicate_of: Optional[int]
     fetched_at: datetime
+    # populated only by GET /api/jobs/{id}; null when this client was never seen
+    client_history: Optional[ClientHistoryOut] = None
 
     class Config:
         from_attributes = True
@@ -152,6 +215,20 @@ class IngestResult(BaseModel):
     ingested: int
     auto_archived: int
     alerts_sent: int
+
+
+class BulkArchiveAction(BaseModel):
+    ids: list[int]
+
+
+class ScorePreviewIn(BaseModel):
+    job: JobIngest
+
+
+class ScorePreviewOut(BaseModel):
+    quality_score: float
+    score_breakdown: dict
+    red_flags: list[str]
 
 
 class PreviewResult(BaseModel):
@@ -199,6 +276,8 @@ class PlatformAccountIn(BaseModel):
     mode: Literal["api", "stealth", "hybrid", "disabled"] = "api"
     enabled: bool = True
     credential_ref: str = ""
+    # recognized keys: bidder_id (freelancer user id), on_behalf_of (upwork agency member)
+    settings: dict = {}
 
 
 class PlatformAccountOut(PlatformAccountIn):
@@ -207,6 +286,33 @@ class PlatformAccountOut(PlatformAccountIn):
 
     class Config:
         from_attributes = True
+
+
+class CredentialsIn(BaseModel):
+    """Secret key/value pairs to store in the vault for a platform account.
+
+    Recognized keys per platform (others are rejected 422):
+      freelancer/upwork: access_token (+ optional refresh_token)
+      stealth platforms: storage_state_json (Playwright storage_state string)
+                         OR username + password (fallback-only login)
+    """
+    secrets: dict[str, str]
+
+
+class CredentialStatusOut(BaseModel):
+    enrolled: bool
+    keys: list[str]
+    updated_at: Optional[datetime] = None
+
+
+class OAuthCompleteIn(BaseModel):
+    code: str
+    redirect_uri: Optional[str] = None  # defaults to FREELANCER_REDIRECT_URI
+
+
+class BidAdviceOut(BaseModel):
+    recommendation: Literal["bid", "caution", "skip"]
+    reason: str
 
 
 class ProposalQueueOut(BaseModel):
@@ -218,6 +324,7 @@ class ProposalQueueOut(BaseModel):
     bid_amount: Optional[float]
     bid_period_days: Optional[int]
     bid_rationale: str = ""
+    bid_advice: Optional[BidAdviceOut] = None
     portfolio_item_ids: list[int]
     portfolio_match: dict = {}
     template_id: Optional[int]
@@ -231,6 +338,7 @@ class ProposalQueueOut(BaseModel):
     request_type: str = "job"
     reviewed_by: Optional[str]
     reviewed_at: Optional[datetime]
+    client_replied_at: Optional[datetime] = None
     submission_result: dict
     created_at: datetime
     job: Optional[JobOut] = None
@@ -244,6 +352,11 @@ class ProposalReviewAction(BaseModel):
     proposal_text: Optional[str] = None   # reviewer may edit before approving
     bid_amount: Optional[float] = None
     bid_period_days: Optional[int] = None
+    # reviewer picked an existing template from suggestions: reuse it on
+    # approve instead of minting a new one
+    template_id: Optional[int] = None
+    # set False to skip minting a Template from this approval
+    save_as_template: bool = True
 
 
 class ProposalRejectAction(BaseModel):
@@ -259,6 +372,18 @@ class BulkApproveAction(BaseModel):
 
 class OutcomeAction(BaseModel):
     outcome: Literal["hired", "rejected", "ghosted"]
+
+
+class InterviewQuestion(BaseModel):
+    question: str
+    suggested_answer: str
+
+
+class InterviewPrepOut(BaseModel):
+    questions: list[InterviewQuestion]
+    pain_points: list[str] = []
+    red_flags: list[str] = []
+    talking_points: list[str] = []
 
 
 # ---------- Proposal generation v3 / templates / gigs ----------
@@ -309,6 +434,10 @@ class GigOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class StealthTaskClaimIn(BaseModel):
+    worker_id: str
 
 
 class GigMetricIn(BaseModel):

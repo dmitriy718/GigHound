@@ -75,11 +75,11 @@ class UpworkAgencyAdapter(PlatformAdapter):
     platform = "upwork"
     rate_per_sec = 8.0  # Upwork documents 10 req/s per IP; stay under
 
-    def __init__(self, db: Session, client: httpx.AsyncClient | None = None):
-        super().__init__(client)
+    def __init__(self, db: Session, user_id: int, client: httpx.AsyncClient | None = None):
+        super().__init__(client, principal=f"user{user_id}:{AGENCY_PRINCIPAL}")
         self.db = db
-        self.vault = CredentialVault(db)
-        self.state = StateStore(db)
+        self.vault = CredentialVault(db, user_id)
+        self.state = StateStore(db, user_id)
 
     # ---------------- audit ----------------
 
@@ -135,6 +135,7 @@ class UpworkAgencyAdapter(PlatformAdapter):
     # ---------------- Discovery (official API) ----------------
 
     async def search_jobs(self, query: str = "", limit: int = 50, **_) -> list[JobPosting]:
+        self._consume_daily_action()
         data = await self._graphql(_SEARCH_QUERY, {
             "filter": {"searchExpression": {"andTerms": {"anyOf": query}}, "pagination": {"first": min(limit, 100)}}
         })
@@ -202,6 +203,7 @@ class UpworkAgencyAdapter(PlatformAdapter):
         members = {m["username"] for m in self.list_agency_members()}
         if on_behalf_of not in members:
             raise AdapterAuthError(f"upwork: '{on_behalf_of}' is not an agency member")
+        self._consume_daily_action()
 
         queue = self.state.get(self.platform, "pending_submissions", {"items": []})
         record = {
@@ -260,6 +262,10 @@ class UpworkAgencyAdapter(PlatformAdapter):
                 country=(client.get("location") or {}).get("country"),
                 hire_rate=(round(100 * client["totalHires"] / client["totalPostedJobs"], 1)
                            if client.get("totalPostedJobs") else None),
+                past_hires=client.get("totalHires"),
+                # search results carry no stable client id; keep it when a
+                # richer query (job details) does provide one
+                client_id=str(client["id"]) if client.get("id") else None,
             ),
             proposals_count=_PROPOSALS_TIER_MAP.get(node.get("proposalsTier", ""), None),
             posted_at=node.get("createdDateTime"),

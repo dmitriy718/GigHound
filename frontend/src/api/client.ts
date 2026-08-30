@@ -1,11 +1,15 @@
 import type {
   AlertSettings,
+  User,
   CompetitorSnapshot,
+  CredentialStatus,
+  FunnelAnalytics,
   Gig,
   GigMetric,
   GigStatus,
   GigTemplate,
   GigTemplateJson,
+  InterviewPrep,
   Job,
   JobIngest,
   Keyword,
@@ -18,11 +22,14 @@ import type {
   ProposalQueueItem,
   ProposalRejectAction,
   ProposalReviewAction,
+  ProposalsPage,
   ProposalStatus,
   RateCardEntry,
+  ScoreBreakdown,
   SearchFilter,
   SearchProfile,
   Template,
+  TrendAnalytics,
 } from '../types';
 
 export const API_URL: string =
@@ -42,15 +49,37 @@ export class ApiError extends Error {
   }
 }
 
+// ---- Auth token (AD-2: localStorage, 12h JWT) ----
+
+const TOKEN_KEY = 'gighound_token';
+
+export const getToken = (): string | null => localStorage.getItem(TOKEN_KEY);
+export const setToken = (token: string) => localStorage.setItem(TOKEN_KEY, token);
+export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
+
+// App registers a handler that drops the session and shows Login on any 401.
+let onUnauthorized: (() => void) | null = null;
+export const setOnUnauthorized = (fn: (() => void) | null) => {
+  onUnauthorized = fn;
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
+  const token = getToken();
   try {
     res = await fetch(API_URL + path, {
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       ...init,
     });
   } catch (e) {
     throw new ApiError(0, `Cannot reach backend at ${API_URL}`);
+  }
+  if (res.status === 401 && !path.startsWith('/api/auth/')) {
+    clearToken();
+    onUnauthorized?.();
   }
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -65,6 +94,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
+
+// ---- Auth ----
+
+export interface AuthResponse {
+  access_token: string;
+  token_type: string;
+  user: User;
+}
+
+export const login = (body: { email: string; password: string }) =>
+  request<AuthResponse>('/api/auth/login', { method: 'POST', body: JSON.stringify(body) });
+export const register = (body: { email: string; password: string; display_name: string }) =>
+  request<AuthResponse>('/api/auth/register', { method: 'POST', body: JSON.stringify(body) });
+export const getMe = () => request<User>('/api/auth/me');
+export const logout = () =>
+  request<{ status: string }>('/api/auth/logout', { method: 'POST' });
+export const changePassword = (body: { current_password: string; new_password: string }) =>
+  request<{ status: string }>('/api/auth/password', { method: 'POST', body: JSON.stringify(body) });
+export const deleteMyAccount = (body: { password: string }) =>
+  request<{ status: string }>('/api/auth/account', { method: 'DELETE', body: JSON.stringify(body) });
 
 // ---- Keyword intelligence ----
 
@@ -123,10 +172,27 @@ export const archiveJob = (id: number) =>
   request<Job>(`/api/jobs/${id}/archive`, { method: 'POST' });
 export const unarchiveJob = (id: number) =>
   request<Job>(`/api/jobs/${id}/unarchive`, { method: 'POST' });
+export const bulkArchiveJobs = (ids: number[]) =>
+  request<{ archived: number[]; skipped: number[] }>('/api/jobs/bulk-archive', {
+    method: 'POST',
+    body: JSON.stringify({ ids }),
+  });
 export const ingestJobs = (jobs: JobIngest[]) =>
   request<{ ingested: number; auto_archived: number; alerts_sent: number }>('/api/jobs/ingest', {
     method: 'POST',
     body: JSON.stringify({ jobs }),
+  });
+
+// Dry-run scoring — scores a job payload without persisting anything or triggering proposals
+export interface ScorePreviewResult {
+  quality_score: number;
+  score_breakdown: ScoreBreakdown;
+  red_flags: string[];
+}
+export const scorePreview = (job: JobIngest) =>
+  request<ScorePreviewResult>('/api/jobs/score-preview', {
+    method: 'POST',
+    body: JSON.stringify({ job }),
   });
 
 // ---- Alerts ----
@@ -191,8 +257,20 @@ export const deleteRateCardEntry = (id: number) =>
 
 // ---- Proposal review queue (human-in-the-loop boundary) ----
 
-export const getProposals = (status?: ProposalStatus) =>
-  request<ProposalQueueItem[]>(`/api/proposals${status ? `?status=${encodeURIComponent(status)}` : ''}`);
+export interface ProposalsQuery {
+  status?: ProposalStatus;
+  limit?: number;
+  offset?: number;
+}
+
+export const getProposals = (query: ProposalsQuery = {}) => {
+  const params = new URLSearchParams();
+  if (query.status) params.set('status', query.status);
+  if (query.limit !== undefined) params.set('limit', String(query.limit));
+  if (query.offset !== undefined) params.set('offset', String(query.offset));
+  const qs = params.toString();
+  return request<ProposalsPage>(`/api/proposals${qs ? `?${qs}` : ''}`);
+};
 export const getProposal = (id: number) => request<ProposalQueueItem>(`/api/proposals/${id}`);
 export const approveProposal = (id: number, body: ProposalReviewAction) =>
   request<ProposalQueueItem>(`/api/proposals/${id}/approve`, {
@@ -210,7 +288,7 @@ export const submitProposal = (id: number) =>
 // ---- Proposals v3 (learning loop) ----
 
 export const bulkApproveProposals = (ids: number[], reviewer: string) =>
-  request<{ approved: number; skipped: number }>('/api/proposals/bulk-approve', {
+  request<{ approved: number[]; skipped: number[] }>('/api/proposals/bulk-approve', {
     method: 'POST',
     body: JSON.stringify({ ids, reviewer }),
   });
@@ -228,6 +306,14 @@ export const suggestProposalTemplates = (platform: Platform, skills: string[]) =
   const params = new URLSearchParams({ platform, skills: skills.join(',') });
   return request<Template[]>(`/api/proposals/templates/suggest?${params.toString()}`);
 };
+
+// ---- Phase 3: winning-advantage features ----
+
+// Draft a follow-up for an already-submitted proposal (409 when not eligible)
+export const followUpProposal = (id: number) =>
+  request<ProposalQueueItem>(`/api/proposals/${id}/follow-up`, { method: 'POST' });
+export const getInterviewPrep = (id: number) =>
+  request<InterviewPrep>(`/api/proposals/${id}/interview-prep`);
 
 // ---- Gigs (`/api/gigs`) ----
 
@@ -248,7 +334,7 @@ export const registerGig = (body: GigPayload) =>
 export const getGigMetrics = (gigId: number) =>
   request<GigMetric[]>(`/api/gigs/metrics?gig_id=${encodeURIComponent(gigId)}`);
 export const triggerGigScrape = () =>
-  request<{ enqueued?: number }>('/api/gigs/metrics/scrape', { method: 'POST' });
+  request<{ queued_tasks: number[] }>('/api/gigs/metrics/scrape', { method: 'POST' });
 
 export interface GigTemplatePayload {
   platform: Platform;
@@ -315,6 +401,16 @@ export const validateBooleanQuery = (query: string) =>
     '/api/search-profiles/validate-boolean',
     { method: 'POST', body: JSON.stringify({ query }) },
   );
+export const runSearchProfileNow = (id: number) =>
+  request<{ queued: boolean; platforms: string[] }>(`/api/search-profiles/${id}/run-now`, {
+    method: 'POST',
+  });
+
+// ---- Analytics (learning loop) ----
+
+export const getFunnelAnalytics = () => request<FunnelAnalytics>('/api/analytics/funnel');
+export const getAnalyticsTrend = (weeks = 8) =>
+  request<TrendAnalytics>(`/api/analytics/trend?weeks=${encodeURIComponent(weeks)}`);
 
 // ---- Platform accounts ----
 
@@ -327,3 +423,22 @@ export const updateAccount = (id: number, body: PlatformAccountPayload) =>
   request<PlatformAccount>(`/api/accounts/${id}`, { method: 'PUT', body: JSON.stringify(body) });
 export const deleteAccount = (id: number) =>
   request<void>(`/api/accounts/${id}`, { method: 'DELETE' });
+
+// ---- Credential enrollment (Contract Addendum v6 — secrets go to the vault, never returned) ----
+
+export const enrollCredentials = (accountId: number, secrets: Record<string, string>) =>
+  request<void>(`/api/accounts/${accountId}/credentials`, {
+    method: 'POST',
+    body: JSON.stringify({ secrets }),
+  });
+export const getCredentialStatus = (accountId: number) =>
+  request<CredentialStatus>(`/api/accounts/${accountId}/credentials/status`);
+export const deleteCredentials = (accountId: number) =>
+  request<void>(`/api/accounts/${accountId}/credentials`, { method: 'DELETE' });
+export const startFreelancerOAuth = (accountId: number) =>
+  request<{ authorize_url: string }>(`/api/accounts/${accountId}/oauth/freelancer/start`);
+export const completeFreelancerOAuth = (accountId: number, code: string) =>
+  request<void>(`/api/accounts/${accountId}/oauth/freelancer/complete`, {
+    method: 'POST',
+    body: JSON.stringify({ code }),
+  });
