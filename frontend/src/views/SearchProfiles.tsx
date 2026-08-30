@@ -5,6 +5,7 @@ import {
   getFilters,
   getKeywordGroups,
   getSearchProfiles,
+  runSearchProfileNow,
   updateSearchProfile,
   validateBooleanQuery,
   type SearchProfilePayload,
@@ -40,6 +41,7 @@ export default function SearchProfiles() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [validation, setValidation] = useState<Validation>({ state: 'idle' });
+  const [runningId, setRunningId] = useState<number | null>(null);
   const queryRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -143,12 +145,35 @@ export default function SearchProfiles() {
     setDraft({ ...draft, name: preset.name, boolean_query: preset.query });
   };
 
+  const runNow = async (p: SearchProfile) => {
+    setRunningId(p.id);
+    try {
+      const res = await runSearchProfileNow(p.id);
+      setNotice(
+        res.queued
+          ? `Search "${p.name}" queued for: ${res.platforms.join(', ') || 'no platforms'}`
+          : `Search "${p.name}" was not queued.`,
+      );
+      setError(null);
+      window.setTimeout(() => setNotice(null), 5000);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setRunningId(null);
+    }
+  };
+
   return (
     <div>
       <h1>Search Profiles</h1>
       <p className="page-sub">
         Named boolean queries wired to keyword groups and filters · auto-queue drafts proposals for
         matches
+      </p>
+      <p className="muted" style={{ fontSize: 12, marginTop: -18, marginBottom: 24 }}>
+        How discovery searches: the positive terms of the boolean query become the search keywords
+        (falling back to the linked keyword group's primary terms, then the profile name). Saved
+        profiles are searched automatically on the discovery schedule (every ~15 minutes).
       </p>
       <ErrorBanner error={error} />
       {notice && <div className="info-banner">{notice}</div>}
@@ -174,7 +199,19 @@ export default function SearchProfiles() {
                   {p.boolean_query || 'no query'}
                 </div>
               </div>
-              {p.auto_queue_proposals && <span className="pill">auto-queue</span>}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {p.auto_queue_proposals && <span className="pill">auto-queue</span>}
+                <button
+                  className="btn secondary small"
+                  disabled={runningId === p.id}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void runNow(p);
+                  }}
+                >
+                  {runningId === p.id ? 'Queueing…' : 'Run search now'}
+                </button>
+              </div>
             </div>
           ))}
         </div>

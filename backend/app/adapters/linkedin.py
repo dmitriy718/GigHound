@@ -40,11 +40,13 @@ class LinkedInJobsAdapter(PlatformAdapter):
     platform = "linkedin"
     rate_per_sec = 1.0
 
-    def __init__(self, db: Session | None = None, provider: str = "theirstack",
+    def __init__(self, db: Session | None = None, user_id: int | None = None,
+                 provider: str = "theirstack",
                  client: httpx.AsyncClient | None = None):
-        super().__init__(client)
+        principal = f"user{user_id}:default" if user_id is not None else "default"
+        super().__init__(client, principal=principal)
         self.provider = provider
-        self.vault = CredentialVault(db) if db is not None else None
+        self.vault = CredentialVault(db, user_id) if db is not None and user_id is not None else None
 
     def _api_key(self) -> str:
         env_var = "BRIGHTDATA_API_KEY" if self.provider == "brightdata" else "THEIRSTACK_API_KEY"
@@ -58,6 +60,7 @@ class LinkedInJobsAdapter(PlatformAdapter):
 
     async def search_jobs(self, query: str = "", location: str = "",
                           remote_only: bool = True, limit: int = 25, **_) -> list[JobPosting]:
+        self._consume_daily_action()
         if self.provider == "brightdata":
             return await self._search_brightdata(query, location, remote_only, limit)
         return await self._search_theirstack(query, location, remote_only, limit)

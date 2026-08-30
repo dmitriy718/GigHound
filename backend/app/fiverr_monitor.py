@@ -48,9 +48,14 @@ def _peek(key: str) -> int:
     return _local_counters.get(key, (0, 0))[0]
 
 
-def offers_remaining_today() -> int:
+def _offers_key(user_id: int) -> str:
+    """Per-tenant daily counter key — the 10/day cap is per user, not global."""
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return max(0, FIVERR_DAILY_OFFER_LIMIT - _peek(f"fiverr:offers:{day}"))
+    return f"fiverr:offers:{user_id}:{day}"
+
+
+def offers_remaining_today(user_id: int) -> int:
+    return max(0, FIVERR_DAILY_OFFER_LIMIT - _peek(_offers_key(user_id)))
 
 
 # ---------------- gig creation ----------------
@@ -68,6 +73,7 @@ def queue_gig_creation(db: Session, template: GigTemplate) -> tuple[StealthTask 
         return None, f"gig draft rate limit: {GIG_DRAFTS_PER_HOUR}/hour per platform"
 
     task = StealthTask(
+        user_id=template.user_id,
         platform=template.platform,
         task_type=f"{template.platform}_create_gig" if template.platform != "fiverr" else "fiverr_create_gig",
         payload={
@@ -78,7 +84,7 @@ def queue_gig_creation(db: Session, template: GigTemplate) -> tuple[StealthTask 
         },
     )
     db.add(task)
-    db.add(AuditLog(action_type="gig_created", platform=template.platform, detail={
+    db.add(AuditLog(user_id=template.user_id, action_type="gig_created", platform=template.platform, detail={
         "template_id": template.id, "stealth_task_id": None, "mode": "draft",
     }))
     db.commit()
@@ -94,6 +100,7 @@ def queue_upwork_catalog_upsert(db: Session, template: GigTemplate) -> tuple[Ste
     if not allowed:
         return None, reason
     task = StealthTask(
+        user_id=template.user_id,
         platform="upwork",
         task_type="upwork_catalog_upsert",
         payload={
@@ -103,7 +110,7 @@ def queue_upwork_catalog_upsert(db: Session, template: GigTemplate) -> tuple[Ste
         },
     )
     db.add(task)
-    db.add(AuditLog(action_type="gig_created", platform="upwork", detail={
+    db.add(AuditLog(user_id=template.user_id, action_type="gig_created", platform="upwork", detail={
         "template_id": template.id, "auto_publish": bool(template.auto_publish),
     }))
     db.commit()
@@ -113,10 +120,11 @@ def queue_upwork_catalog_upsert(db: Session, template: GigTemplate) -> tuple[Ste
 
 # ---------------- buyer request monitor ----------------
 
-def matching_buyer_requests(db: Session, requests: list[dict]) -> list[dict]:
+def matching_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> list[dict]:
     """Filter raw buyer requests against active gig templates' categories/tags."""
     templates = (db.query(GigTemplate)
-                 .filter(GigTemplate.platform == "fiverr", GigTemplate.is_active.is_(True))
+                 .filter(GigTemplate.user_id == user_id,
+                         GigTemplate.platform == "fiverr", GigTemplate.is_active.is_(True))
                  .all())
     if not templates:
         return []
@@ -147,7 +155,7 @@ def generate_custom_offer(request: dict, price: float | None = None,
             f"Happy to share a relevant sample before you decide.")
 
 
-def process_buyer_requests(db: Session, requests: list[dict]) -> dict:
+def process_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> dict:
     """Monitor tick: filter → generate offers → queue for approval.
 
     ALWAYS requires human approval (no auto-approve for buyer requests).
@@ -158,19 +166,22 @@ def process_buyer_requests(db: Session, requests: list[dict]) -> dict:
         log.warning("buyer request monitor skipped: %s", reason)
         return {"queued": 0, "skipped_reason": reason}
 
-    matched = matching_buyer_requests(db, requests)
+    matched = matching_buyer_requests(db, user_id, requests)
     queued = 0
     for req in matched:
-        if offers_remaining_today() <= 0:
-            log.info("fiverr daily offer cap reached (%d/day)", FIVERR_DAILY_OFFER_LIMIT)
+        if offers_remaining_today(user_id) <= 0:
+            log.info("fiverr daily offer cap reached (%d/day, user %d)",
+                     FIVERR_DAILY_OFFER_LIMIT, user_id)
             break
         ext_id = str(req.get("id") or req.get("url") or req.get("title", "")[:80])
         exists = (db.query(Job)
-                  .filter(Job.platform == "fiverr", Job.external_id == ext_id)
+                  .filter(Job.user_id == user_id,
+                          Job.platform == "fiverr", Job.external_id == ext_id)
                   .first())
         if exists:
             continue
         job = Job(
+            user_id=user_id,
             external_id=ext_id, platform="fiverr",
             title=req.get("title", "Buyer request"),
             description=req.get("description", ""),
@@ -187,6 +198,7 @@ def process_buyer_requests(db: Session, requests: list[dict]) -> dict:
         db.flush()
         offer_text = generate_custom_offer(req)
         item = ProposalQueueItem(
+            user_id=user_id,
             job_id=job.id, platform="fiverr", request_type="buyer_request",
             proposal_text=offer_text, humanized_text=offer_text,
             bid_amount=req.get("budget") or 50,
@@ -196,28 +208,27 @@ def process_buyer_requests(db: Session, requests: list[dict]) -> dict:
             confidence=60.0,
         )
         db.add(item)
-        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        _counter(f"fiverr:offers:{day}", 86400)
-        db.add(AuditLog(action_type="buyer_request_sent", platform="fiverr", detail={
+        _counter(_offers_key(user_id), 86400)
+        db.add(AuditLog(user_id=user_id, action_type="buyer_request_sent", platform="fiverr", detail={
             "job_id": job.id, "offer": offer_text[:200], "status": "queued_for_approval",
         }))
         queued += 1
     db.commit()
-    return {"queued": queued, "offers_remaining": offers_remaining_today()}
+    return {"queued": queued, "offers_remaining": offers_remaining_today(user_id)}
 
 
-def enqueue_buyer_request_fetch(db: Session) -> StealthTask | None:
+def enqueue_buyer_request_fetch(db: Session, user_id: int) -> StealthTask | None:
     """Queue the stealth fetch task the browser worker executes each tick."""
     allowed, reason = circuit_breaker.check("fiverr")
     if not allowed:
         log.warning("buyer request fetch skipped: %s", reason)
-        task = StealthTask(platform="fiverr", task_type="fiverr_fetch_buyer_requests",
+        task = StealthTask(user_id=user_id, platform="fiverr", task_type="fiverr_fetch_buyer_requests",
                            payload={}, status="skipped_circuit_open",
                            result={"reason": reason})
         db.add(task)
         db.commit()
         return None
-    task = StealthTask(platform="fiverr", task_type="fiverr_fetch_buyer_requests", payload={})
+    task = StealthTask(user_id=user_id, platform="fiverr", task_type="fiverr_fetch_buyer_requests", payload={})
     db.add(task)
     db.commit()
     db.refresh(task)

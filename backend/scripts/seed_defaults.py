@@ -1,22 +1,43 @@
-"""Seed one sensible default per dashboard collection.
+"""Seed one sensible default per dashboard collection for the demo user.
 
-Idempotent: a default is only created when its table is completely empty,
-so running this repeatedly (or against a populated DB) never duplicates
-or overwrites user data. Wired defaults reference the first existing
-keyword group / filter when present.
+All rows are tenant-owned (AD-1), so seeding happens under a demo account:
+    email: demo@gighound.local   password: demo1234
+
+Idempotent: a default is only created when the demo user's collection is
+completely empty, so running this repeatedly (or against a populated DB)
+never duplicates or overwrites user data. Wired defaults reference the
+demo user's first existing keyword group / filter when present.
 
 Run:  .venv/bin/python -m scripts.seed_defaults   (from backend/)
 """
 
+from app.auth import hash_password
 from app.database import SessionLocal
 from app import models as m
+
+DEMO_EMAIL = "demo@gighound.local"
+DEMO_PASSWORD = "demo1234"
+
+
+def get_or_create_demo_user(db) -> m.User:
+    user = db.query(m.User).filter(m.User.email == DEMO_EMAIL).first()
+    if not user:
+        user = m.User(email=DEMO_EMAIL, password_hash=hash_password(DEMO_PASSWORD),
+                      display_name="Demo User")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
 
 
 def seed(db) -> list[str]:
     created: list[str] = []
+    user = get_or_create_demo_user(db)
+    uid = user.id
 
-    if db.query(m.KeywordGroup).count() == 0:
-        group = m.KeywordGroup(name="Default — Full-Stack Web", service_type="web-development")
+    if db.query(m.KeywordGroup).filter(m.KeywordGroup.user_id == uid).count() == 0:
+        group = m.KeywordGroup(user_id=uid, name="Default — Full-Stack Web",
+                               service_type="web-development")
         group.keywords = [
             m.Keyword(term="react", kind="primary", weight=0.9),
             m.Keyword(term="typescript", kind="primary", weight=0.85),
@@ -31,11 +52,13 @@ def seed(db) -> list[str]:
         db.add(group)
         created.append("keyword group")
 
-    if db.query(m.SearchFilter).count() == 0:
+    if db.query(m.SearchFilter).filter(m.SearchFilter.user_id == uid).count() == 0:
         db.flush()
-        group = db.query(m.KeywordGroup).order_by(m.KeywordGroup.id).first()
+        group = (db.query(m.KeywordGroup).filter(m.KeywordGroup.user_id == uid)
+                 .order_by(m.KeywordGroup.id).first())
         db.add(
             m.SearchFilter(
+                user_id=uid,
                 name="Default — Remote web jobs",
                 keyword_group_id=group.id if group else None,
                 platforms=["upwork", "freelancer", "linkedin", "indeed"],
@@ -53,12 +76,15 @@ def seed(db) -> list[str]:
         )
         created.append("search filter")
 
-    if db.query(m.SearchProfile).count() == 0:
+    if db.query(m.SearchProfile).filter(m.SearchProfile.user_id == uid).count() == 0:
         db.flush()
-        group = db.query(m.KeywordGroup).order_by(m.KeywordGroup.id).first()
-        filt = db.query(m.SearchFilter).order_by(m.SearchFilter.id).first()
+        group = (db.query(m.KeywordGroup).filter(m.KeywordGroup.user_id == uid)
+                 .order_by(m.KeywordGroup.id).first())
+        filt = (db.query(m.SearchFilter).filter(m.SearchFilter.user_id == uid)
+                .order_by(m.SearchFilter.id).first())
         db.add(
             m.SearchProfile(
+                user_id=uid,
                 name="Default — Full-Stack Web",
                 keyword_group_id=group.id if group else None,
                 filter_id=filt.id if filt else None,
@@ -123,12 +149,14 @@ def seed(db) -> list[str]:
     for platform, pitch in DEFAULT_PITCHES.items():
         exists = (
             db.query(m.ProfileTemplate)
-            .filter(m.ProfileTemplate.platform == platform)
+            .filter(m.ProfileTemplate.user_id == uid,
+                    m.ProfileTemplate.platform == platform)
             .count()
         )
         if exists == 0:
             db.add(
                 m.ProfileTemplate(
+                    user_id=uid,
                     platform=platform,
                     name=f"Default {platform} pitch",
                     pitch_template=pitch,
@@ -136,9 +164,10 @@ def seed(db) -> list[str]:
             )
             created.append(f"profile template ({platform})")
 
-    if db.query(m.PortfolioItem).count() == 0:
+    if db.query(m.PortfolioItem).filter(m.PortfolioItem.user_id == uid).count() == 0:
         db.add(
             m.PortfolioItem(
+                user_id=uid,
                 title="Sample full-stack project",
                 description="Replace with a real project: stack, outcome, and your role.",
                 url="",
@@ -147,9 +176,10 @@ def seed(db) -> list[str]:
         )
         created.append("portfolio item")
 
-    if db.query(m.RateCardEntry).count() == 0:
+    if db.query(m.RateCardEntry).filter(m.RateCardEntry.user_id == uid).count() == 0:
         db.add(
             m.RateCardEntry(
+                user_id=uid,
                 skill_category="Full-stack web development",
                 hourly_rate=75.0,
                 fixed_min=1000.0,
@@ -158,15 +188,17 @@ def seed(db) -> list[str]:
         )
         created.append("rate card entry")
 
-    if db.query(m.PlatformAccount).count() == 0:
+    if db.query(m.PlatformAccount).filter(m.PlatformAccount.user_id == uid).count() == 0:
         db.add(
             m.PlatformAccount(
+                user_id=uid,
                 platform="upwork",
                 label="Default Upwork (hybrid)",
                 principal="agency-manager",
                 mode="hybrid",
                 enabled=True,
                 credential_ref="vault://upwork/agency-manager",
+                settings={},
             )
         )
         created.append("platform account")

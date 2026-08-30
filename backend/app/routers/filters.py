@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from ..auth import get_current_user, get_owned, scoped
 from ..cache import cache
 from ..database import get_db
 from ..filtering import job_matches_filter
-from ..models import Job, SearchFilter
+from ..models import Job, SearchFilter, User
 from ..schemas import PreviewResult, SearchFilterIn, SearchFilterOut
 
 router = APIRouter(prefix="/api/filters", tags=["filters"])
@@ -19,13 +20,14 @@ def _apply(flt: SearchFilter, body: SearchFilterIn):
 
 
 @router.get("", response_model=list[SearchFilterOut])
-def list_filters(db: Session = Depends(get_db)):
-    return db.query(SearchFilter).all()
+def list_filters(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return scoped(db, SearchFilter, user).all()
 
 
 @router.post("", response_model=SearchFilterOut, status_code=201)
-def create_filter(body: SearchFilterIn, db: Session = Depends(get_db)):
-    flt = SearchFilter()
+def create_filter(body: SearchFilterIn, db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    flt = SearchFilter(user_id=user.id)
     _apply(flt, body)
     db.add(flt)
     db.commit()
@@ -35,8 +37,9 @@ def create_filter(body: SearchFilterIn, db: Session = Depends(get_db)):
 
 
 @router.put("/{filter_id}", response_model=SearchFilterOut)
-def update_filter(filter_id: int, body: SearchFilterIn, db: Session = Depends(get_db)):
-    flt = db.get(SearchFilter, filter_id)
+def update_filter(filter_id: int, body: SearchFilterIn, db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    flt = get_owned(db, SearchFilter, filter_id, user)
     if not flt:
         raise HTTPException(404, "filter not found")
     _apply(flt, body)
@@ -47,8 +50,9 @@ def update_filter(filter_id: int, body: SearchFilterIn, db: Session = Depends(ge
 
 
 @router.delete("/{filter_id}", status_code=204)
-def delete_filter(filter_id: int, db: Session = Depends(get_db)):
-    flt = db.get(SearchFilter, filter_id)
+def delete_filter(filter_id: int, db: Session = Depends(get_db),
+                  user: User = Depends(get_current_user)):
+    flt = get_owned(db, SearchFilter, filter_id, user)
     if not flt:
         raise HTTPException(404, "filter not found")
     db.delete(flt)
@@ -57,17 +61,18 @@ def delete_filter(filter_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{filter_id}/preview", response_model=PreviewResult)
-def preview_filter(filter_id: int, db: Session = Depends(get_db)):
-    flt = db.get(SearchFilter, filter_id)
+def preview_filter(filter_id: int, db: Session = Depends(get_db),
+                   user: User = Depends(get_current_user)):
+    flt = get_owned(db, SearchFilter, filter_id, user)
     if not flt:
         raise HTTPException(404, "filter not found")
 
-    cache_key = f"preview:{filter_id}"
+    cache_key = f"preview:{user.id}:{filter_id}"
     cached = cache.get_json(cache_key)
     if cached:
         return cached
 
-    jobs = db.query(Job).filter(Job.status != "archived").all()
+    jobs = scoped(db, Job, user).filter(Job.status != "archived").all()
     matched, excluded = [], 0
     for job in jobs:
         ok, _ = job_matches_filter(job, flt)

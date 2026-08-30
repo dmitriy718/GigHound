@@ -52,6 +52,16 @@ RED_FLAG_PATTERNS = [
     (r"student project|school project|homework|budget project", "student/budget project"),
 ]
 
+# Word-boundary lookups for COMPLEXITY_TERMS: "ai" must not match "said",
+# "api" must not match "capital". Compiled once, matched against lowered text.
+_COMPLEXITY_RES = {
+    term: re.compile(r"\b" + re.escape(term) + r"\b") for term in COMPLEXITY_TERMS
+}
+
+
+def _term_re(term: str) -> re.Pattern:
+    return re.compile(r"\b" + re.escape(term.lower()) + r"\b")
+
 VAGUE_PHRASES = [
     "need a website", "need an app", "simple project", "quick job",
     "easy task", "asap", "help me", "looking for someone",
@@ -63,7 +73,8 @@ DELIVERABLE_PATTERNS = r"(deliverables?|scope of work|milestones?|you will (buil
 def estimate_complexity(text: str) -> int:
     """Rough complexity score 0-15 from technical term density."""
     t = text.lower()
-    return min(15, sum(w for term, w in COMPLEXITY_TERMS.items() if term in t))
+    return min(15, sum(w for term, w in COMPLEXITY_TERMS.items()
+                       if _COMPLEXITY_RES[term].search(t)))
 
 
 def estimate_hours(complexity: int, text: str) -> float:
@@ -82,7 +93,8 @@ def score_keyword_match(text: str, primary: list, secondary: list, negative: lis
     t = text.lower()
     for kw in negative:
         term = kw if isinstance(kw, str) else kw.term
-        if term.lower() in t:
+        # word-boundary: negative "php" must not kill "graphPHP"
+        if _term_re(term).search(t):
             return 0.0, True
     points = 0.0
     if primary:
@@ -145,7 +157,7 @@ def score_description_quality(text: str) -> float:
         pts += 6.0
     if re.search(DELIVERABLE_PATTERNS, t):
         pts += 8.0
-    tech_hits = sum(1 for term in COMPLEXITY_TERMS if term in t)
+    tech_hits = sum(1 for rx in _COMPLEXITY_RES.values() if rx.search(t))
     if tech_hits:
         pts += min(6.0, tech_hits * 1.5)
     vague_hits = sum(1 for p in VAGUE_PHRASES if p in t)
@@ -210,8 +222,8 @@ def detect_bait_and_switch(title: str, description: str) -> bool:
     if not description:
         return False
     t_title, t_desc = title.lower(), description.lower()
-    title_tech = {term for term in COMPLEXITY_TERMS if term in t_title}
-    desc_tech = {term for term in COMPLEXITY_TERMS if term in t_desc}
+    title_tech = {term for term, rx in _COMPLEXITY_RES.items() if rx.search(t_title)}
+    desc_tech = {term for term, rx in _COMPLEXITY_RES.items() if rx.search(t_desc)}
     vague = sum(1 for p in VAGUE_PHRASES if p in t_desc)
     return bool(title_tech) and not desc_tech and (vague >= 2 or len(description) < 150)
 

@@ -1,5 +1,13 @@
 // Domain types mirrored from docs/api-contract.md
 
+export interface User {
+  id: number;
+  email: string;
+  display_name: string;
+  is_active: boolean;
+  created_at: string;
+}
+
 export type Platform =
   | 'upwork'
   | 'fiverr'
@@ -90,6 +98,14 @@ export interface ClientInfo {
   reviews_count?: number;
 }
 
+// Phase 3: outcome history with this client — present on GET /api/jobs/{id}, null when never seen
+export interface ClientHistory {
+  past_proposals: number;
+  hired: number;
+  rejected: number;
+  ghosted: number;
+}
+
 export interface Job {
   id: number;
   external_id: string;
@@ -117,6 +133,7 @@ export interface Job {
   status: JobStatus;
   is_duplicate: boolean;
   duplicate_of: number | null;
+  client_history?: ClientHistory | null; // Phase 3: detail endpoint only
   fetched_at: string;
 }
 
@@ -201,6 +218,10 @@ export interface PlatformAccount {
   mode: AccountMode;
   enabled: boolean;
   credential_ref: string; // pointer into the credential vault — never a secret itself
+  // Per-platform extras. Recognized keys:
+  //   bidder_id (number)     — Freelancer: required before proposals can be submitted
+  //   on_behalf_of (string)  — Upwork: agency member the browser worker acts as
+  settings: Record<string, unknown>;
   created_at: string;
 }
 
@@ -208,6 +229,7 @@ export type ProposalStatus =
   | 'pending_review'
   | 'approved'
   | 'rejected'
+  | 'queued_for_browser' // Upwork: waiting on the external browser worker; flips to 'submitted' when done
   | 'submitted'
   | 'failed'
   | 'generation_failed';
@@ -215,6 +237,7 @@ export const PROPOSAL_STATUSES: ProposalStatus[] = [
   'pending_review',
   'approved',
   'rejected',
+  'queued_for_browser',
   'submitted',
   'failed',
   'generation_failed',
@@ -246,6 +269,8 @@ export interface ProposalQueueItem {
   rejection_reason: string | null;
   outcome: ProposalOutcome;
   request_type: ProposalRequestType;
+  bid_advice: BidAdvice | null; // Phase 3: bid/caution/skip recommendation
+  client_replied_at: string | null; // set when the client answers on the platform (see client_replied WS event)
 }
 
 export interface ProposalReviewAction {
@@ -253,6 +278,14 @@ export interface ProposalReviewAction {
   proposal_text?: string;
   bid_amount?: number;
   bid_period_days?: number;
+  template_id?: number; // reviewer started from this template — reuse it instead of minting
+  save_as_template?: boolean; // default true server-side; false opts out of minting a template
+}
+
+// GET /api/proposals — always paginated
+export interface ProposalsPage {
+  items: ProposalQueueItem[];
+  total: number;
 }
 
 // v3: reject requires a reason — feeds rejection learning
@@ -281,7 +314,26 @@ export const REJECTION_REASONS: RejectionReason[] = [
   'other',
 ];
 
-export type ProposalRequestType = 'job' | 'buyer_request';
+export type ProposalRequestType = 'job' | 'buyer_request' | 'follow_up';
+
+// Phase 3: should we bid on this at all — derived from win-rate learning
+export interface BidAdvice {
+  recommendation: 'bid' | 'caution' | 'skip';
+  reason: string;
+}
+
+// Phase 3: GET /api/proposals/{id}/interview-prep
+export interface InterviewPrepQuestion {
+  question: string;
+  suggested_answer: string;
+}
+
+export interface InterviewPrep {
+  questions: InterviewPrepQuestion[];
+  pain_points: string[];
+  red_flags: string[];
+  talking_points: string[];
+}
 
 export interface ProposalVersion {
   text: string;
@@ -322,6 +374,79 @@ export interface Template {
   created_at: string;
 }
 
+// ---- Phase 2: win-rate analytics (`GET /api/analytics/funnel`) ----
+// win_rate is a 0–100 float, or null when no outcomes have been recorded yet.
+
+export interface FunnelCounts {
+  queued: number;
+  approved: number;
+  submitted: number;
+  replied: number;
+  hired: number;
+  rejected: number;
+  ghosted: number;
+}
+
+export interface PlatformFunnelRow {
+  platform: Platform;
+  queued: number;
+  approved: number;
+  submitted: number;
+  replied: number;
+  hired: number;
+  win_rate: number | null;
+}
+
+export interface TemplateFunnelRow {
+  template_id: number;
+  title: string;
+  platform: Platform;
+  uses: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+}
+
+export interface BidBandRow {
+  band: string;
+  submitted: number;
+  hired: number;
+  win_rate: number | null;
+}
+
+export interface RejectionReasonCount {
+  reason: string;
+  count: number;
+}
+
+export interface FunnelAnalytics {
+  funnel: FunnelCounts;
+  by_platform: PlatformFunnelRow[];
+  by_template: TemplateFunnelRow[];
+  by_bid_band: BidBandRow[];
+  rejection_reasons: RejectionReasonCount[];
+}
+
+// GET /api/analytics/trend?weeks=N — weekly rollup, win_rate 0–100 or null
+export interface TrendWeek {
+  week: string;
+  submitted: number;
+  replied: number;
+  hired: number;
+  win_rate: number | null;
+}
+
+export interface TrendAnalytics {
+  weeks: TrendWeek[];
+}
+
+// Contract Addendum v6 — credential enrollment status (key names only, never values)
+export interface CredentialStatus {
+  enrolled: boolean;
+  keys: string[];
+  updated_at: string | null;
+}
+
 export type GigStatus = 'draft' | 'active' | 'paused';
 export const GIG_STATUSES: GigStatus[] = ['draft', 'active', 'paused'];
 
@@ -336,13 +461,18 @@ export interface Gig {
   template_id: number | null;
 }
 
+export interface GigMetricSuggestion {
+  area: string;
+  message: string;
+}
+
 export interface GigMetric {
   week: string;
   impressions: number;
   clicks: number;
   orders: number;
   revenue: number;
-  suggestions: string[];
+  suggestions: GigMetricSuggestion[];
 }
 
 // Fiverr gig template — structured JSON editor
@@ -377,7 +507,7 @@ export interface GigTemplate {
   name: string;
   template_json: Partial<GigTemplateJson>;
   auto_publish: boolean;
-  active: boolean;
+  is_active: boolean;
   created_at?: string;
 }
 
@@ -388,9 +518,12 @@ export interface CompetitorGig {
 }
 
 export interface CompetitorSnapshot {
-  date: string;
+  id: number;
+  platform: Platform;
+  category: string;
   gigs: CompetitorGig[];
   insights: string[];
+  created_at: string;
 }
 
 // Scoring weights v2 (server-side, from contract — for UI display)

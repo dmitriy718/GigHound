@@ -13,6 +13,9 @@ import re
 
 _TOKEN_RE = re.compile(r'\s*(\(|\)|\bAND\b|\bOR\b|\bNOT\b|"[^"]+"|[^\s()"]+)', re.IGNORECASE)
 
+MAX_QUERY_LENGTH = 1000  # chars — query text is user-supplied
+MAX_DEPTH = 32           # paren/NOT nesting — bounds parser & evaluator recursion
+
 
 class BooleanQueryError(ValueError):
     pass
@@ -32,6 +35,7 @@ class _Parser:
     def __init__(self, tokens: list[str]):
         self.tokens = tokens
         self.pos = 0
+        self.depth = 0
 
     def peek(self):
         return self.tokens[self.pos] if self.pos < len(self.tokens) else None
@@ -40,6 +44,16 @@ class _Parser:
         tok = self.peek()
         self.pos += 1
         return tok
+
+    def _descend(self, rule):
+        """Track nesting depth so hostile queries can't blow the stack."""
+        self.depth += 1
+        if self.depth > MAX_DEPTH:
+            raise BooleanQueryError(f"query nesting too deep (max {MAX_DEPTH})")
+        try:
+            return rule()
+        finally:
+            self.depth -= 1
 
     def parse(self):
         node = self._or()
@@ -69,34 +83,44 @@ class _Parser:
         tok = self.peek()
         if tok is not None and tok.upper() == "NOT":
             self.next()
-            return ("NOT", self._not())
+            return ("NOT", self._descend(self._not))
         if tok == "(":
             self.next()
-            node = self._or()
+            node = self._descend(self._or)
             if self.next() != ")":
                 raise BooleanQueryError("missing closing parenthesis")
             return node
         if tok is None or tok == ")":
             raise BooleanQueryError("unexpected end of expression")
         self.next()
-        term = tok.strip('"')
-        return ("TERM", term)
+        if tok.startswith('"') and tok.endswith('"') and len(tok) >= 2:
+            return ("TERM", tok[1:-1], True)   # quoted phrase: substring semantics
+        return ("TERM", tok, False)            # single word: word-boundary match
 
 
 def parse_boolean_query(query: str):
     """Parse to an AST tuple tree. Empty query → None (matches everything)."""
     if not query or not query.strip():
         return None
+    if len(query) > MAX_QUERY_LENGTH:
+        raise BooleanQueryError(f"query too long ({len(query)} > {MAX_QUERY_LENGTH} chars)")
     return _Parser(_tokenize(query)).parse()
 
 
 def evaluate(ast, text: str) -> bool:
-    """Evaluate a parsed AST against text (case-insensitive substring terms)."""
+    """Evaluate a parsed AST against text.
+
+    Quoted/phrase terms keep case-insensitive substring semantics; single-word
+    terms match on word boundaries ("ai" does not match "said").
+    """
     if ast is None:
         return True
     op = ast[0]
     if op == "TERM":
-        return ast[1].lower() in text.lower()
+        term, phrase = ast[1], ast[2]
+        if phrase:
+            return term.lower() in text.lower()
+        return bool(re.search(r"\b" + re.escape(term) + r"\b", text, re.IGNORECASE))
     if op == "NOT":
         return not evaluate(ast[1], text)
     if op == "AND":

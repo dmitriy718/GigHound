@@ -6,11 +6,12 @@ prompt emphasis per platform. Top templates become few-shot examples for
 future generations.
 """
 import logging
+from datetime import datetime, timezone
 
 from rapidfuzz import fuzz
 from sqlalchemy.orm import Session
 
-from .models import ProposalQueueItem, RejectionFeedback, Template
+from .models import Job, ProposalQueueItem, RejectionFeedback, Template
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ def save_as_template(db: Session, proposal: ProposalQueueItem, title: str | None
                      tags: list[str] | None = None) -> Template:
     """Snapshot an approved proposal into the template library."""
     tpl = Template(
+        user_id=proposal.user_id,
         title=title or (proposal.proposal_text[:60] or f"Proposal #{proposal.id}"),
         platform=proposal.platform,
         text=proposal.proposal_text,
@@ -43,30 +45,69 @@ def save_as_template(db: Session, proposal: ProposalQueueItem, title: str | None
     return tpl
 
 
+def template_for_approval(db: Session, proposal: ProposalQueueItem) -> Template | None:
+    """Template provenance on approve (Phase 2.5).
+
+    If the reviewer started from a suggested template (`template_id` set and
+    resolvable), link THAT template — do not mint a new one. Only mint a new
+    Template when the item has no template_id and the item's
+    `save_as_template` flag is on (reviewer opt-out).
+
+    `uses` is NOT incremented here — a use is counted only at selection time
+    (`top_templates`), so one proposal contributes at most one use.
+    """
+    if proposal.template_id:
+        tpl = db.get(Template, proposal.template_id)
+        if tpl is not None:
+            return tpl
+    if not proposal.save_as_template:
+        return None
+    return save_as_template(db, proposal)
+
+
 def record_outcome(db: Session, proposal: ProposalQueueItem, outcome: str) -> None:
     """outcome: hired | rejected | ghosted — updates template win rates."""
     proposal.outcome = outcome
+    # stamped once (idempotent re-marks keep the first timestamp) so the
+    # analytics trend can bucket outcomes by ISO week — there is no
+    # dedicated outcome timestamp column
+    result = dict(proposal.submission_result or {})
+    result.setdefault("outcome_recorded_at",
+                      datetime.now(timezone.utc).isoformat())
+    proposal.submission_result = result
     tpl = None
     if proposal.template_id:
         tpl = db.get(Template, proposal.template_id)
     if tpl is None:
         tpl = (db.query(Template)
-               .filter(Template.source_proposal_id == proposal.id)
+               .filter(Template.user_id == proposal.user_id,
+                       Template.source_proposal_id == proposal.id)
                .first())
     if tpl:
-        tpl.uses += 1
         if outcome == "hired":
             tpl.wins += 1
         elif outcome in ("rejected", "ghosted"):
             tpl.losses += 1
         total = tpl.wins + tpl.losses
         tpl.win_rate = round(100 * tpl.wins / total, 1) if total else 0.0
+    if outcome == "hired" and proposal.bid_amount:
+        # won-bid learning: the winning amount feeds future bid suggestions
+        # for the matched rate-card category (Phase 3.4)
+        from .orchestrator import pick_rate
+        from .rate_learning import record_winning_bid
+
+        job = db.get(Job, proposal.job_id)
+        if job is not None:
+            rate = pick_rate(db, proposal.user_id, job)
+            category = rate.skill_category if rate else "general"
+            record_winning_bid(db, proposal.user_id, category, proposal.bid_amount)
     db.commit()
 
 
 def record_rejection(db: Session, proposal: ProposalQueueItem, reason: str,
                      notes: str = "") -> RejectionFeedback:
     fb = RejectionFeedback(
+        user_id=proposal.user_id,
         proposal_id=proposal.id, platform=proposal.platform,
         reason=reason if reason in _REASON_EFFECTS else "other", notes=notes,
     )
@@ -76,11 +117,12 @@ def record_rejection(db: Session, proposal: ProposalQueueItem, reason: str,
     return fb
 
 
-def generation_tuning(db: Session, platform: str) -> dict:
+def generation_tuning(db: Session, user_id: int, platform: str) -> dict:
     """Temperature + prompt hints derived from recent rejection trends."""
     recent = (
         db.query(RejectionFeedback)
-        .filter(RejectionFeedback.platform == platform)
+        .filter(RejectionFeedback.user_id == user_id,
+                RejectionFeedback.platform == platform)
         .order_by(RejectionFeedback.created_at.desc())
         .limit(20)
         .all()
@@ -99,12 +141,18 @@ def generation_tuning(db: Session, platform: str) -> dict:
     }
 
 
-def top_templates(db: Session, platform: str, skills: list[str] | None = None,
+def top_templates(db: Session, user_id: int, platform: str, skills: list[str] | None = None,
                   limit: int = 3) -> list[Template]:
-    """Best templates for few-shot prompting: platform + skill overlap + win rate."""
+    """Best templates for few-shot prompting: platform + skill overlap + win rate.
+
+    Selecting a template COUNTS as a use: `uses` is incremented for every
+    template returned here (they get injected as few-shot examples or shown
+    as reviewer suggestions).
+    """
     candidates = (
         db.query(Template)
-        .filter(Template.platform == platform, Template.uses >= 0)
+        .filter(Template.user_id == user_id,
+                Template.platform == platform)
         .all()
     )
     skills = [s.lower() for s in (skills or [])]
@@ -118,4 +166,9 @@ def top_templates(db: Session, platform: str, skills: list[str] | None = None,
         return t.win_rate + 0.3 * overlap + min(10, t.uses)  # experience bonus
 
     candidates.sort(key=score, reverse=True)
-    return candidates[:limit]
+    selected = candidates[:limit]
+    for tpl in selected:
+        tpl.uses += 1
+    if selected:
+        db.commit()
+    return selected

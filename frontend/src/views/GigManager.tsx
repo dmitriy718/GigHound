@@ -27,7 +27,7 @@ import type {
   Platform,
 } from '../types';
 import { GIG_STATUSES, PLATFORMS } from '../types';
-import { ErrorBanner, TagInput } from '../components/common';
+import { ErrorBanner, ErrorBoundary, formatDate, TagInput } from '../components/common';
 
 type Tab = 'gigs' | 'templates' | 'competitors';
 
@@ -136,7 +136,7 @@ function GigsTab() {
 
   const scrape = () => {
     triggerGigScrape()
-      .then((res) => setInfo(`Weekly scrape enqueued${res.enqueued != null ? ` (${res.enqueued} gigs)` : ''}.`))
+      .then((res) => setInfo(`Weekly scrape enqueued (${res.queued_tasks.length} gigs).`))
       .catch((e: Error) => setError(e.message));
   };
 
@@ -251,8 +251,8 @@ function GigsTab() {
             <>
               <h3>Suggestions (latest week)</h3>
               <ul className="muted" style={{ margin: '4px 0', paddingLeft: 18 }}>
-                {latest.suggestions.map((s) => (
-                  <li key={s}>{s}</li>
+                {latest.suggestions.map((s, i) => (
+                  <li key={i}>{s.message}</li>
                 ))}
               </ul>
             </>
@@ -535,7 +535,7 @@ function TemplatesTab() {
               </span>
               <span style={{ display: 'flex', gap: 6 }} onClick={(e) => e.stopPropagation()}>
                 <button className="btn small secondary" onClick={() => toggle(t)}>
-                  {t.active ? 'Deactivate' : 'Activate'}
+                  {t.is_active ? 'Deactivate' : 'Activate'}
                 </button>
                 <button className="btn small danger" onClick={() => remove(t)}>
                   Delete
@@ -845,8 +845,8 @@ function CompetitorsTab() {
       )}
       <div className="card-grid">
         {snapshots.map((s) => (
-          <div className="card" key={s.date}>
-            <h3>{s.date}</h3>
+          <div className="card" key={s.id}>
+            <h3>{formatDate(s.created_at)}</h3>
             {s.gigs.length > 0 && (
               <table className="data">
                 <thead>
@@ -884,7 +884,7 @@ function CompetitorsTab() {
 
 // ------------------------------------------------------------------- View
 
-export default function GigManager() {
+function GigManagerView() {
   const [tab, setTab] = useState<Tab>('gigs');
 
   return (
@@ -908,9 +908,29 @@ export default function GigManager() {
           </button>
         ))}
       </div>
-      {tab === 'gigs' && <GigsTab />}
-      {tab === 'templates' && <TemplatesTab />}
-      {tab === 'competitors' && <CompetitorsTab />}
+      {tab === 'gigs' && (
+        <ErrorBoundary label="Gigs panel">
+          <GigsTab />
+        </ErrorBoundary>
+      )}
+      {tab === 'templates' && (
+        <ErrorBoundary label="Template builder">
+          <TemplatesTab />
+        </ErrorBoundary>
+      )}
+      {tab === 'competitors' && (
+        <ErrorBoundary label="Competitor intel">
+          <CompetitorsTab />
+        </ErrorBoundary>
+      )}
     </div>
+  );
+}
+
+export default function GigManager() {
+  return (
+    <ErrorBoundary label="Gig Manager">
+      <GigManagerView />
+    </ErrorBoundary>
   );
 }

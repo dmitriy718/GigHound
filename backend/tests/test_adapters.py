@@ -12,8 +12,9 @@ from app.adapters.freelancer import FreelancerAdapter
 from app.adapters.linkedin import LinkedInJobsAdapter
 from app.adapters.upwork_agency import UpworkAgencyAdapter
 from app.adapters.vault import CredentialVault
+from app.auth import hash_password
 from app.database import Base
-from app.models import AgencyAuditLog
+from app.models import AgencyAuditLog, User
 
 
 @pytest.fixture()
@@ -25,12 +26,21 @@ def db():
     session.close()
 
 
+@pytest.fixture()
+def user(db):
+    u = User(email="adapter-test@example.com",
+             password_hash=hash_password("password123"), display_name="Adapter Test")
+    db.add(u)
+    db.commit()
+    return u
+
+
 def _mock_client(handler):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=5.0)
 
 
-def _seed_freelancer_creds(db, expired=False):
-    vault = CredentialVault(db)
+def _seed_freelancer_creds(db, user_id, expired=False):
+    vault = CredentialVault(db, user_id)
     expires = datetime.now(timezone.utc) + (timedelta(seconds=-10) if expired else timedelta(hours=1))
     vault.store("freelancer", "default", {
         "client_id": "cid", "client_secret": "sec",
@@ -53,12 +63,17 @@ FL_PROJECT = {
 
 # ---------------- Vault ----------------
 
-def test_vault_roundtrip(db):
-    vault = CredentialVault(db)
+def test_vault_roundtrip(db, user):
+    vault = CredentialVault(db, user.id)
     vault.store("freelancer", "default", {"api_key": "secret123"})
     assert vault.load("freelancer", "default") == {"api_key": "secret123"}
     # principals are isolated
     assert vault.load("freelancer", "agency_manager") is None
+    # tenants are isolated
+    other = User(email="other@example.com", password_hash="x")
+    db.add(other)
+    db.commit()
+    assert CredentialVault(db, other.id).load("freelancer", "default") is None
     # raw DB blob is not plaintext
     from app.models import AdapterCredential
     row = db.query(AdapterCredential).first()
@@ -70,8 +85,8 @@ def test_vault_roundtrip(db):
 # ---------------- Freelancer ----------------
 
 @pytest.mark.asyncio
-async def test_freelancer_search_normalization(db):
-    _seed_freelancer_creds(db)
+async def test_freelancer_search_normalization(db, user):
+    _seed_freelancer_creds(db, user.id)
 
     def handler(request: httpx.Request):
         assert request.headers["Authorization"] == "Bearer OLD_TOKEN"
@@ -79,7 +94,7 @@ async def test_freelancer_search_normalization(db):
         return httpx.Response(200, json={"status": "success", "result": {"projects": [FL_PROJECT]}})
 
     async with _mock_client(handler) as client:
-        adapter = FreelancerAdapter(db, client=client)
+        adapter = FreelancerAdapter(db, user.id, client=client)
         jobs = await adapter.search_jobs("react")
     assert len(jobs) == 1
     j = jobs[0]
@@ -91,8 +106,8 @@ async def test_freelancer_search_normalization(db):
 
 
 @pytest.mark.asyncio
-async def test_freelancer_token_refresh(db):
-    _seed_freelancer_creds(db, expired=True)
+async def test_freelancer_token_refresh(db, user):
+    _seed_freelancer_creds(db, user.id, expired=True)
     calls = []
 
     def handler(request: httpx.Request):
@@ -105,15 +120,15 @@ async def test_freelancer_token_refresh(db):
         return httpx.Response(200, json={"status": "success", "result": {"projects": []}})
 
     async with _mock_client(handler) as client:
-        adapter = FreelancerAdapter(db, client=client)
+        adapter = FreelancerAdapter(db, user.id, client=client)
         await adapter.search_jobs("react")
     assert "/api/oauth/token" in calls
-    assert CredentialVault(db).load("freelancer", "default")["access_token"] == "NEW_TOKEN"
+    assert CredentialVault(db, user.id).load("freelancer", "default")["access_token"] == "NEW_TOKEN"
 
 
 @pytest.mark.asyncio
-async def test_freelancer_bid_quota(db):
-    _seed_freelancer_creds(db)
+async def test_freelancer_bid_quota(db, user):
+    _seed_freelancer_creds(db, user.id)
     bids_placed = []
 
     def handler(request: httpx.Request):
@@ -123,7 +138,7 @@ async def test_freelancer_bid_quota(db):
         return httpx.Response(200, json={"status": "success", "result": {}})
 
     async with _mock_client(handler) as client:
-        adapter = FreelancerAdapter(db, client=client, monthly_bid_quota=2)
+        adapter = FreelancerAdapter(db, user.id, client=client, monthly_bid_quota=2)
         await adapter.place_bid(12345, 777, 500, 7, "proposal text")
         await adapter.place_bid(12346, 777, 600, 7, "proposal text 2")
         assert adapter.bids_remaining() == 0
@@ -135,8 +150,8 @@ async def test_freelancer_bid_quota(db):
 
 
 @pytest.mark.asyncio
-async def test_freelancer_api_error_envelope(db):
-    _seed_freelancer_creds(db)
+async def test_freelancer_api_error_envelope(db, user):
+    _seed_freelancer_creds(db, user.id)
 
     def handler(request: httpx.Request):
         return httpx.Response(200, json={
@@ -144,7 +159,7 @@ async def test_freelancer_api_error_envelope(db):
         })
 
     async with _mock_client(handler) as client:
-        adapter = FreelancerAdapter(db, client=client)
+        adapter = FreelancerAdapter(db, user.id, client=client)
         with pytest.raises(AdapterAuthError, match="invalid project"):
             await adapter.get_job_details("999")
 
@@ -164,8 +179,8 @@ UW_NODE = {
 }
 
 
-def _seed_upwork_creds(db):
-    CredentialVault(db).store("upwork", "agency_manager", {
+def _seed_upwork_creds(db, user_id):
+    CredentialVault(db, user_id).store("upwork", "agency_manager", {
         "client_id": "cid", "client_secret": "sec",
         "access_token": "UW_TOKEN", "refresh_token": "UW_REFRESH",
         "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
@@ -173,8 +188,8 @@ def _seed_upwork_creds(db):
 
 
 @pytest.mark.asyncio
-async def test_upwork_search_normalization(db):
-    _seed_upwork_creds(db)
+async def test_upwork_search_normalization(db, user):
+    _seed_upwork_creds(db, user.id)
 
     def handler(request: httpx.Request):
         assert request.headers["Authorization"] == "Bearer UW_TOKEN"
@@ -185,7 +200,7 @@ async def test_upwork_search_normalization(db):
         }})
 
     async with _mock_client(handler) as client:
-        adapter = UpworkAgencyAdapter(db, client=client)
+        adapter = UpworkAgencyAdapter(db, user.id, client=client)
         jobs = await adapter.search_jobs("django")
     assert len(jobs) == 1
     j = jobs[0]
@@ -195,21 +210,21 @@ async def test_upwork_search_normalization(db):
     assert j.proposals_count == 10
 
 
-def test_upwork_proposal_requires_human_approval(db):
-    adapter = UpworkAgencyAdapter(db)
+def test_upwork_proposal_requires_human_approval(db, user):
+    adapter = UpworkAgencyAdapter(db, user.id)
     adapter.add_agency_member("freelancer_jane")
     with pytest.raises(AdapterAuthError, match="human approval"):
         adapter.submit_proposal("job1", "text", on_behalf_of="freelancer_jane")
 
 
-def test_upwork_proposal_requires_roster_membership(db):
-    adapter = UpworkAgencyAdapter(db)
+def test_upwork_proposal_requires_roster_membership(db, user):
+    adapter = UpworkAgencyAdapter(db, user.id)
     with pytest.raises(AdapterAuthError, match="not an agency member"):
         adapter.submit_proposal("job1", "text", on_behalf_of="stranger", approved_by="operator")
 
 
-def test_upwork_proposal_queue_and_audit(db):
-    adapter = UpworkAgencyAdapter(db)
+def test_upwork_proposal_queue_and_audit(db, user):
+    adapter = UpworkAgencyAdapter(db, user.id)
     adapter.add_agency_member("freelancer_jane")
     rec = adapter.submit_proposal("job1", "Hi, I can help...", on_behalf_of="freelancer_jane",
                                   connects_required=6, approved_by="operator_bob")
@@ -224,8 +239,8 @@ def test_upwork_proposal_queue_and_audit(db):
     assert queue["items"][0]["status"] == "submitted"
 
 
-def test_upwork_credentials_isolated_per_principal(db):
-    vault = CredentialVault(db)
+def test_upwork_credentials_isolated_per_principal(db, user):
+    vault = CredentialVault(db, user.id)
     vault.store("upwork", "agency_manager", {"access_token": "AGENCY"})
     vault.store("upwork", "default", {"access_token": "FREELANCER"})
     assert vault.load("upwork", "agency_manager")["access_token"] == "AGENCY"

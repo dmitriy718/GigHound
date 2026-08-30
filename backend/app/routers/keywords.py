@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, selectinload
 
+from ..auth import get_current_user, get_owned, scoped
 from ..database import get_db
-from ..models import Keyword, KeywordGroup
+from ..models import Keyword, KeywordGroup, User
 from ..schemas import KeywordGroupIn, KeywordGroupOut
 from ..skills_taxonomy import suggest_skills
 
@@ -10,13 +11,14 @@ router = APIRouter(prefix="/api", tags=["keywords"])
 
 
 @router.get("/keyword-groups", response_model=list[KeywordGroupOut])
-def list_groups(db: Session = Depends(get_db)):
-    return db.query(KeywordGroup).options(selectinload(KeywordGroup.keywords)).all()
+def list_groups(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return scoped(db, KeywordGroup, user).options(selectinload(KeywordGroup.keywords)).all()
 
 
 @router.post("/keyword-groups", response_model=KeywordGroupOut, status_code=201)
-def create_group(body: KeywordGroupIn, db: Session = Depends(get_db)):
-    group = KeywordGroup(name=body.name, service_type=body.service_type)
+def create_group(body: KeywordGroupIn, db: Session = Depends(get_db),
+                 user: User = Depends(get_current_user)):
+    group = KeywordGroup(user_id=user.id, name=body.name, service_type=body.service_type)
     group.keywords = [Keyword(term=k.term, kind=k.kind, weight=k.weight) for k in body.keywords]
     db.add(group)
     db.commit()
@@ -25,8 +27,9 @@ def create_group(body: KeywordGroupIn, db: Session = Depends(get_db)):
 
 
 @router.put("/keyword-groups/{group_id}", response_model=KeywordGroupOut)
-def update_group(group_id: int, body: KeywordGroupIn, db: Session = Depends(get_db)):
-    group = db.get(KeywordGroup, group_id)
+def update_group(group_id: int, body: KeywordGroupIn, db: Session = Depends(get_db),
+                 user: User = Depends(get_current_user)):
+    group = get_owned(db, KeywordGroup, group_id, user)
     if not group:
         raise HTTPException(404, "keyword group not found")
     group.name = body.name
@@ -38,8 +41,9 @@ def update_group(group_id: int, body: KeywordGroupIn, db: Session = Depends(get_
 
 
 @router.delete("/keyword-groups/{group_id}", status_code=204)
-def delete_group(group_id: int, db: Session = Depends(get_db)):
-    group = db.get(KeywordGroup, group_id)
+def delete_group(group_id: int, db: Session = Depends(get_db),
+                 user: User = Depends(get_current_user)):
+    group = get_owned(db, KeywordGroup, group_id, user)
     if not group:
         raise HTTPException(404, "keyword group not found")
     db.delete(group)
@@ -47,5 +51,6 @@ def delete_group(group_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/skills/suggest")
-def skills_suggest(platform: str | None = None, q: str = ""):
+def skills_suggest(platform: str | None = None, q: str = "",
+                   user: User = Depends(get_current_user)):
     return {"suggestions": suggest_skills(platform, q)}

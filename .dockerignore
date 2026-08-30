@@ -1,0 +1,12 @@
+.git
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+backend/.venv
+backend/.vault-dev-key
+frontend/dist
+frontend/tsconfig.tsbuildinfo
+evolution
+docs
+*.md
+.github

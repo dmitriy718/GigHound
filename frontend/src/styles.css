@@ -206,7 +206,15 @@ body {
 .menu-hint { font-size: 11px; color: var(--text-dim); font-weight: 400; }
 
 /* ---- live status ---- */
-.topbar-right { margin-left: auto; }
+.topbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.user-menu .cluster-menu { left: auto; right: 0; transform: none; }
+.user-menu.open .cluster-menu { animation: user-menu-in 0.16s ease; }
+@keyframes user-menu-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.user-menu .cluster-menu .menu-item.user-identity { cursor: default; }
+.user-menu .cluster-menu .menu-item.user-identity:hover { background: none; }
 .live-dot {
   display: inline-flex; align-items: center; gap: 7px;
   font-family: var(--font-display);
@@ -275,6 +283,7 @@ h3 { font-family: var(--font-display); font-size: 14px; margin: 16px 0 8px; }
 .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
 .field label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; }
 .field input[type='text'], .field input[type='number'], .field input[type='url'],
+.field input[type='email'], .field input[type='password'],
 .field select, .field textarea, input.inline-input, select.inline-select, textarea {
   background: rgba(7, 8, 13, 0.55);
   border: 1px solid var(--glass-border);
@@ -399,6 +408,9 @@ input[type='range'] { accent-color: var(--accent); }
 .job-row.proposal-row > .pill { grid-column: auto; margin-top: 0; }
 .proposal-row { grid-template-columns: auto auto 1fr auto auto auto auto; }
 .row-check { width: 18px; height: 18px; accent-color: var(--accent); cursor: pointer; }
+/* bulk-select checkbox on job feed cards (out of flow — the card grid is fixed) */
+.job-row .job-check { position: absolute; top: 12px; left: 12px; z-index: 2; }
+.job-row.checked { border-color: var(--accent); box-shadow: inset 0 1px 0 var(--glass-highlight), var(--shadow), var(--glow); }
 .row-actions { display: flex; gap: 8px; }
 .touch-btn { min-width: 44px; min-height: 44px; font-size: 16px; }
 
@@ -583,6 +595,18 @@ table.data tr:last-child td { border-bottom: none; }
 
 .muted { color: var(--text-dim); }
 .spread { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+
+/* ============ auth ============ */
+.auth-wrap {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 24px; position: relative; z-index: 1;
+}
+.auth-card { width: 380px; max-width: 100%; padding: 26px; }
+.auth-brand { margin-bottom: 20px; padding-left: 0; }
+.auth-tabs { display: flex; width: 100%; }
+.auth-tabs .tab { flex: 1; }
+.auth-card form .btn { width: 100%; margin-top: 4px; }
+.auth-hint { font-size: 12px; margin: 14px 0 0; }
 .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-dim); margin: 20px 0 8px; }
 
 /* ============ gig metrics chart ============ */

@@ -135,7 +135,7 @@ async def generate_faqs(gig_type: str, title: str, count: int = 4) -> list[dict]
     ][:count]
 
 
-def create_template(db: Session, platform: str, name: str, template_json: dict,
+def create_template(db: Session, user_id: int, platform: str, name: str, template_json: dict,
                     auto_publish: bool = False) -> tuple[GigTemplate | None, list[str]]:
     """Validate + persist. Returns (template, problems)."""
     if platform == "fiverr":
@@ -146,8 +146,8 @@ def create_template(db: Session, platform: str, name: str, template_json: dict,
         problems = []  # other platforms: free-form templates
     if problems:
         return None, problems
-    tpl = GigTemplate(platform=platform, name=name, template_json=template_json,
-                      auto_publish=auto_publish)
+    tpl = GigTemplate(user_id=user_id, platform=platform, name=name,
+                      template_json=template_json, auto_publish=auto_publish)
     db.add(tpl)
     db.commit()
     db.refresh(tpl)

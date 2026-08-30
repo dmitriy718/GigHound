@@ -14,8 +14,10 @@ from app.gig_analytics import (build_suggestions, competitor_price_analysis,
                                record_metrics, store_competitor_snapshot)
 from app.gig_templates import (create_template, generate_faqs, seo_title_score,
                                validate_fiverr_template)
+from app.auth import hash_password
 from app.models import (AuditLog, Gig, GigTemplate, Job, PortfolioItem,
-                        ProposalQueueItem, RateCardEntry, StealthTask, Template)
+                        ProposalQueueItem, RateCardEntry, StealthTask, Template,
+                        User)
 from app.proposal_gen import (_heuristic_analysis, analyze_job, calculate_bid,
                               generate)
 from app.templates import (generation_tuning, record_outcome, record_rejection,
@@ -47,8 +49,17 @@ def db():
 
 
 @pytest.fixture()
-def job(db):
-    j = Job(external_id="pg1", platform="upwork",
+def user(db):
+    u = User(email="gen-test@example.com",
+             password_hash=hash_password("password123"), display_name="Gen Test")
+    db.add(u)
+    db.commit()
+    return u
+
+
+@pytest.fixture()
+def job(db, user):
+    j = Job(user_id=user.id, external_id="pg1", platform="upwork",
             title="React dashboard for SaaS analytics platform",
             description=("We need a React and TypeScript expert. Deliverables: GraphQL API "
                          "integration, PostgreSQL schema, CI/CD pipeline, websocket real-time "
@@ -57,8 +68,9 @@ def job(db):
             budget_usd_min=4000, budget_usd_max=6000, skills=["React", "TypeScript"],
             quality_score=80.0, status="new")
     db.add(j)
-    db.add(RateCardEntry(skill_category="React", hourly_rate=75, fixed_min=1500, currency="USD"))
-    db.add(PortfolioItem(title="React SaaS Dashboard", url="https://pf/1",
+    db.add(RateCardEntry(user_id=user.id, skill_category="React",
+                         hourly_rate=75, fixed_min=1500, currency="USD"))
+    db.add(PortfolioItem(user_id=user.id, title="React SaaS Dashboard", url="https://pf/1",
                          tags=["react", "typescript"]))
     db.commit()
     return j
@@ -160,8 +172,8 @@ async def test_generate_fiverr_is_ultra_brief(db, job):
 
 # ---------------- template learning ----------------
 
-def test_template_win_rate_lifecycle(db, job):
-    item = ProposalQueueItem(job_id=job.id, platform="upwork",
+def test_template_win_rate_lifecycle(db, user, job):
+    item = ProposalQueueItem(user_id=user.id, job_id=job.id, platform="upwork",
                              proposal_text="winning text", bid_amount=5000,
                              status="approved")
     db.add(item)
@@ -177,27 +189,27 @@ def test_template_win_rate_lifecycle(db, job):
     assert tpl.win_rate == 50.0
 
 
-def test_rejection_learning_adjusts_temperature(db, job):
-    item = ProposalQueueItem(job_id=job.id, platform="upwork", proposal_text="x",
-                             status="rejected")
+def test_rejection_learning_adjusts_temperature(db, user, job):
+    item = ProposalQueueItem(user_id=user.id, job_id=job.id, platform="upwork",
+                             proposal_text="x", status="rejected")
     db.add(item)
     db.commit()
     for _ in range(3):
         record_rejection(db, item, "too_generic")
-    tuning = generation_tuning(db, "upwork")
+    tuning = generation_tuning(db, user.id, "upwork")
     assert tuning["temperature"] < 0.7
     assert any("job-specific" in h for h in tuning["prompt_hints"])
 
 
-def test_top_templates_ranking(db):
+def test_top_templates_ranking(db, user):
     db.add_all([
-        Template(title="A", platform="upwork", text="t", tags=["react"],
+        Template(user_id=user.id, title="A", platform="upwork", text="t", tags=["react"],
                  uses=5, wins=4, losses=1, win_rate=80.0),
-        Template(title="B", platform="upwork", text="t", tags=["logo"],
+        Template(user_id=user.id, title="B", platform="upwork", text="t", tags=["logo"],
                  uses=5, wins=1, losses=4, win_rate=20.0),
     ])
     db.commit()
-    top = top_templates(db, "upwork", ["react"])
+    top = top_templates(db, user.id, "upwork", ["react"])
     assert top[0].title == "A"
 
 
@@ -212,11 +224,11 @@ GOOD_FIVERR = {
 }
 
 
-def test_fiverr_template_validation(db):
-    tpl, problems = create_template(db, "fiverr", "React Gig", GOOD_FIVERR)
+def test_fiverr_template_validation(db, user):
+    tpl, problems = create_template(db, user.id, "fiverr", "React Gig", GOOD_FIVERR)
     assert problems == [] and tpl.id
     bad = {**GOOD_FIVERR, "title": "x" * 100, "tags": ["a"] * 6}
-    tpl2, problems2 = create_template(db, "fiverr", "Bad", bad)
+    tpl2, problems2 = create_template(db, user.id, "fiverr", "Bad", bad)
     assert tpl2 is None and any("80 chars" in p for p in problems2) and any("tags" in p for p in problems2)
 
 
@@ -237,14 +249,14 @@ async def test_faq_fallback():
 
 # ---------------- fiverr monitor + circuit breaker ----------------
 
-def _fiverr_template(db):
-    tpl, problems = create_template(db, "fiverr", "React Gig", GOOD_FIVERR)
+def _fiverr_template(db, user_id):
+    tpl, problems = create_template(db, user_id, "fiverr", "React Gig", GOOD_FIVERR)
     assert not problems
     return tpl
 
 
-def test_gig_creation_queue_draft_only(db):
-    tpl = _fiverr_template(db)
+def test_gig_creation_queue_draft_only(db, user):
+    tpl = _fiverr_template(db, user.id)
     task, err = queue_gig_creation(db, tpl)
     assert err == "" and task.task_type == "fiverr_create_gig"
     assert task.payload["save_as_draft"] is True
@@ -255,35 +267,35 @@ def test_gig_creation_queue_draft_only(db):
     assert db.query(AuditLog).filter_by(action_type="gig_created").count() == 1
 
 
-def test_gig_creation_blocked_by_open_circuit(db):
+def test_gig_creation_blocked_by_open_circuit(db, user):
     circuit_breaker.open_circuit("fiverr", "test")
-    tpl = _fiverr_template(db)
+    tpl = _fiverr_template(db, user.id)
     task, err = queue_gig_creation(db, tpl)
     assert task is None and "circuit OPEN" in err
     circuit_breaker.close_circuit("fiverr")
 
 
-def test_buyer_request_processing(db):
-    _fiverr_template(db)
+def test_buyer_request_processing(db, user):
+    _fiverr_template(db, user.id)
     requests = [
         {"id": "br1", "title": "Need a React website developer", "budget": 120,
          "description": "website development for my SaaS"},
         {"id": "br2", "title": "Voice over for audiobook", "budget": 80,
          "description": "narration work"},
     ]
-    result = process_buyer_requests(db, requests)
+    result = process_buyer_requests(db, user.id, requests)
     assert result["queued"] == 1  # only the React one matches template tags
     item = db.query(ProposalQueueItem).filter_by(request_type="buyer_request").one()
     assert item.status == "pending_review"  # approval always required
     assert "$120" in item.proposal_text or item.bid_amount == 120
-    assert offers_remaining_today() == 9
+    assert offers_remaining_today(user.id) == 9
     # duplicate request not re-queued
-    result2 = process_buyer_requests(db, requests)
+    result2 = process_buyer_requests(db, user.id, requests)
     assert result2["queued"] == 0
 
 
-def test_matching_buyer_requests_no_templates(db):
-    assert matching_buyer_requests(db, [{"title": "react dev"}]) == []
+def test_matching_buyer_requests_no_templates(db, user):
+    assert matching_buyer_requests(db, user.id, [{"title": "react dev"}]) == []
 
 
 # ---------------- gig analytics ----------------
@@ -306,12 +318,12 @@ def test_competitor_price_analysis():
     assert any("below market" in i for i in insights2)
 
 
-def test_record_metrics_and_snapshot(db):
-    gig = Gig(platform="fiverr", title="React gig", status="active")
+def test_record_metrics_and_snapshot(db, user):
+    gig = Gig(user_id=user.id, platform="fiverr", title="React gig", status="active")
     db.add(gig)
     db.commit()
     m = record_metrics(db, gig, impressions=80, clicks=2, orders=0, revenue=0)
     assert m.week and any(s["area"] == "title_keywords" for s in m.suggestions)
-    snap = store_competitor_snapshot(db, "fiverr", "Website Development",
+    snap = store_competitor_snapshot(db, user.id, "fiverr", "Website Development",
                                      [{"price": 50, "title": "x"}], my_price=80)
     assert snap.insights
