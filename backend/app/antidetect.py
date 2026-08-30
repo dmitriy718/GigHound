@@ -167,11 +167,21 @@ def strip_ai_tells(text: str, platform: str = "") -> str:
 
 
 def inject_personality(text: str, max_markers: int = 1) -> str:
-    """Splice a casual transition before a mid-text sentence."""
+    """Splice a casual transition before a mid-text sentence.
+
+    Only first-person declarative sentences are eligible — a marker prepended
+    to a subordinate clause ("Funny enough, since your API…") reads worse than
+    no marker at all. When nothing eligible exists, the text is left alone.
+    """
     sentences = re.split(r"(?<=[.!?])\s+", text)
     if len(sentences) < 3 or max_markers < 1:
         return text
-    idx = random.randint(1, len(sentences) - 2)
+    eligible = [i for i, s in enumerate(sentences)
+                if 0 < i < len(sentences) - 1
+                and re.match(r"^(I|We|I've|I'm|I'll|My)\b", s)]
+    if not eligible:
+        return text
+    idx = random.choice(eligible)
     sentences[idx] = f"{random.choice(PERSONALITY_MARKERS)} {sentences[idx][0].lower()}{sentences[idx][1:]}"
     return " ".join(sentences)
 

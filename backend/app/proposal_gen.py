@@ -361,8 +361,6 @@ def calculate_bid(db: Session, job: Job, analysis: dict,
     estimate = hours * hourly * multiplier
     if rate and rate.fixed_min:
         estimate = max(estimate, rate.fixed_min)
-    if job.budget_usd_max and estimate > job.budget_usd_max * 1.2:
-        estimate = job.budget_usd_max  # cap near stated budget
     if rate:
         # won-bid learning: pull toward historical winning bids for this
         # rate-card category once enough samples exist (bounded ±20%)
@@ -371,6 +369,9 @@ def calculate_bid(db: Session, job: Job, analysis: dict,
         estimate, nudge_note = nudge_toward_wins(estimate, samples)
     else:
         nudge_note = None
+    if job.budget_usd_max and estimate > job.budget_usd_max:
+        # never bid above the client's stated max — come in just under it
+        estimate = job.budget_usd_max * 0.98
     period = max(3, min(60, int(hours / 6)))
     rationale = (f"{hours:.0f}h est. × ${hourly:g}/hr × {multiplier:.2f} complexity "
                  f"= ${estimate:,.0f}")
