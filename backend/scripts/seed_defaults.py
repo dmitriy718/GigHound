@@ -9,7 +9,14 @@ never duplicates or overwrites user data. Wired defaults reference the
 demo user's first existing keyword group / filter when present.
 
 Run:  .venv/bin/python -m scripts.seed_defaults   (from backend/)
+      python scripts/seed_defaults.py             (also works — path self-fixes)
 """
+
+import sys
+from pathlib import Path
+
+# allow running as a plain script (incl. inside Docker) without PYTHONPATH
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.auth import hash_password
 from app.database import SessionLocal
