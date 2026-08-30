@@ -546,3 +546,31 @@ platform-tuned draft, one clarifying question, word cap respected, gap-honesty v
    sentences are eligible; no eligible sentence → text untouched. Verified live: marker lands
    naturally ("Here's the thing — my portfolio includes…").
 Suite: **217/217 green**.
+
+---
+
+## 2026-08-30 — Docker images built + full-stack E2E (the last environmental gap closed)
+
+**Docker access:** user added dima to the docker group; agent session predates the change, so
+all Docker commands run through a `newgrp docker` wrapper (group applies per-process).
+
+**Builds (first ever, both green):**
+- `gighound-backend` multi-stage (Node frontend build → py3.12 runtime, non-root, migrations on
+  start) — backend, celery-worker, celery-beat images.
+- `gighound-worker` (py3.12 + Playwright + Chromium headless shell) — ~2 min download, clean.
+
+**Full stack live:** db (healthy) + redis (healthy) + backend + celery-worker + celery-beat +
+stealth worker — all up via compose with healthchecks/service_healthy working as designed.
+- Backend ran all 7 migrations on container start; SPA served at :8000 (200).
+- Seed inside container exposed a real bug: `python scripts/seed_defaults.py` failed with
+  ModuleNotFoundError (Python puts the script's dir, not cwd, on sys.path). Fixed: seed script
+  self-inserts its parent dir into sys.path; image rebuilt; verified ("All collections already
+  populated" — idempotent, no error).
+- **First fully-autonomous pipeline run as designed:** HTTP ingest → Redis broker → Celery
+  worker → real LAN Ollama (qwen3:4b) → pending_review proposal (conf 72.7, bid $4,250 under
+  the $5k cap, personalized draft). No human touched anything between ingest and queue.
+- Stealth worker container live: authenticates with its token, polls all four platforms
+  (fiverr/upwork/peopleperhour/guru) at 200s, no tasks pending (correct — nothing enqueued).
+
+**Remaining unverified (unchanged):** live-platform selectors (need real accounts), GitHub CI
+(account billing lock — user action).
