@@ -5,6 +5,7 @@ x-backend-env: &backend-env
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: gighound
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
@@ -21,6 +22,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
@@ -42,6 +44,13 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     restart: unless-stopped
+    healthcheck:
+      # curl isn't in python:slim; probe the API health route with urllib
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     depends_on:
       db:
         condition: service_healthy
@@ -56,6 +65,9 @@ services:
     environment: *backend-env
     command: celery -A app.tasks worker --loglevel=info
     restart: unless-stopped
+    # the image-level HEALTHCHECK probes the API; celery serves no HTTP
+    healthcheck:
+      disable: true
     depends_on:
       db:
         condition: service_healthy
@@ -70,6 +82,9 @@ services:
     environment: *backend-env
     command: celery -A app.tasks beat --loglevel=info
     restart: unless-stopped
+    # the image-level HEALTHCHECK probes the API; celery serves no HTTP
+    healthcheck:
+      disable: true
     depends_on:
       db:
         condition: service_healthy

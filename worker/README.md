@@ -19,7 +19,10 @@ poll GET /api/gigs/stealth-tasks?platform=&status=pending   (worker token, all t
 - CAPTCHA/challenge detection → `complete(success=false, result={captcha: true})`.
   Three failures within an hour trip the server-side circuit breaker for that
   platform and a human is alerted in the UI.
-- Unhandled handler exceptions are reported as failed tasks — the loop never dies.
+- Unhandled handler exceptions are reported as failed tasks, tasks already
+  finalized server-side are skipped, and backend outages are logged and
+  retried on the next sweep — the loop survives all of these; the container
+  restart policy (`restart: unless-stopped`) covers truly fatal errors.
 
 ## Setup
 
