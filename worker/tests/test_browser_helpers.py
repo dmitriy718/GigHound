@@ -347,6 +347,38 @@ def test_reap_disabled_with_nonpositive_ttl(tmp_path):
     assert ("guru", 1) in mgr._contexts
 
 
+# ---------------- per-task page hygiene ----------------
+
+def test_new_page_is_fresh_each_call(tmp_path):
+    """new_page never hands back a reused page: a crashed task's leftover
+    DOM state must not leak into the next task for the tenant."""
+    from worker.browser import BrowserManager
+    from worker.config import Config
+    mgr = BrowserManager(Config(session_dir=tmp_path), client=None)
+    ctx = FakeContext()
+    mgr._browser_type = FakeBrowserType(ctx)
+    first = mgr.new_page("fiverr", 7)
+    second = mgr.new_page("fiverr", 7)
+    assert first is not second
+    assert ctx.pages_made == [first, second]
+
+
+def test_close_pages_closes_every_page_on_the_context(tmp_path):
+    from worker.browser import BrowserManager
+    from worker.config import Config
+    mgr = BrowserManager(Config(session_dir=tmp_path), client=None)
+
+    class _Ctx:
+        def __init__(self):
+            self.pages = [FakePage(), FakePage()]
+
+    ctx = _Ctx()
+    mgr._contexts[("fiverr", 7)] = ctx
+    mgr.close_pages("fiverr", 7)
+    assert all(page.closed for page in ctx.pages)
+    mgr.close_pages("upwork", 9)  # unknown context — a no-op, not an error
+
+
 # ---------------- session-dir / artifact permissions ----------------
 
 def _mode(path):

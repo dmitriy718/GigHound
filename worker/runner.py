@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from . import browser as _browser
 from .browser import BrowserManager, CaptchaDetectedError, SessionExpiredError
 from .client import BackendError, ClaimConflictError, WorkerClient
 from .config import load_config
@@ -62,8 +63,18 @@ def process_task(task, ctx: HandlerContext) -> None:
         ctx.client.complete_task(task.id, False,
                                  {"error": f"no handler for task_type '{task.task_type}'"})
         return
+    _browser.arm_task_deadline(ctx.config.task_timeout_sec)
     try:
         result = handler(task, ctx)
+    except _browser.TaskTimeoutError:
+        log.error("task %d (%s) exceeded the %ss wall-clock budget",
+                  task.id, task.task_type, ctx.config.task_timeout_sec)
+        try:
+            ctx.client.complete_task(task.id, False,
+                                     {"error": "task timeout",
+                                      "timeout_sec": ctx.config.task_timeout_sec})
+        except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
+            log.error("could not report timeout for task %d: %s", task.id, report_exc)
     except CaptchaDetectedError as exc:
         log.warning("task %d hit a challenge on %s (%s) — escalating",
                     task.id, exc.platform, exc.marker)
@@ -111,6 +122,17 @@ def process_task(task, ctx: HandlerContext) -> None:
                      task.id)
         except httpx.TransportError as exc:
             log.error("could not report completion for task %d: %s", task.id, exc)
+    finally:
+        _browser.disarm_task_deadline()
+        # task hygiene: close the task's pages so leftover DOM state (open
+        # modal, half-filled form from a crashed task) never leaks into the
+        # next task on this tenant's context
+        close_pages = getattr(ctx.browser, "close_pages", None)
+        if close_pages is not None:
+            try:
+                close_pages(task.platform, task.user_id)
+            except Exception as exc:  # noqa: BLE001 — never fail the report path
+                log.warning("could not close pages after task %d: %s", task.id, exc)
 
 
 def poll_once(ctx: HandlerContext) -> int:

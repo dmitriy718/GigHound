@@ -44,3 +44,29 @@ def test_context_idle_sec_from_env(monkeypatch):
     assert Config(worker_token="t").context_idle_sec == 1800
     monkeypatch.setenv("WORKER_CONTEXT_IDLE_SEC", "300")
     assert Config(worker_token="t").context_idle_sec == 300
+
+
+def test_task_timeout_sec_from_env(monkeypatch):
+    monkeypatch.delenv("WORKER_TASK_TIMEOUT_SEC", raising=False)
+    assert Config(worker_token="t").task_timeout_sec == 600
+    monkeypatch.setenv("WORKER_TASK_TIMEOUT_SEC", "120")
+    assert Config(worker_token="t").task_timeout_sec == 120
+
+
+def test_allow_submit_per_platform_override_wins(monkeypatch):
+    monkeypatch.delenv("WORKER_ALLOW_SUBMIT_UPWORK", raising=False)
+    cfg = Config(worker_token="t", allow_submit=False)
+    assert cfg.allow_submit_for("upwork") is False
+    monkeypatch.setenv("WORKER_ALLOW_SUBMIT_UPWORK", "1")
+    assert cfg.allow_submit_for("upwork") is True
+    assert cfg.allow_submit_for("fiverr") is False  # other platforms unaffected
+
+
+def test_allow_submit_global_fallback_and_explicit_off(monkeypatch):
+    cfg = Config(worker_token="t", allow_submit=True)
+    # empty override (e.g. compose passthrough default) means unset → global
+    monkeypatch.setenv("WORKER_ALLOW_SUBMIT_FIVERR", "")
+    assert cfg.allow_submit_for("fiverr") is True
+    # an explicit per-platform off wins over the global on
+    monkeypatch.setenv("WORKER_ALLOW_SUBMIT_FIVERR", "0")
+    assert cfg.allow_submit_for("fiverr") is False
