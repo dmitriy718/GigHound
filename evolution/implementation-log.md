@@ -642,3 +642,48 @@ Backend 254 tests.
 - Worker loop alive throughout, polling all 4 platforms.
 
 **Phase 0 status: COMPLETE (18/18).** Next: Phase 1 (security hardening) on user approval.
+
+
+---
+
+## 2026-09-01 — Phase 1 implemented: security hardening (10/10)
+
+Basis: `evolution/review-2026-08-31/implementation-plan.md` Phase 1. Implemented in 4 clusters;
+master `a8294b3`..`097bec9`. Suites: backend 257→284, worker 69→72, tsc clean.
+
+**Cluster G — worker-endpoint binding (P1-1, P1-2).** `complete_stealth_task` now requires
+`status=claimed` + matching `claimed_by`/`worker_id` (pending backcompat dropped; worker client
+sends worker_id). proposal-status posts validate task state. stealth-session requires an active
+claimed task for the (platform, user_id) pair + honors `mode=disabled`, and every session read is
+audit-logged (never the data). Worker mutation endpoints now write AuditLog rows with worker
+identity. **Side fix:** test suite moved to Redis db 15 with per-test flush — the live stack's
+pacing locks/breaker keys on db 0 were colliding with test user ids, making discovery tests
+timing-dependent (root-caused to beat's `discovery:{user}:{platform}` NX locks; suite now
+deterministic — 257/257 across repeated runs with the stack running).
+
+**Cluster H — token hygiene (P1-3, P1-4, P1-10).** `hmac.compare_digest` for the worker token.
+JWTs mint a `jti`; logout denylists it (TTL = remaining lifetime); change_password also sets a
+per-user not-before → all outstanding tokens die (fail-open when Redis down, documented). WS auth
+moved to single-use 30s tickets (`POST /api/alerts/ws-ticket`, atomic GETDEL) with legacy `?token=`
+kept as degradation fallback; frontend stops reconnecting on 4401 and routes to logout.
+`validate_auth_config` fails fast on missing/malformed vault key in non-dev; rotation documented.
+passlib removed → direct bcrypt (`>=4.2,<6`); existing `$2b$` hashes verify natively (compat test).
+
+**Cluster I — IDOR + brute-force + hygiene (P1-5..P1-7).** Search-profile `keyword_group_id`/
+`filter_id` ownership-validated (404, no existence leak); discovery treats foreign refs as absent;
+`register_gig` validates `template_id`; proposal job loads tenant-scoped. Login limiter counts
+failures only (success no longer self-429s), adds per-IP bucket, dummy-verifies unknown emails
+(timing oracle closed); register gains per-IP bucket. Generic 502s (crafted messages kept);
+security-headers middleware (CSP/nosniff/DENY/referrer, HSTS behind `GIGHOUND_BEHIND_TLS`);
+CORS `*` rejected in non-dev; filter preview scan capped at 500; shared per-user LLM-generation
+rate limit (20/h, new `backend/app/ratelimit.py`) across all five LLM-cost endpoints.
+
+**Cluster J — secrets surface + injection (P1-8, P1-9).** Worker container no longer receives
+the root `.env` (only its own 14 vars via explicit `environment:`); session dirs 0700,
+storage_state + screenshots 0600; bootstrap.sh `chmod 600 .env` + portable sed; seed refuses the
+demo account when `GIGHOUND_ENV=production`. `<job_posting>` fence tokens neutralized inside
+untrusted content at all four prompt-assembly sites; adversarial-fixture tests.
+
+**Phase 1 gate items:** all test-covered (forged worker_id → 409; cross-tenant refs → 404;
+post-password-change token rejected; WS ticket single-use; prod seed refuses demo). Stack rebuild
+deferred to Phase 2 end (worker-heavy changes land there).
