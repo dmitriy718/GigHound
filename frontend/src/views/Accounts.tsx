@@ -13,6 +13,7 @@ import {
 } from '../api/client';
 import type { AccountMode, CredentialStatus, Platform, PlatformAccount } from '../types';
 import { ACCOUNT_MODES, PLATFORMS } from '../types';
+import { useReconnectRefetch, type SocketStatus } from '../hooks/useAlertsSocket';
 import { ErrorBanner, formatDate, Modal } from '../components/common';
 
 // Token-based platforms enroll access_token (+ optional refresh_token);
@@ -403,7 +404,7 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
   );
 }
 
-export default function Accounts() {
+export default function Accounts({ status: socketStatus }: { status: SocketStatus }) {
   const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
   const [draft, setDraft] = useState<PlatformAccountPayload>(emptyPayload);
   const [draftId, setDraftId] = useState<number | null>(null);
@@ -419,6 +420,9 @@ export default function Accounts() {
   };
 
   useEffect(reloadAccounts, []);
+
+  // reconnect = events were missed while the socket was down — reload once
+  useReconnectRefetch(socketStatus, reloadAccounts);
 
   const selectAccount = (a: PlatformAccount) => {
     const { id, created_at: _created, ...rest } = a;

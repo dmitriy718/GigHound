@@ -7,11 +7,12 @@ import {
 } from '../api/client';
 import type { ProposalQueueItem, RejectionReason } from '../types';
 import { REJECTION_REASONS } from '../types';
-import { useNewAlertMessages, type AlertMessage } from '../hooks/useAlertsSocket';
+import { useNewAlertMessages, useReconnectRefetch, type AlertMessage, type SocketStatus } from '../hooks/useAlertsSocket';
 import { ErrorBanner, formatDate } from '../components/common';
 
 interface Props {
   messages: AlertMessage[];
+  status: SocketStatus;
 }
 
 interface OfferEdits {
@@ -24,7 +25,7 @@ const editsFrom = (item: ProposalQueueItem): OfferEdits => ({
   bid_amount: item.bid_amount != null ? String(item.bid_amount) : '',
 });
 
-export default function BuyerRequestInbox({ messages }: Props) {
+export default function BuyerRequestInbox({ messages, status: socketStatus }: Props) {
   const [offers, setOffers] = useState<{ offers_remaining_today: number; daily_limit: number } | null>(null);
   const [items, setItems] = useState<ProposalQueueItem[]>([]);
   const [edits, setEdits] = useState<Record<number, OfferEdits>>({});
@@ -53,6 +54,9 @@ export default function BuyerRequestInbox({ messages }: Props) {
 
   useEffect(load, []);
 
+  // reconnect = events were missed while the socket was down — reload once
+  useReconnectRefetch(socketStatus, load);
+
   useEffect(() => {
     getBuyerRequests()
       .then(setOffers)
@@ -70,7 +74,11 @@ export default function BuyerRequestInbox({ messages }: Props) {
   };
 
   const patchEdit = (id: number, patch: Partial<OfferEdits>) =>
-    setEdits((prev) => ({ ...prev, [id]: { ...editsFrom(items.find((i) => i.id === id)!), ...prev[id], ...patch } }));
+    setEdits((prev) => {
+      const item = items.find((i) => i.id === id);
+      if (!item) return prev; // row reloaded away mid-edit — drop the keystroke
+      return { ...prev, [id]: { ...editsFrom(item), ...prev[id], ...patch } };
+    });
 
   const requireReviewer = (id: number): boolean => {
     if (reviewer.trim()) return true;

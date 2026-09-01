@@ -22,6 +22,7 @@ from ..schemas import (CompetitorSnapshotOut, GigMetricIn, GigMetricOut,
                        GigOut, GigTemplateIn, GigTemplateOut,
                        Platform, StealthTaskClaimIn)
 from ..stealth import SUBMIT_UPWORK_PROPOSAL
+from ..ws_manager import alerts
 
 router = APIRouter(prefix="/api/gigs", tags=["gigs"])
 
@@ -359,8 +360,8 @@ def claim_stealth_task(task_id: int, body: StealthTaskClaimIn,
 
 
 @router.post("/stealth-tasks/{task_id}/complete", response_model=dict)
-def complete_stealth_task(task_id: int, body: dict, db: Session = Depends(get_db),
-                          worker: str = Depends(get_worker)):
+async def complete_stealth_task(task_id: int, body: dict, db: Session = Depends(get_db),
+                                worker: str = Depends(get_worker)):
     task = db.get(StealthTask, task_id)
     if not task:
         raise HTTPException(404, "stealth task not found")
@@ -390,7 +391,7 @@ def complete_stealth_task(task_id: int, body: dict, db: Session = Depends(get_db
                 task.platform,
                 f"{recent_failures} stealth task failures in the last hour",
                 user_id=task.user_id)
-    _apply_submission_outcome(db, task, success)
+    changed_item = _apply_submission_outcome(db, task, success)
     if (task.result or {}).get("session_expired"):
         _flag_session_expired(db, task)
     db.add(AuditLog(user_id=task.user_id, action_type="stealth_task_completed",
@@ -398,6 +399,13 @@ def complete_stealth_task(task_id: int, body: dict, db: Session = Depends(get_db
                     detail={"task_id": task.id, "worker_id": task.claimed_by,
                             "success": success}))
     db.commit()
+    if changed_item is not None:
+        # after commit so a refetch triggered by the event sees the new status
+        await alerts.broadcast(changed_item.user_id, {
+            "type": "proposal_status_changed",
+            "proposal_id": changed_item.id,
+            "status": changed_item.status,
+        })
     return {"id": task.id, "status": task.status}
 
 
@@ -420,9 +428,13 @@ def _flag_session_expired(db: Session, task: StealthTask):
                             "needs_reenrollment": True}
 
 
-def _apply_submission_outcome(db: Session, task: StealthTask, success: bool):
+def _apply_submission_outcome(db: Session, task: StealthTask,
+                              success: bool) -> ProposalQueueItem | None:
     """Close the HITL loop for submission tasks: flip the review-queue item
     out of queued_for_browser and complete the agency handoff record.
+
+    Returns the queue item when its status actually changed (so the caller can
+    broadcast `proposal_status_changed` after commit), else None.
 
     The worker's explicit `result.submitted` verdict wins over the bare
     task-level success flag: a task can "succeed" (no crash) while the
@@ -432,9 +444,10 @@ def _apply_submission_outcome(db: Session, task: StealthTask, success: bool):
     auto-retried: a blind retry risks a duplicate proposal)."""
     item_id = (task.payload or {}).get("proposal_queue_item_id")
     if not item_id:
-        return
+        return None
     result = task.result or {}
     submitted = result.get("submitted")
+    flipped: ProposalQueueItem | None = None
     item = db.get(ProposalQueueItem, item_id)
     if item and item.user_id == task.user_id and item.status == "queued_for_browser":
         if not success:
@@ -461,6 +474,7 @@ def _apply_submission_outcome(db: Session, task: StealthTask, success: bool):
             item.submission_result = {**(item.submission_result or {}), **result}
         else:
             item.status = "submitted"
+        flipped = item
     if task.task_type == SUBMIT_UPWORK_PROPOSAL:
         from ..adapters.upwork_agency import UpworkAgencyAdapter
         # the agency handoff record is only closed on a CONFIRMED outcome —
@@ -474,6 +488,7 @@ def _apply_submission_outcome(db: Session, task: StealthTask, success: bool):
                 note="stealth worker " +
                      ("submitted" if success and submitted is not False
                       else "failed"))
+    return flipped
 
 
 # --- worker-posted proposal status (Upwork outcome/reply sync) ---

@@ -225,9 +225,7 @@ export default function AlertsPanel({ messages, status }: Props) {
                   ? `proposal #${m.proposal_id} — ${'snippet' in m && m.snippet ? m.snippet : '(no snippet)'}`
                   : 'job' in m && m.job
                     ? (m.job as Job).title
-                    : 'jobs' in m && Array.isArray(m.jobs)
-                      ? `${m.jobs.length} jobs`
-                      : JSON.stringify(m)}
+                    : JSON.stringify(m)}
               </div>
             ))}
           </div>

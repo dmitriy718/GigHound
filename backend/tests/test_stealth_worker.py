@@ -434,6 +434,41 @@ def test_manual_assist_gate_no_longer_flips_to_submitted(client):
     assert "human must click" in item.submission_result["error"]
 
 
+def test_submission_outcome_broadcasts_status_change(client, monkeypatch):
+    c, Session = client
+    db = Session()
+    u = _user(db, "verdict-ws@example.com")
+    job = Job(user_id=u.id, external_id="~abc123", platform="upwork",
+              title="Job", url="https://www.upwork.com/jobs/~abc123")
+    db.add(job)
+    db.commit()
+
+    sent = []
+
+    async def _capture(user_id, message):
+        sent.append((user_id, message))
+
+    monkeypatch.setattr("app.routers.gigs.alerts.broadcast", _capture)
+
+    item = _submission_item(db, u, job)
+    _complete(c, db, u, item, {"submitted": True})
+    assert item.status == "submitted"
+    assert sent == [(u.id, {"type": "proposal_status_changed",
+                            "proposal_id": item.id, "status": "submitted"})]
+
+    # a non-submission task (no proposal_queue_item_id) broadcasts nothing
+    t = _task(db, u.id, status="claimed", claimed_by="w-1")
+    r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
+               json={"worker_id": "w-1", "success": True, "result": {}},
+               headers=WORKER_HEADERS)
+    assert r.status_code == 200
+    assert len(sent) == 1
+
+    # an item no longer in queued_for_browser is not re-flipped/re-broadcast
+    _complete(c, db, u, item, {"submitted": True})
+    assert len(sent) == 1
+
+
 # ---------------- session-expiry surfacing (P2-3) ----------------
 
 def test_session_expired_audited_and_account_flagged(client):

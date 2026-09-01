@@ -108,7 +108,9 @@ interface RateCardEntry { id: number; skill_category: string; hourly_rate: numbe
 - `WS /ws/alerts` — server pushes JSON messages:
   - `{type: 'job_alert', job: Job}` — high-match job
   - `{type: 'hot_job', job: Job}` — urgency alert
-  - `{type: 'digest', jobs: Job[]}` — digest payload
+  - `{type: 'proposal_status_changed', proposal_id: number, status: string}` —
+    browser-worker submission verdict (`submitted` / `failed` / `submitted_unverified`)
+  (digests are email-only — there is no `digest` WS message.)
   Client should send `ping` text every 30s; server tolerates it.
 
 ### Profile management

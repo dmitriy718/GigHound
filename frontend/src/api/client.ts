@@ -85,6 +85,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
+      // a hung connection must not spin a loading state forever;
+      // a caller-supplied signal (spread below) wins over the timeout
+      signal: AbortSignal.timeout(30_000),
       ...init,
     });
   } catch (e) {
