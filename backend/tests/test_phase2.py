@@ -753,6 +753,30 @@ def test_analytics_funnel(client):
     assert empty["funnel"]["queued"] == 0 and empty["by_template"] == []
 
 
+def test_analytics_funnel_unverified_is_active_not_submitted(client):
+    """submitted_unverified is attention-needing/in-flight (queued + approved
+    counts) but must NOT inflate the submitted funnel counts."""
+    c, Session = client
+    token = _register(c, "phase2-unverified@example.com")
+    uid = _user_id(Session, "phase2-unverified@example.com")
+    db = Session()
+    try:
+        job = Job(user_id=uid, external_id="an-uv", platform="upwork", title="J")
+        db.add(job)
+        db.commit()
+        db.add(ProposalQueueItem(user_id=uid, job_id=job.id, platform="upwork",
+                                 proposal_text="t", status="submitted_unverified"))
+        db.commit()
+    finally:
+        db.close()
+
+    r = c.get("/api/analytics/funnel", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    funnel = r.json()["funnel"]
+    assert funnel["queued"] == 1 and funnel["approved"] == 1
+    assert funnel["submitted"] == 0
+
+
 # ---------------- AD-6 WS over Redis pub/sub ----------------
 
 class _FakeAsyncRedis:

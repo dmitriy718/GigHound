@@ -51,8 +51,15 @@ const STATUS_COLORS: Record<ProposalStatus, string> = {
   rejected: 'var(--red)',
   queued_for_browser: 'var(--accent)',
   submitted: 'var(--green)',
+  submitted_unverified: 'var(--amber)',
   failed: 'var(--red)',
   generation_failed: 'var(--red)',
+};
+
+// Human-facing overrides for statuses whose raw name undersells the required
+// action; everything else renders as the status with spaces.
+const STATUS_LABELS: Partial<Record<ProposalStatus, string>> = {
+  submitted_unverified: 'submitted — verify on platform',
 };
 
 // Platforms with no compliant submission channel — submit is manual (copy the text)
@@ -460,7 +467,7 @@ export default function ProposalQueue({ messages, user }: Props) {
                   </div>
                 </div>
                 <span className="pill" style={{ color: STATUS_COLORS[item.status] }}>
-                  {item.status.replace(/_/g, ' ')}
+                  {STATUS_LABELS[item.status] ?? item.status.replace(/_/g, ' ')}
                 </span>
                 {item.bid_advice && (
                   <span

@@ -7,7 +7,7 @@ import logging
 
 from ..platforms import platform_config
 from .base import (HandlerContext, extract_cards, extract_fields, fetch_page,
-                   parse_number, url_for)
+                   parse_number, SelectorSuspectError, url_for)
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +24,14 @@ def handle_scrape_gig_metrics(task, ctx: HandlerContext) -> dict:
             continue
         page = fetch_page(ctx, task.platform, task.user_id, gig["url"])
         fields = extract_fields(page, cfg.get("metrics_fields", {}))
+        if not fields:
+            # every metric selector missed on a session-verified page — the
+            # selectors drifted. Never post zeros: that would silently
+            # corrupt the tenant's analytics with fabricated data.
+            raise SelectorSuspectError(
+                f"no metrics fields extracted for gig {gig['id']} on "
+                f"{task.platform} — metrics_fields in worker/platforms.py "
+                f"likely drifted")
         impressions = int(parse_number(fields.get("impressions")) or 0)
         clicks = int(parse_number(fields.get("clicks")) or 0)
         orders = int(parse_number(fields.get("orders")) or 0)

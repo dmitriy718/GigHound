@@ -355,3 +355,126 @@ def test_worker_posts_results(client):
     r = c.post("/api/gigs/buyer-requests/process",
                json={"user_id": u.id, "requests": []}, headers=WORKER_HEADERS)
     assert r.status_code == 200, r.text
+
+
+# ---------------- submission-outcome verdicts (P2-2) ----------------
+
+def _submission_item(db, u, job):
+    item = ProposalQueueItem(user_id=u.id, job_id=job.id, platform="upwork",
+                             proposal_text="hi", status="queued_for_browser")
+    db.add(item)
+    db.commit()
+    return item
+
+
+def _complete(c, db, u, item, result, success=True):
+    t = _task(db, u.id, platform="upwork", task_type="submit_upwork_proposal",
+              status="claimed", claimed_by="w-1",
+              payload={"proposal_queue_item_id": item.id,
+                       "job_external_id": "~abc123"})
+    r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
+               json={"worker_id": "w-1", "success": success, "result": result},
+               headers=WORKER_HEADERS)
+    assert r.status_code == 200, r.text
+    db.refresh(item)
+    return t
+
+
+def test_confirmed_rejection_flips_item_to_failed_with_reason(client):
+    c, Session = client
+    db = Session()
+    u = _user(db, "verdict-reject@example.com")
+    job = Job(user_id=u.id, external_id="~abc123", platform="upwork",
+              title="Job", url="https://www.upwork.com/jobs/~abc123")
+    db.add(job)
+    db.commit()
+    # the task "succeeded" (no crash) but the platform rejected the submit —
+    # the explicit submitted=False verdict must win over the success flag
+    item = _submission_item(db, u, job)
+    _complete(c, db, u, item,
+              {"submitted": False,
+               "reason": "platform rejected the submit (matched 'insufficient connects')"})
+    assert item.status == "failed"
+    assert "insufficient connects" in item.submission_result["error"]
+
+
+def test_unverified_submit_flips_item_to_submitted_unverified(client):
+    c, Session = client
+    db = Session()
+    u = _user(db, "verdict-unverified@example.com")
+    job = Job(user_id=u.id, external_id="~abc123", platform="upwork",
+              title="Job", url="https://www.upwork.com/jobs/~abc123")
+    db.add(job)
+    db.commit()
+    item = _submission_item(db, u, job)
+    _complete(c, db, u, item,
+              {"submitted": None, "state": "submitted_unverified",
+               "reason": "no success/failure marker matched",
+               "screenshots": ["/shots/a.png"]})
+    assert item.status == "submitted_unverified"
+    assert item.submission_result["state"] == "submitted_unverified"
+    assert item.submission_result["screenshots"] == ["/shots/a.png"]
+
+
+def test_manual_assist_gate_no_longer_flips_to_submitted(client):
+    c, Session = client
+    db = Session()
+    u = _user(db, "verdict-manual@example.com")
+    job = Job(user_id=u.id, external_id="~abc123", platform="upwork",
+              title="Job", url="https://www.upwork.com/jobs/~abc123")
+    db.add(job)
+    db.commit()
+    # manual-assist (WORKER_ALLOW_SUBMIT off): filled only, NOT submitted —
+    # must map to failed so a human re-reviews instead of lying "submitted"
+    item = _submission_item(db, u, job)
+    _complete(c, db, u, item,
+              {"manual_assist": True, "filled": True, "submitted": False,
+               "note": "form filled only — a human must click the final submit"})
+    assert item.status == "failed"
+    assert "human must click" in item.submission_result["error"]
+
+
+# ---------------- session-expiry surfacing (P2-3) ----------------
+
+def test_session_expired_audited_and_account_flagged(client):
+    c, Session = client
+    from app.models import AuditLog, PlatformAccount
+    db = Session()
+    u = _user(db, "session-exp@example.com")
+    account = PlatformAccount(user_id=u.id, platform="fiverr", label="main",
+                              settings={"username": "seller1"})
+    db.add(account)
+    db.commit()
+
+    t = _task(db, u.id, status="claimed", claimed_by="w-1")
+    r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
+               json={"worker_id": "w-1", "success": False,
+                     "result": {"session_expired": True, "platform": "fiverr"}},
+               headers=WORKER_HEADERS)
+    assert r.status_code == 200
+    assert r.json()["status"] == "failed"  # a real failure: feeds the breaker
+
+    row = (db.query(AuditLog)
+           .filter(AuditLog.action_type == "session_expired")
+           .one())
+    assert row.user_id == u.id and row.platform == "fiverr"
+    assert row.detail["task_id"] == t.id
+
+    db.refresh(account)
+    assert account.settings["needs_reenrollment"] is True
+    assert account.settings["username"] == "seller1"  # existing knobs kept
+
+
+def test_session_expired_counts_toward_breaker(client):
+    c, Session = client
+    db = Session()
+    u = _user(db, "session-breaker@example.com")
+    for _ in range(3):
+        t = _task(db, u.id, status="claimed", claimed_by="w-1")
+        r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
+                   json={"worker_id": "w-1", "success": False,
+                         "result": {"session_expired": True,
+                                    "platform": "fiverr"}},
+                   headers=WORKER_HEADERS)
+        assert r.status_code == 200
+    assert circuit_breaker.get_state("fiverr", u.id)["state"] == "open"

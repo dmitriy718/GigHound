@@ -49,6 +49,18 @@ class CaptchaDetectedError(Exception):
         super().__init__(f"challenge detected on {platform}: {marker}")
 
 
+class SessionExpiredError(Exception):
+    """The stored session is dead (login redirect / logged-out page) — the
+    account needs re-enrollment. Distinct from "no data": handlers must never
+    post fabricated zeros for a logged-out session."""
+
+    def __init__(self, platform: str, detail: str = ""):
+        self.platform = platform
+        self.detail = detail
+        super().__init__(f"session expired on {platform}"
+                         + (f": {detail}" if detail else ""))
+
+
 def _sleep(seconds: float):
     """Indirection so tests can patch out real sleeping."""
     _real_sleep(seconds)

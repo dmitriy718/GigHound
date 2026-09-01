@@ -5,12 +5,18 @@ import re
 from dataclasses import dataclass
 
 from ..browser import (BrowserManager, CaptchaDetectedError, human_delay,
-                       raise_if_challenge)
+                       raise_if_challenge, SessionExpiredError)
 from ..client import WorkerClient
 from ..config import Config
 from ..platforms import platform_config
 
 log = logging.getLogger(__name__)
+
+
+class SelectorSuspectError(Exception):
+    """Extraction yielded nothing at all on a verified session — the platform
+    selectors in worker/platforms.py likely drifted. Failing loudly beats
+    posting fabricated zeros into tenant analytics."""
 
 
 @dataclass
@@ -22,12 +28,34 @@ class HandlerContext:
 
 def fetch_page(ctx: HandlerContext, platform: str, user_id: int, url: str):
     """Navigate to `url` on the (platform, user) session with human pacing.
-    Raises CaptchaDetectedError when a challenge marker is present."""
+    Raises CaptchaDetectedError when a challenge marker is present and
+    SessionExpiredError when the session is logged out — so "no data" is
+    never mistaken for a dead session."""
     page = ctx.browser.new_page(platform, user_id)
     page.goto(url, wait_until="domcontentloaded")
     human_delay(1.0, 2.5)
     raise_if_challenge(page, platform)
+    _raise_if_session_expired(page, platform)
     return page
+
+
+def _raise_if_session_expired(page, platform: str):
+    """Best-effort session liveness check against the platform's configured
+    markers (see worker/platforms.py — they REQUIRE live validation). Only
+    runs when markers are configured."""
+    cfg = platform_config(platform)
+    login_redirect = cfg.get("login_redirect")
+    logged_in_marker = cfg.get("logged_in_marker")
+    if not login_redirect and not logged_in_marker:
+        return
+    if login_redirect and login_redirect in (page.url or ""):
+        raise SessionExpiredError(platform, f"redirected to {page.url}")
+    if logged_in_marker:
+        try:
+            page.wait_for_selector(logged_in_marker, timeout=5000)
+        except Exception as exc:  # noqa: BLE001 — timeout means "not logged in"
+            raise SessionExpiredError(
+                platform, f"logged-in marker {logged_in_marker!r} absent") from exc
 
 
 def extract_jsonld(page) -> list[dict]:

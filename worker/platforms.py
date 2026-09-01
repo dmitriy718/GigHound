@@ -26,6 +26,17 @@ GENERIC_CHALLENGE_MARKERS: list[str] = [
     "text=/are you a robot/i",
 ]
 
+# ---------------------------------------------------------------- session
+# Session-expiry markers, per platform (keys inside each platform dict below):
+# `logged_in_marker` is a selector only present on an authenticated page;
+# `login_redirect` is a URL fragment that indicates the platform bounced us
+# to a login wall. fetch_page checks these after navigation so "logged out /
+# selector dead" is never mistaken for "no data" (which would silently
+# fabricate zeros into tenant analytics).
+# BEST-EFFORT BY DESIGN — these REQUIRE LIVE VALIDATION against each
+# platform's current UI; a drifted marker must fail loudly (SessionExpired),
+# never post fabricated data.
+
 PLATFORMS: dict[str, dict[str, Any]] = {
     "fiverr": {
         "base_url": "https://www.fiverr.com",
@@ -92,6 +103,9 @@ PLATFORMS: dict[str, dict[str, Any]] = {
         "proposal_unread": ("[data-testid='unread-badge'], .unread, "
                             "[class*='unread'], [aria-label*='unread' i]"),
         "challenge_markers": ["text=/please verify/i", "#px-captcha"],
+        # session-expiry markers (see the session note above — live-validate)
+        "logged_in_marker": "a[href*='/seller_dashboard'], [data-testid='header-avatar']",
+        "login_redirect": "/login",
     },
     "upwork": {
         "base_url": "https://www.upwork.com",
@@ -130,6 +144,26 @@ PLATFORMS: dict[str, dict[str, Any]] = {
         "proposal_unread": ("[data-test='unread'], .unread, [class*='unread'], "
                             "[aria-label*='unread' i], .badge:has-text('new')"),
         "challenge_markers": ["#challenge-running", "text=/unusual activity/i"],
+        # post-submit outcome markers for the proposal flow: the handler
+        # verifies the result of the submit click against these instead of
+        # trusting the click. BEST-EFFORT — REQUIRE LIVE VALIDATION; when
+        # neither list matches, the handler reports the outcome as
+        # unverified rather than guessing (a wrong guess either hides a
+        # rejection or invites a duplicate submit).
+        "submit_success": [
+            "text=/proposal (was |has been )?submitted/i",
+            "text=/your proposal has been sent/i",
+            "[data-test='submit-success'], .submit-success",
+        ],
+        "submit_failure": [
+            "text=/insufficient connects/i",
+            "text=/this job is no longer available/i",
+            "text=/job (has been|was) (closed|removed|cancelled)/i",
+            "[data-test='form-error'], .form-error, [role='alert']",
+        ],
+        # session-expiry markers (see the session note above — live-validate)
+        "logged_in_marker": "[data-test='account-menu'], a[href*='/ab/payments']",
+        "login_redirect": "/ab/account-security/login",
     },
     # copy-assist platforms: manual-assist only (fill + screenshot, no submit)
     "peopleperhour": {
@@ -153,6 +187,9 @@ PLATFORMS: dict[str, dict[str, Any]] = {
         "proposal_unread": (".unread, [class*='unread'], "
                             "[aria-label*='unread' i], .badge:has-text('new')"),
         "challenge_markers": [],
+        # session-expiry markers (see the session note above — live-validate)
+        "logged_in_marker": "a[href*='/dashboard'], .user-menu",
+        "login_redirect": "/login",
     },
     "guru": {
         "base_url": "https://www.guru.com",
@@ -175,6 +212,9 @@ PLATFORMS: dict[str, dict[str, Any]] = {
         "proposal_unread": (".unread, [class*='unread'], "
                             "[aria-label*='unread' i], .badge:has-text('new')"),
         "challenge_markers": [],
+        # session-expiry markers (see the session note above — live-validate)
+        "logged_in_marker": "a[href*='/d/settings'], .user-menu",
+        "login_redirect": "/login",
     },
 }
 

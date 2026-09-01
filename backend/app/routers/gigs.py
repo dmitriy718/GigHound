@@ -382,6 +382,8 @@ def complete_stealth_task(task_id: int, body: dict, db: Session = Depends(get_db
                 f"{recent_failures} stealth task failures in the last hour",
                 user_id=task.user_id)
     _apply_submission_outcome(db, task, success)
+    if (task.result or {}).get("session_expired"):
+        _flag_session_expired(db, task)
     db.add(AuditLog(user_id=task.user_id, action_type="stealth_task_completed",
                     platform=task.platform,
                     detail={"task_id": task.id, "worker_id": task.claimed_by,
@@ -390,25 +392,79 @@ def complete_stealth_task(task_id: int, body: dict, db: Session = Depends(get_db
     return {"id": task.id, "status": task.status}
 
 
+def _flag_session_expired(db: Session, task: StealthTask):
+    """The worker found a dead session (login redirect / logged-out page):
+    audit it and flag the platform account as needing re-enrollment so a
+    human re-enrolls credentials instead of the worker silently posting
+    fabricated data. The failed task already counts toward the per-tenant
+    circuit breaker via the normal failure path."""
+    db.add(AuditLog(user_id=task.user_id, action_type="session_expired",
+                    platform=task.platform,
+                    detail={"task_id": task.id, "worker_id": task.claimed_by}))
+    account = (db.query(PlatformAccount)
+               .filter(PlatformAccount.user_id == task.user_id,
+                       PlatformAccount.platform == task.platform)
+               .order_by(PlatformAccount.created_at)
+               .first())
+    if account is not None:
+        account.settings = {**(account.settings or {}),
+                            "needs_reenrollment": True}
+
+
 def _apply_submission_outcome(db: Session, task: StealthTask, success: bool):
     """Close the HITL loop for submission tasks: flip the review-queue item
-    out of queued_for_browser and complete the agency handoff record."""
+    out of queued_for_browser and complete the agency handoff record.
+
+    The worker's explicit `result.submitted` verdict wins over the bare
+    task-level success flag: a task can "succeed" (no crash) while the
+    platform rejected the submit, or while the outcome could not be
+    confirmed — the click already happened, so the latter becomes
+    submitted_unverified for a human to check on the platform (NEVER
+    auto-retried: a blind retry risks a duplicate proposal)."""
     item_id = (task.payload or {}).get("proposal_queue_item_id")
     if not item_id:
         return
+    result = task.result or {}
+    submitted = result.get("submitted")
     item = db.get(ProposalQueueItem, item_id)
     if item and item.user_id == task.user_id and item.status == "queued_for_browser":
-        item.status = "submitted" if success else "failed"
         if not success:
+            item.status = "failed"
             item.submission_result = {
                 **(item.submission_result or {}),
-                "error": (task.result or {}).get("error", "stealth submission failed"),
+                "error": result.get("error", "stealth submission failed"),
             }
+        elif submitted is False:
+            # explicit non-submission on a successful task: the platform
+            # confirmed a rejection, or the manual-assist gate left the final
+            # click to a human. Map to failed with the worker's reason so a
+            # human re-reviews — leaving it in queued_for_browser would
+            # strand it, since nothing enqueues a new task for an item
+            # already in that state.
+            item.status = "failed"
+            item.submission_result = {
+                **(item.submission_result or {}),
+                "error": (result.get("reason") or result.get("note")
+                          or "submission not confirmed by the platform"),
+            }
+        elif submitted is None and result.get("state") == "submitted_unverified":
+            item.status = "submitted_unverified"
+            item.submission_result = {**(item.submission_result or {}), **result}
+        else:
+            item.status = "submitted"
     if task.task_type == SUBMIT_UPWORK_PROPOSAL:
         from ..adapters.upwork_agency import UpworkAgencyAdapter
-        UpworkAgencyAdapter(db, task.user_id).complete_submission(
-            (task.payload or {}).get("job_external_id", ""), success,
-            note="stealth worker " + ("submitted" if success else "failed"))
+        # the agency handoff record is only closed on a CONFIRMED outcome —
+        # an unverified submit stays pending for human reconciliation
+        unverified = (success and submitted is None
+                      and result.get("state") == "submitted_unverified")
+        if not unverified:
+            UpworkAgencyAdapter(db, task.user_id).complete_submission(
+                (task.payload or {}).get("job_external_id", ""),
+                success and submitted is not False,
+                note="stealth worker " +
+                     ("submitted" if success and submitted is not False
+                      else "failed"))
 
 
 # --- worker-posted proposal status (Upwork outcome/reply sync) ---
