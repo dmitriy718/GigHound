@@ -173,3 +173,54 @@ def test_seed_session_falls_back_when_absent_or_unreachable():
 
     # no client at all (e.g. worker.login) → no-op
     _manager(None)._seed_session(FakeContext(), "guru", 1)
+
+
+# ---------------- session-dir / artifact permissions ----------------
+
+def _mode(path):
+    import os
+    import stat
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def test_mkdir_private_creates_owner_only_dirs(tmp_path):
+    from worker.browser import _mkdir_private
+    d = _mkdir_private(tmp_path / "platform" / "user_3")
+    assert d.is_dir() and _mode(d) == 0o700
+    # re-running tightens a pre-existing loose dir instead of leaving it
+    import os
+    os.chmod(d, 0o755)
+    _mkdir_private(d)
+    assert _mode(d) == 0o700
+
+
+def test_storage_state_saved_owner_only(tmp_path):
+    from worker.browser import BrowserManager
+    from worker.config import Config
+
+    class FakeStorageContext:
+        def storage_state(self, path):
+            Path(path).write_text("{}")
+
+        def close(self):
+            pass
+
+    mgr = BrowserManager(Config(session_dir=tmp_path), client=None)
+    mgr.session_dir_for("upwork", 1).mkdir(parents=True)
+    mgr._contexts[("upwork", 1)] = FakeStorageContext()
+    mgr.close_session("upwork", 1)
+    assert _mode(tmp_path / "upwork" / "user_1" / "storage_state.json") == 0o600
+
+
+def test_screenshot_saved_owner_only(tmp_path):
+    from worker.browser import BrowserManager
+    from worker.config import Config
+
+    class FakeShotPage:
+        def screenshot(self, path, full_page=False):
+            Path(path).write_bytes(b"png")
+
+    mgr = BrowserManager(Config(session_dir=tmp_path), client=None)
+    mgr.session_dir_for("guru", 2).mkdir(parents=True)
+    shot = mgr.screenshot(FakeShotPage(), "guru", 2, "task9-manual-assist")
+    assert _mode(Path(shot)) == 0o600

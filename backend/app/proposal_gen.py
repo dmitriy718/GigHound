@@ -124,14 +124,29 @@ def _strip_prompt_leakage(text: str, rate_line: str) -> tuple[str, str | None]:
     return clean, warning
 
 
+_FENCE_TOKEN_RE = re.compile(r"</?job_posting\b[^>]*>?", re.IGNORECASE)
+
+
+def _escape_fence(text: str) -> str:
+    """Input-side fence integrity: a posting containing a literal
+    </job_posting> would close the untrusted-data fence and turn the rest of
+    the description into trusted instruction space, defeating
+    _UNTRUSTED_DATA_RULE. Neutralize the token inside untrusted content
+    (case-insensitive) before interpolation; normal text passes through."""
+    return _FENCE_TOKEN_RE.sub(
+        lambda mo: "[/job_posting]" if mo.group(0).lstrip("<").startswith("/")
+        else "[job_posting]", text or "")
+
+
 # ---------------- a) job analysis ----------------
 
 async def analyze_job(job: Job) -> tuple[dict, dict]:
     """Returns (analysis, meta). LLM JSON analysis, heuristic fallback offline."""
     user = (
         "<job_posting>\n"
-        f"TITLE: {job.title}\n\nDESCRIPTION:\n{job.description}\n\n"
-        f"BUDGET: {job.budget_min}-{job.budget_max} {job.currency}\n"
+        f"TITLE: {_escape_fence(job.title)}\n\n"
+        f"DESCRIPTION:\n{_escape_fence(job.description)}\n\n"
+        f"BUDGET: {job.budget_min}-{job.budget_max} {_escape_fence(job.currency)}\n"
         "</job_posting>"
     )
     if llm.llm_available():
@@ -225,8 +240,8 @@ async def _generate_with_llm(platform: str, job: Job, analysis: dict,
     # the untrusted <job_posting> tags.
     history = f"CLIENT HISTORY: {client_history_text}\n" if client_history_text else ""
     user = (
-        f"<job_posting>\nJOB TITLE: {job.title}\n"
-        f"JOB DESCRIPTION: {job.description[:2000]}\n</job_posting>\n"
+        f"<job_posting>\nJOB TITLE: {_escape_fence(job.title)}\n"
+        f"JOB DESCRIPTION: {_escape_fence(job.description[:2000])}\n</job_posting>\n"
         f"ANALYSIS: skills={analysis.get('required_skills')}, "
         f"pain_points={analysis.get('client_pain_points')}, tone={analysis.get('tone')}\n"
         f"{history}"
@@ -517,10 +532,10 @@ async def generate_follow_up(db: Session, item, job: Job) -> dict:
     if llm.llm_available():
         try:
             user = (
-                f"<job_posting>\nJOB TITLE: {job.title}\n"
-                f"JOB DESCRIPTION: {job.description[:1500]}\n</job_posting>\n"
+                f"<job_posting>\nJOB TITLE: {_escape_fence(job.title)}\n"
+                f"JOB DESCRIPTION: {_escape_fence(job.description[:1500])}\n</job_posting>\n"
                 f"MY ORIGINAL PROPOSAL (already sent, awaiting a reply):\n"
-                f"{item.proposal_text[:800]}\n"
+                f"{_escape_fence(item.proposal_text[:800])}\n"
                 f"ANALYSIS: pain_points={analysis.get('client_pain_points')}, "
                 f"missing_info={analysis.get('missing_info')}\n"
                 "Write the follow-up message now."
@@ -633,8 +648,8 @@ async def generate_interview_prep(db: Session, item, job: Job) -> dict:
     if llm.llm_available():
         try:
             user = (
-                f"<job_posting>\nJOB TITLE: {job.title}\n"
-                f"JOB DESCRIPTION: {job.description[:1500]}\n</job_posting>\n"
+                f"<job_posting>\nJOB TITLE: {_escape_fence(job.title)}\n"
+                f"JOB DESCRIPTION: {_escape_fence(job.description[:1500])}\n</job_posting>\n"
                 f"ANALYSIS: required_skills={analysis.get('required_skills')}, "
                 f"deliverables={analysis.get('deliverables')}, "
                 f"pain_points={analysis.get('client_pain_points')}, "

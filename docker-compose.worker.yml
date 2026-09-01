@@ -5,13 +5,26 @@
 services:
   worker:
     build: ./worker
-    env_file:
-      - path: .env
-        required: false  # worker also takes plain environment variables
+    # No root env_file: this container runs a browser against hostile web
+    # content and must not see DB credentials / LLM keys. Pass ONLY the
+    # variables worker/config.py actually reads; values still come from the
+    # root .env (or shell) at compose time via ${VAR} interpolation, and the
+    # defaults below mirror config.py so unset vars behave as before.
     environment:
       GIGHOUND_API_URL: ${GIGHOUND_API_URL:-http://backend:8000}
       GIGHOUND_WORKER_TOKEN: ${GIGHOUND_WORKER_TOKEN:?set GIGHOUND_WORKER_TOKEN}
       WORKER_SESSION_DIR: /app/.sessions
+      WORKER_PLATFORMS: ${WORKER_PLATFORMS:-}
+      WORKER_HEADLESS: ${WORKER_HEADLESS:-true}
+      WORKER_ALLOW_SUBMIT: ${WORKER_ALLOW_SUBMIT:-false}
+      WORKER_POLL_INTERVAL_SEC: ${WORKER_POLL_INTERVAL_SEC:-45}
+      WORKER_POLL_JITTER_SEC: ${WORKER_POLL_JITTER_SEC:-15}
+      WORKER_TIMEZONE: ${WORKER_TIMEZONE:-America/New_York}
+      WORKER_LOCALE: ${WORKER_LOCALE:-en-US}
+      WORKER_PROXY_FIVERR: ${WORKER_PROXY_FIVERR:-}
+      WORKER_PROXY_UPWORK: ${WORKER_PROXY_UPWORK:-}
+      WORKER_PROXY_PEOPLEPERHOUR: ${WORKER_PROXY_PEOPLEPERHOUR:-}
+      WORKER_PROXY_GURU: ${WORKER_PROXY_GURU:-}
     volumes:
       # persistent per-(platform, user) browser sessions
       - worker_sessions:/app/.sessions

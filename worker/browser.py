@@ -13,6 +13,7 @@ via `python -m worker.login --platform <p>` (see README).
 """
 import json
 import logging
+import os
 import random
 import re
 from pathlib import Path
@@ -122,6 +123,14 @@ def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "_", value)
 
 
+def _mkdir_private(path: Path) -> Path:
+    """Create a session dir (and parents) and lock it down: it holds browser
+    profiles, storage_state and inbox screenshots — owner-only (0700)."""
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
 def apply_storage_state(context, state: dict):
     """Seed a browser context from a Playwright storage_state dict (cookies
     + per-origin localStorage), as enrolled via the Accounts UI."""
@@ -176,8 +185,7 @@ class BrowserManager:
         key = (platform, user_id)
         if key in self._contexts:
             return self._contexts[key]
-        user_data_dir = self.session_dir_for(platform, user_id)
-        user_data_dir.mkdir(parents=True, exist_ok=True)
+        user_data_dir = _mkdir_private(self.session_dir_for(platform, user_id))
         width, height = random.choice(VIEWPORTS)
         kwargs = {
             "user_data_dir": str(user_data_dir),
@@ -233,6 +241,7 @@ class BrowserManager:
             # belt & suspenders alongside the persistent profile dir
             state_path = self.session_dir_for(platform, user_id) / "storage_state.json"
             context.storage_state(path=str(state_path))
+            os.chmod(state_path, 0o600)  # session cookies — owner-only
         except Exception as exc:  # noqa: BLE001
             log.warning("could not save storage_state for %s/%s: %s",
                         platform, user_id, exc)
@@ -241,4 +250,5 @@ class BrowserManager:
     def screenshot(self, page, platform: str, user_id: int, name: str) -> str:
         path = self.session_dir_for(platform, user_id) / f"{_safe_name(name)}.png"
         page.screenshot(path=str(path), full_page=True)
+        os.chmod(path, 0o600)  # may show tenant inboxes/proposals — owner-only
         return str(path)
