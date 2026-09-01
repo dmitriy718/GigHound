@@ -195,7 +195,7 @@ def upwork_submit_proposal(body: QueueItemAction, db: Session = Depends(get_db),
                   if stealth_task is not None else "")
         if not reason:
             from .. import circuit_breaker
-            reason = circuit_breaker.check("upwork")[1] or "upwork circuit is open"
+            reason = circuit_breaker.check("upwork", user.id)[1] or "upwork circuit is open"
         raise HTTPException(409, reason)
     # same status contract as routers/proposals.py submit: task completion
     # (gigs.py _apply_submission_outcome) only flips queued_for_browser items

@@ -197,11 +197,43 @@ def test_windowed_circuit_breaker(client):
 
     fail_one()
     fail_one()
-    assert circuit_breaker.get_state("fiverr")["state"] == "closed"  # 2 in window < 3
+    assert circuit_breaker.get_state("fiverr", u.id)["state"] == "closed"  # 2 in window < 3
     fail_one()
-    state = circuit_breaker.get_state("fiverr")
+    state = circuit_breaker.get_state("fiverr", u.id)
     assert state["state"] == "open"
     assert "failures in the last hour" in state["reason"]
+    # the trip is per-tenant: the platform-global circuit stays closed
+    assert circuit_breaker.get_state("fiverr")["state"] == "closed"
+
+
+def test_per_tenant_circuit_isolation(client):
+    """Tenant A's failures trip A's circuit; tenant B keeps enqueueing."""
+    c, Session = client
+    db = Session()
+    a = _user(db, "tenant-a@example.com")
+    b = _user(db, "tenant-b@example.com")
+
+    # 3 in-window failures for tenant A
+    for _ in range(3):
+        t = _task(db, a.id, status="claimed")
+        r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
+                   json={"success": False, "result": {"error": "boom"}},
+                   headers=WORKER_HEADERS)
+        assert r.status_code == 200
+
+    allowed_a, _ = circuit_breaker.check("fiverr", a.id)
+    allowed_b, _ = circuit_breaker.check("fiverr", b.id)
+    assert not allowed_a  # A is halted
+    assert allowed_b      # B is unaffected
+    assert circuit_breaker.check("fiverr")[0]  # global scope untouched
+
+    # a manual platform-wide open still blocks every tenant
+    circuit_breaker.open_circuit("fiverr", "manual halt")
+    try:
+        assert not circuit_breaker.check("fiverr", b.id)[0]
+        assert not circuit_breaker.check("fiverr")[0]
+    finally:
+        circuit_breaker.close_circuit("fiverr", "test cleanup")
 
 
 def test_complete_submission_flips_queue_item(client):

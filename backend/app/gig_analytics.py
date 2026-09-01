@@ -87,7 +87,7 @@ def enqueue_metrics_scrape(db: Session, user_id: int) -> list[StealthTask]:
     platforms = [p for (p,) in db.query(Gig.platform).filter(Gig.user_id == user_id).distinct().all()]
     tasks = []
     for platform in platforms:
-        allowed, reason = circuit_breaker.check(platform)
+        allowed, reason = circuit_breaker.check(platform, user_id)
         task = StealthTask(
             user_id=user_id,
             platform=platform, task_type="gig_scrape_metrics",

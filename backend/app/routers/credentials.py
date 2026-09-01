@@ -7,13 +7,17 @@ is stored under the account's `credential_ref` (auto-generated as
 values are never returned or logged — status exposes key names only.
 
 Recognized secret keys per platform:
-  * freelancer / upwork: `access_token` (required), `refresh_token` (opt)
-  * stealth platforms (fiverr, peopleperhour, guru, linkedin, indeed):
+  * freelancer: `access_token` (required), `refresh_token` (opt)
+  * stealth platforms (fiverr, peopleperhour, guru):
     `storage_state_json` (a Playwright storage_state JSON string — the
     preferred path, seeded straight into the worker's browser context), OR
     raw `username` + `password` for the worker's login flow.
     Password-based login is a FALLBACK only: it is challenge-prone
     (CAPTCHA/2FA) and may escalate to a human at run time.
+  * upwork supports BOTH credential types: API tokens (`access_token`,
+    `refresh_token`) OR a browser session per the stealth rules above
+    (the worker drives upwork through the browser, so a stealth session is
+    what most tenants enroll).
 """
 import json
 import logging
@@ -34,7 +38,9 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/accounts", tags=["credentials"])
 
 _OAUTH_PLATFORMS = ("freelancer", "upwork")
-_STEALTH_PLATFORMS = ("fiverr", "peopleperhour", "guru", "linkedin", "indeed")
+# stealth platforms served by the browser worker (worker/config.py
+# SUPPORTED_PLATFORMS minus API-driven ones); upwork is BOTH oauth + stealth
+_STEALTH_PLATFORMS = ("fiverr", "peopleperhour", "guru", "upwork")
 _OAUTH_KEYS = {"access_token", "refresh_token"}
 _STEALTH_KEYS = {"storage_state_json", "username", "password"}
 
@@ -68,37 +74,60 @@ def _ensure_credential_ref(db: Session, account: PlatformAccount) -> str:
     return account.credential_ref
 
 
+def _validate_oauth_secrets(platform: str, secrets: dict):
+    unknown = set(secrets) - _OAUTH_KEYS
+    if unknown:
+        raise HTTPException(422, f"unknown credential keys for {platform}: {sorted(unknown)}")
+    if not secrets.get("access_token"):
+        raise HTTPException(422, f"{platform}: 'access_token' is required")
+
+
+def _validate_stealth_secrets(platform: str, secrets: dict):
+    unknown = set(secrets) - _STEALTH_KEYS
+    if unknown:
+        raise HTTPException(422, f"unknown credential keys for {platform}: {sorted(unknown)}")
+    has_state = bool(secrets.get("storage_state_json"))
+    has_userpass = bool(secrets.get("username")) or bool(secrets.get("password"))
+    if has_state and has_userpass:
+        raise HTTPException(
+            422, "provide either 'storage_state_json' or 'username'+'password', not both")
+    if has_state:
+        try:
+            state = json.loads(secrets["storage_state_json"])
+        except (ValueError, TypeError):
+            raise HTTPException(422, "'storage_state_json' is not valid JSON") from None
+        if not isinstance(state, dict):
+            raise HTTPException(422, "'storage_state_json' must decode to a JSON object")
+    elif has_userpass:
+        if not (secrets.get("username") and secrets.get("password")):
+            raise HTTPException(422, "'username' and 'password' must be provided together")
+    else:
+        raise HTTPException(
+            422, f"{platform}: provide 'storage_state_json' or 'username'+'password'")
+
+
+def _validate_dual_secrets(platform: str, secrets: dict):
+    """Platform in BOTH sets (upwork): API tokens OR a browser session."""
+    unknown = set(secrets) - (_OAUTH_KEYS | _STEALTH_KEYS)
+    if unknown:
+        raise HTTPException(422, f"unknown credential keys for {platform}: {sorted(unknown)}")
+    if secrets.get("access_token"):
+        stealth = {k: v for k, v in secrets.items() if k in _STEALTH_KEYS}
+        if stealth:  # mixed enrollment: the stealth half must still be coherent
+            _validate_stealth_secrets(platform, stealth)
+        return
+    _validate_stealth_secrets(platform, secrets)
+
+
 def _validate_secrets(platform: str, secrets: dict) -> dict:
     if not secrets:
         raise HTTPException(422, "secrets must not be empty")
-    if platform in _OAUTH_PLATFORMS:
-        unknown = set(secrets) - _OAUTH_KEYS
-        if unknown:
-            raise HTTPException(422, f"unknown credential keys for {platform}: {sorted(unknown)}")
-        if not secrets.get("access_token"):
-            raise HTTPException(422, f"{platform}: 'access_token' is required")
+    if platform in _OAUTH_PLATFORMS and platform in _STEALTH_PLATFORMS:
+        _validate_dual_secrets(platform, secrets)
+    elif platform in _OAUTH_PLATFORMS:
+        _validate_oauth_secrets(platform, secrets)
     elif platform in _STEALTH_PLATFORMS:
-        unknown = set(secrets) - _STEALTH_KEYS
-        if unknown:
-            raise HTTPException(422, f"unknown credential keys for {platform}: {sorted(unknown)}")
-        has_state = bool(secrets.get("storage_state_json"))
-        has_userpass = bool(secrets.get("username")) or bool(secrets.get("password"))
-        if has_state and has_userpass:
-            raise HTTPException(
-                422, "provide either 'storage_state_json' or 'username'+'password', not both")
-        if has_state:
-            try:
-                state = json.loads(secrets["storage_state_json"])
-            except (ValueError, TypeError):
-                raise HTTPException(422, "'storage_state_json' is not valid JSON") from None
-            if not isinstance(state, dict):
-                raise HTTPException(422, "'storage_state_json' must decode to a JSON object")
-        elif has_userpass:
-            if not (secrets.get("username") and secrets.get("password")):
-                raise HTTPException(422, "'username' and 'password' must be provided together")
-        else:
-            raise HTTPException(
-                422, f"{platform}: provide 'storage_state_json' or 'username'+'password'")
+        _validate_stealth_secrets(platform, secrets)
     else:
         raise HTTPException(422, f"credential enrollment not supported for '{platform}'")
     if any(not isinstance(v, str) or not v for v in secrets.values()):

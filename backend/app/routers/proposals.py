@@ -490,7 +490,7 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
                           if stealth_task is not None else "")
                 if not reason:
                     from .. import circuit_breaker
-                    reason = circuit_breaker.check("upwork")[1] or "upwork circuit is open"
+                    reason = circuit_breaker.check("upwork", user.id)[1] or "upwork circuit is open"
                 raise HTTPException(409, reason)
         else:
             raise HTTPException(

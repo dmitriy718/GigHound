@@ -16,8 +16,11 @@ import { ACCOUNT_MODES, PLATFORMS } from '../types';
 import { ErrorBanner, formatDate, Modal } from '../components/common';
 
 // Token-based platforms enroll access_token (+ optional refresh_token);
-// stealth platforms enroll a Playwright storage_state JSON or username+password fallback
+// stealth platforms enroll a Playwright storage_state JSON or username+password fallback.
+// Upwork is in BOTH sets (API tokens OR a browser session — the worker drives it via browser).
 const TOKEN_PLATFORMS: Platform[] = ['freelancer', 'upwork'];
+const STEALTH_PLATFORMS: Platform[] = ['fiverr', 'peopleperhour', 'guru', 'upwork'];
+const ENROLLABLE_PLATFORMS: Platform[] = [...new Set([...TOKEN_PLATFORMS, ...STEALTH_PLATFORMS])];
 
 // FastAPI error bodies are {detail: string} — prefer that over the raw status line
 const apiMessage = (e: unknown): string => {
@@ -61,7 +64,7 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
   const [accessToken, setAccessToken] = useState('');
   const [refreshToken, setRefreshToken] = useState('');
   // stealth platforms
-  const [credForm, setCredForm] = useState<'storage_state' | 'userpass'>('storage_state');
+  const [credForm, setCredForm] = useState<'token' | 'storage_state' | 'userpass'>('storage_state');
   const [storageJson, setStorageJson] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -70,6 +73,9 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
   const [oauthCode, setOauthCode] = useState('');
 
   const isTokenPlatform = TOKEN_PLATFORMS.includes(account.platform);
+  const isStealthPlatform = STEALTH_PLATFORMS.includes(account.platform);
+  const isDualPlatform = isTokenPlatform && isStealthPlatform;
+  const showTokenForm = isTokenPlatform && (!isDualPlatform || credForm === 'token');
 
   const loadStatus = () => {
     getCredentialStatus(account.id)
@@ -102,7 +108,7 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
 
   const enroll = async () => {
     let secrets: Record<string, string>;
-    if (isTokenPlatform) {
+    if (showTokenForm) {
       if (!accessToken.trim()) {
         setError('access_token is required.');
         return;
@@ -224,7 +230,42 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
         )}
       </p>
 
-      {isTokenPlatform ? (
+      {!ENROLLABLE_PLATFORMS.includes(account.platform) ? (
+        <p className="muted" style={{ fontSize: 12 }}>
+          Credential enrollment is not supported for {account.platform} — no worker serves this
+          platform.
+        </p>
+      ) : (
+        <>
+          {isDualPlatform && (
+            <div className="form-row" style={{ marginBottom: 8 }}>
+              <label className="checkbox-row">
+                <input
+                  type="radio"
+                  checked={credForm === 'token'}
+                  onChange={() => setCredForm('token')}
+                />
+                Access token (API)
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="radio"
+                  checked={credForm === 'storage_state'}
+                  onChange={() => setCredForm('storage_state')}
+                />
+                Browser session (storage_state JSON)
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="radio"
+                  checked={credForm === 'userpass'}
+                  onChange={() => setCredForm('userpass')}
+                />
+                Username + password
+              </label>
+            </div>
+          )}
+          {showTokenForm ? (
         <>
           <div className="form-row">
             <div className="field" style={{ flex: 1, marginBottom: 0 }}>
@@ -280,24 +321,26 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
         </>
       ) : (
         <>
-          <div className="form-row" style={{ marginBottom: 8 }}>
-            <label className="checkbox-row">
-              <input
-                type="radio"
-                checked={credForm === 'storage_state'}
-                onChange={() => setCredForm('storage_state')}
-              />
-              Browser session (storage_state JSON)
-            </label>
-            <label className="checkbox-row">
-              <input
-                type="radio"
-                checked={credForm === 'userpass'}
-                onChange={() => setCredForm('userpass')}
-              />
-              Username + password
-            </label>
-          </div>
+          {!isDualPlatform && (
+            <div className="form-row" style={{ marginBottom: 8 }}>
+              <label className="checkbox-row">
+                <input
+                  type="radio"
+                  checked={credForm === 'storage_state'}
+                  onChange={() => setCredForm('storage_state')}
+                />
+                Browser session (storage_state JSON)
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="radio"
+                  checked={credForm === 'userpass'}
+                  onChange={() => setCredForm('userpass')}
+                />
+                Username + password
+              </label>
+            </div>
+          )}
           {credForm === 'storage_state' ? (
             <div className="field">
               <label>Playwright storage_state JSON</label>
@@ -341,11 +384,15 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
           )}
         </>
       )}
+        </>
+      )}
 
       <div className="form-row" style={{ marginBottom: 0 }}>
-        <button className="btn" disabled={busy} onClick={enroll}>
-          {busy ? 'Working…' : 'Enroll credentials'}
-        </button>
+        {ENROLLABLE_PLATFORMS.includes(account.platform) && (
+          <button className="btn" disabled={busy} onClick={enroll}>
+            {busy ? 'Working…' : 'Enroll credentials'}
+          </button>
+        )}
         {status?.enrolled && (
           <button className="btn danger" disabled={busy} onClick={remove}>
             Delete credentials
