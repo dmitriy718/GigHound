@@ -1,23 +1,31 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { archiveJob, bulkArchiveJobs, getJob, getJobs, unarchiveJob } from '../api/client';
 import type { ClientHistory, Job, JobStatus, Platform } from '../types';
 import { PLATFORMS } from '../types';
-import { useNewAlertMessages, type AlertMessage } from '../hooks/useAlertsSocket';
+import {
+  useNewAlertMessages,
+  useReconnectRefetch,
+  type AlertMessage,
+  type SocketStatus,
+} from '../hooks/useAlertsSocket';
 import { ErrorBanner, ScoreBadge, ScoreBars, formatDate } from '../components/common';
 import OnboardingChecklist from '../components/OnboardingChecklist';
 import type { ViewKey } from '../App';
 
 interface Props {
   messages: AlertMessage[];
+  status: SocketStatus;
   onNavigate: (view: ViewKey) => void;
 }
 
-export default function JobFeed({ messages, onNavigate }: Props) {
+export default function JobFeed({ messages, status: socketStatus, onNavigate }: Props) {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [total, setTotal] = useState(0);
   const [status, setStatus] = useState<JobStatus | ''>('new');
   const [platform, setPlatform] = useState<Platform | ''>('');
   const [minScore, setMinScore] = useState(0);
+  // debounced (~250ms) so dragging the slider fires one query, not one per tick
+  const [debouncedMinScore, setDebouncedMinScore] = useState(0);
   const [selected, setSelected] = useState<Job | null>(null);
   // Phase 3: client outcome history — only on the job detail endpoint, so fetched on drawer open
   const [clientHistory, setClientHistory] = useState<ClientHistory | null>(null);
@@ -26,23 +34,39 @@ export default function JobFeed({ messages, onNavigate }: Props) {
   const [checked, setChecked] = useState<Set<number>>(new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  // stale-response guards: only the newest load/detail request may land
+  const loadSeq = useRef(0);
+  const selectedIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedMinScore(minScore), 250);
+    return () => window.clearTimeout(t);
+  }, [minScore]);
 
   const load = () => {
+    const seq = ++loadSeq.current;
     getJobs({
       status: status || undefined,
       platform: platform || undefined,
-      min_score: minScore > 0 ? minScore : undefined,
+      min_score: debouncedMinScore > 0 ? debouncedMinScore : undefined,
       limit: 50,
     })
       .then((res) => {
+        if (seq !== loadSeq.current) return; // a newer request superseded this one
         setJobs(res.jobs);
         setTotal(res.total);
         setError(null);
       })
-      .catch((e: Error) => setError(e.message));
+      .catch((e: Error) => {
+        if (seq !== loadSeq.current) return;
+        setError(e.message);
+      });
   };
 
-  useEffect(load, [status, platform, minScore]);
+  useEffect(load, [status, platform, debouncedMinScore]);
+
+  // reconnect = events were missed while the socket was down — reload once
+  useReconnectRefetch(socketStatus, load);
 
   // Live updates from the shared alerts socket — every unseen message is processed,
   // so bursts collapsed by React batching are not dropped
@@ -61,14 +85,23 @@ export default function JobFeed({ messages, onNavigate }: Props) {
   });
 
   const openJob = (job: Job) => {
+    selectedIdRef.current = job.id;
     setSelected(job);
     setClientHistory(null);
     getJob(job.id)
-      .then((detail) => setClientHistory(detail.client_history ?? null))
-      .catch(() => setClientHistory(null)); // history is cosmetic — ignore failure
+      .then((detail) => {
+        // discard if the user opened another job (or closed the drawer) meanwhile
+        if (selectedIdRef.current === job.id) {
+          setClientHistory(detail.client_history ?? null);
+        }
+      })
+      .catch(() => {
+        if (selectedIdRef.current === job.id) setClientHistory(null); // history is cosmetic — ignore failure
+      });
   };
 
   const closeDrawer = () => {
+    selectedIdRef.current = null;
     setSelected(null);
     setClientHistory(null);
   };

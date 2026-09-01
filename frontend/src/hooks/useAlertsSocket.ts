@@ -9,7 +9,7 @@ export type AlertMessage =
   | { type: 'proposal_queued'; proposal_id: number; job?: Job; receivedAt: number }
   | { type: 'generation_failed'; proposal_id: number; error?: string; job_id?: number; receivedAt: number }
   | { type: 'client_replied'; proposal_id: number; job_id: number; snippet: string; receivedAt: number }
-  | { type: 'digest'; jobs: Job[]; receivedAt: number }
+  | { type: 'proposal_status_changed'; proposal_id: number; status: string; receivedAt: number }
   | { type: string; receivedAt: number; job?: undefined; jobs?: undefined };
 
 export type SocketStatus = 'connecting' | 'open' | 'closed';
@@ -31,6 +31,8 @@ export function useAlertsSocket({ onMessage, token }: Options = {}) {
   onMessageRef.current = onMessage;
 
   useEffect(() => {
+    // never leak one tenant's alerts into the next session on this browser
+    setMessages([]);
     if (!token) {
       setStatus('closed');
       return;
@@ -70,11 +72,11 @@ export function useAlertsSocket({ onMessage, token }: Options = {}) {
         let data: {
           type?: string;
           job?: Job;
-          jobs?: Job[];
           proposal_id?: number;
           job_id?: number;
           error?: string;
           snippet?: string;
+          status?: string;
         };
         try {
           data = JSON.parse(ev.data as string);
@@ -109,8 +111,13 @@ export function useAlertsSocket({ onMessage, token }: Options = {}) {
                     snippet: data.snippet ?? '',
                     receivedAt: Date.now(),
                   }
-              : data.type === 'digest' && Array.isArray(data.jobs)
-                ? { type: 'digest', jobs: data.jobs, receivedAt: Date.now() }
+              : data.type === 'proposal_status_changed'
+                ? {
+                    type: 'proposal_status_changed',
+                    proposal_id: data.proposal_id ?? 0,
+                    status: data.status ?? '',
+                    receivedAt: Date.now(),
+                  }
                 : { type: data.type, receivedAt: Date.now() };
         setMessages((prev) => [msg, ...prev].slice(0, 50));
         onMessageRef.current?.(msg);
@@ -178,4 +185,22 @@ export function useNewAlertMessages(
     lastSeenRef.current = messages[0];
     for (const msg of fresh) handlerRef.current(msg);
   }, [messages]);
+}
+
+/**
+ * Calls `refetch` when the socket REOPENS after having been open before —
+ * events pushed while the connection was down are lost, so views reload once
+ * per reconnect. The very first open after mount is skipped (the view's own
+ * mount effect already loads).
+ */
+export function useReconnectRefetch(status: SocketStatus, refetch: () => void) {
+  const wasOpenRef = useRef(false);
+  const refetchRef = useRef(refetch);
+  refetchRef.current = refetch;
+
+  useEffect(() => {
+    if (status !== 'open') return;
+    if (wasOpenRef.current) refetchRef.current();
+    wasOpenRef.current = true;
+  }, [status]);
 }

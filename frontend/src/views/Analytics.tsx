@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { getAnalyticsTrend, getFunnelAnalytics } from '../api/client';
 import type { FunnelAnalytics, TrendAnalytics } from '../types';
+import { useReconnectRefetch, type SocketStatus } from '../hooks/useAlertsSocket';
 import { ErrorBanner } from '../components/common';
 
 const FUNNEL_STAGES = [
@@ -15,7 +16,7 @@ const FUNNEL_STAGES = [
 const winRateLabel = (rate: number | null) =>
   rate == null ? 'no outcomes yet' : `${Math.round(rate)}%`;
 
-export default function Analytics() {
+export default function Analytics({ status: socketStatus }: { status: SocketStatus }) {
   const [data, setData] = useState<FunnelAnalytics | null>(null);
   const [trend, setTrend] = useState<TrendAnalytics | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -34,6 +35,9 @@ export default function Analytics() {
   };
 
   useEffect(load, []);
+
+  // reconnect = events were missed while the socket was down — reload once
+  useReconnectRefetch(socketStatus, load);
 
   const maxStage = data
     ? Math.max(1, ...FUNNEL_STAGES.map((s) => data.funnel[s.key]))

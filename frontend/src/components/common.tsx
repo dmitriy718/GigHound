@@ -10,6 +10,7 @@ export function ErrorBanner({ error }: { error: string | null }) {
 interface ErrorBoundaryProps {
   children: ReactNode;
   label?: string; // panel name shown in the fallback
+  reload?: boolean; // app-level boundary: offer a full reload instead of a local retry
 }
 
 interface ErrorBoundaryState {
@@ -30,13 +31,23 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
       return (
         <div className="error-banner">
           {this.props.label ?? 'This panel'} crashed: {error.message}
-          <button
-            className="btn small secondary"
-            style={{ marginLeft: 10 }}
-            onClick={() => this.setState({ error: null })}
-          >
-            Retry
-          </button>
+          {this.props.reload ? (
+            <button
+              className="btn small secondary"
+              style={{ marginLeft: 10 }}
+              onClick={() => window.location.reload()}
+            >
+              Reload
+            </button>
+          ) : (
+            <button
+              className="btn small secondary"
+              style={{ marginLeft: 10 }}
+              onClick={() => this.setState({ error: null })}
+            >
+              Retry
+            </button>
+          )}
         </div>
       );
     }

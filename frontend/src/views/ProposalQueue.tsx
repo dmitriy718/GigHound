@@ -25,11 +25,12 @@ import type {
   User,
 } from '../types';
 import { PROPOSAL_STATUSES, REJECTION_REASONS } from '../types';
-import { useNewAlertMessages, type AlertMessage } from '../hooks/useAlertsSocket';
+import { useNewAlertMessages, useReconnectRefetch, type AlertMessage, type SocketStatus } from '../hooks/useAlertsSocket';
 import { ErrorBanner, ScoreBadge, formatDate, scoreClass } from '../components/common';
 
 interface Props {
   messages: AlertMessage[];
+  status: SocketStatus;
   user?: User | null;
 }
 
@@ -94,7 +95,7 @@ const truncate = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…`
 
 const PAGE_SIZE = 50;
 
-export default function ProposalQueue({ messages, user }: Props) {
+export default function ProposalQueue({ messages, status: socketStatus, user }: Props) {
   const [proposals, setProposals] = useState<ProposalQueueItem[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
@@ -149,6 +150,9 @@ export default function ProposalQueue({ messages, user }: Props) {
 
   useEffect(load, [statusFilter, offset]);
 
+  // reconnect = events were missed while the socket was down — reload once
+  useReconnectRefetch(socketStatus, load);
+
   useEffect(() => {
     getPortfolioItems()
       .then(setPortfolio)
@@ -173,6 +177,10 @@ export default function ProposalQueue({ messages, user }: Props) {
       const snippet = 'snippet' in msg && msg.snippet ? ` — “${truncate(msg.snippet, 80)}”` : '';
       setRepliedIds((prev) => new Set(prev).add(msg.proposal_id));
       showToast(`Client replied on proposal #${msg.proposal_id}${snippet}`);
+      load();
+    } else if (msg.type === 'proposal_status_changed' && 'proposal_id' in msg) {
+      // worker-side submit verdict — flip the row live instead of waiting for a refresh
+      showToast(`Proposal #${msg.proposal_id} → ${msg.status.replace(/_/g, ' ')}`);
       load();
     }
   });
@@ -605,11 +613,11 @@ export default function ProposalQueue({ messages, user }: Props) {
                           </span>
                         )}
                       </div>
-                      {item.analysis.required_skills.length > 0 && (
+                      {(item.analysis.required_skills ?? []).length > 0 && (
                         <>
                           <div className="section-title">Required skills</div>
                           <div className="chips">
-                            {item.analysis.required_skills.map((s) => (
+                            {(item.analysis.required_skills ?? []).map((s) => (
                               <span className="chip" key={s}>
                                 {s}
                               </span>

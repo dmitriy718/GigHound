@@ -10,6 +10,7 @@ import {
 } from './api/client';
 import type { User } from './types';
 import { ChangePasswordModal, DeleteAccountModal } from './components/AccountModals';
+import { ErrorBoundary } from './components/common';
 import Login from './views/Login';
 import JobFeed from './views/JobFeed';
 import ProposalQueue from './views/ProposalQueue';
@@ -255,18 +256,20 @@ export default function App() {
       )}
 
       <main className="content">
-        {view === 'jobs' && <JobFeed messages={socket.messages} onNavigate={setView} />}
-        {view === 'proposals' && <ProposalQueue messages={socket.messages} user={user} />}
-        {view === 'buyerRequests' && <BuyerRequestInbox messages={socket.messages} />}
-        {view === 'gigs' && <GigManager />}
-        {view === 'analytics' && <Analytics />}
-        {view === 'keywords' && <KeywordIntelligence />}
-        {view === 'filters' && <SearchFineTuning />}
-        {view === 'searchProfiles' && <SearchProfiles />}
-        {view === 'scoring' && <ScoringConfig />}
-        {view === 'alerts' && <AlertsPanel messages={socket.messages} status={socket.status} />}
-        {view === 'accounts' && <Accounts />}
-        {view === 'profiles' && <ProfileManager />}
+        <ErrorBoundary label="This view" reload>
+          {view === 'jobs' && <JobFeed messages={socket.messages} status={socket.status} onNavigate={setView} />}
+          {view === 'proposals' && <ProposalQueue messages={socket.messages} status={socket.status} user={user} />}
+          {view === 'buyerRequests' && <BuyerRequestInbox messages={socket.messages} status={socket.status} />}
+          {view === 'gigs' && <GigManager />}
+          {view === 'analytics' && <Analytics status={socket.status} />}
+          {view === 'keywords' && <KeywordIntelligence />}
+          {view === 'filters' && <SearchFineTuning />}
+          {view === 'searchProfiles' && <SearchProfiles />}
+          {view === 'scoring' && <ScoringConfig />}
+          {view === 'alerts' && <AlertsPanel messages={socket.messages} status={socket.status} />}
+          {view === 'accounts' && <Accounts status={socket.status} />}
+          {view === 'profiles' && <ProfileManager />}
+        </ErrorBoundary>
       </main>
     </div>
   );
