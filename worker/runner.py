@@ -91,6 +91,7 @@ def process_task(task, ctx: HandlerContext) -> None:
 
 def poll_once(ctx: HandlerContext) -> int:
     """One sweep over all configured platforms. Returns tasks executed."""
+    ctx.browser.reap_idle_contexts()  # close contexts past the idle TTL
     executed = 0
     for platform in ctx.config.platforms:
         try:

@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+import time
 from pathlib import Path
 from time import sleep as _real_sleep
 from urllib.parse import urlparse
@@ -122,8 +123,13 @@ def raise_if_challenge(page, platform: str):
         raise CaptchaDetectedError(marker, platform)
 
 
-def _parse_proxy(proxy_url: str) -> dict:
+def _parse_proxy(proxy_url: str, platform: str = "") -> dict:
     parsed = urlparse(proxy_url)
+    if not parsed.scheme or not parsed.hostname or parsed.port is None:
+        raise ValueError(
+            f"invalid proxy URL for {platform or 'worker'}: {proxy_url!r} — "
+            "expected scheme://[user:pass@]host:port with an explicit port "
+            "(a missing port must not silently become ':None')")
     proxy = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
     if parsed.username:
         proxy["username"] = parsed.username
@@ -154,11 +160,23 @@ def apply_storage_state(context, state: dict):
                    for e in origin.get("localStorage") or [] if e.get("name")]
         if not entries:
             continue
+        _seed_local_storage(context, origin.get("origin", ""), entries)
+
+
+def _seed_local_storage(context, origin: str, entries: list):
+    """Write enrolled localStorage entries ONCE on the platform origin — the
+    persistent profile (user_data_dir) retains them afterwards. A permanent
+    add_init_script would instead re-apply the enrolled snapshot on every
+    page load, stomping rotated CSRF/session tokens with weeks-old values."""
+    page = context.new_page()
+    try:
+        page.goto(origin)
         items = json.dumps(entries)
-        context.add_init_script(
-            f"if (window.location.origin === {json.dumps(origin.get('origin', ''))}) {{"
-            f" for (const [k, v] of {items}) {{"
-            " try { window.localStorage.setItem(k, v); } catch (e) {} } } }")
+        page.evaluate(
+            f"(() => {{ for (const [k, v] of {items}) {{"
+            " try { window.localStorage.setItem(k, v); } catch (e) {} } } })()")
+    finally:
+        page.close()
 
 
 class BrowserManager:
@@ -177,6 +195,8 @@ class BrowserManager:
         self._pw = None
         self._browser_type = None
         self._contexts: dict[tuple[str, int], object] = {}
+        self._last_used: dict[tuple[str, int], float] = {}
+        self._now = time.monotonic  # indirection so tests can fake time
 
     def __enter__(self):
         from playwright.sync_api import sync_playwright  # lazy: needs browsers
@@ -196,6 +216,7 @@ class BrowserManager:
     def get_context(self, platform: str, user_id: int):
         key = (platform, user_id)
         if key in self._contexts:
+            self._last_used[key] = self._now()
             return self._contexts[key]
         user_data_dir = _mkdir_private(self.session_dir_for(platform, user_id))
         width, height = random.choice(VIEWPORTS)
@@ -208,27 +229,57 @@ class BrowserManager:
             "timezone_id": self.config.timezone,
             "args": ["--disable-blink-features=AutomationControlled"],
         }
-        proxy_url = self.config.proxy_for(platform)
+        # fetch the enrolled session before launch: it may pin a per-account
+        # proxy, which must be known when the context is created
+        session = self._fetch_session(platform, user_id)
+        proxy_url = session.get("proxy_url") or self.config.proxy_for(platform)
         if proxy_url:
-            kwargs["proxy"] = _parse_proxy(proxy_url)
-            log.info("platform %s via proxy %s", platform, proxy_url.split("@")[-1])
+            kwargs["proxy"] = _parse_proxy(proxy_url, platform)
+            log.info("%s/user %s via proxy %s",
+                     platform, user_id, proxy_url.split("@")[-1])
         context = self._browser_type.launch_persistent_context(**kwargs)
-        self._seed_session(context, platform, user_id)
+        self._seed_session(context, platform, user_id, session)
         self._contexts[key] = context
+        self._last_used[key] = self._now()
         return context
 
-    def _seed_session(self, context, platform: str, user_id: int):
-        """Prefer the vault-enrolled storage_state from the backend; fall back
-        to the local persistent profile when absent or unreachable."""
-        if self.client is None:
+    def reap_idle_contexts(self):
+        """Close contexts idle beyond WORKER_CONTEXT_IDLE_SEC (flushing
+        storage_state to disk as close_session does). The next get_context
+        recreates the context fresh — which is also how a re-enrolled
+        session takes effect without a worker restart."""
+        ttl = self.config.context_idle_sec
+        if ttl <= 0:
             return
+        now = self._now()
+        for platform, user_id in list(self._contexts):
+            if now - self._last_used.get((platform, user_id), now) > ttl:
+                log.info("closing idle %s/user %s context (>%ds unused)",
+                         platform, user_id, ttl)
+                self.close_session(platform, user_id)
+
+    def _fetch_session(self, platform: str, user_id: int) -> dict:
+        """Fetch the vault-enrolled stealth session from the backend; {} when
+        there is no client, nothing is enrolled, or the backend is unreachable
+        — never block task execution on seeding."""
+        if self.client is None:
+            return {}
         try:
-            session = self.client.get_stealth_session(platform, user_id)
-        except Exception as exc:  # noqa: BLE001 — never block task execution on seeding
+            return self.client.get_stealth_session(platform, user_id) or {}
+        except Exception as exc:  # noqa: BLE001
             log.warning("could not fetch stealth session for %s/user %s (%s) — "
                         "falling back to the local profile", platform, user_id, exc)
-            return
-        state = (session or {}).get("storage_state")
+            return {}
+
+    def _seed_session(self, context, platform: str, user_id: int,
+                      session: dict | None = None):
+        """Prefer the vault-enrolled storage_state from the backend; fall back
+        to the local persistent profile when absent or unreachable. `session`
+        is the prefetched payload when the caller already fetched it (the
+        per-account proxy is chosen before the context launches)."""
+        if session is None:
+            session = self._fetch_session(platform, user_id)
+        state = session.get("storage_state")
         if not state:
             return
         try:
@@ -247,6 +298,7 @@ class BrowserManager:
 
     def close_session(self, platform: str, user_id: int):
         context = self._contexts.pop((platform, user_id), None)
+        self._last_used.pop((platform, user_id), None)
         if context is None:
             return
         try:

@@ -34,12 +34,24 @@ class FakePage:
         self.keyboard = FakeKeyboard(self)
         self.mouse = FakeMouse(self)
         self.markers = set(markers)
+        self.navigated = []
+        self.evaluated = []
+        self.closed = False
 
     def click(self, selector):
         self.events.append(("click", selector))
 
     def query_selector(self, selector):
         return object() if selector in self.markers else None
+
+    def goto(self, url):
+        self.navigated.append(url)
+
+    def evaluate(self, script):
+        self.evaluated.append(script)
+
+    def close(self):
+        self.closed = True
 
 
 @pytest.fixture(autouse=True)
@@ -101,18 +113,41 @@ def test_parse_proxy_without_credentials():
         "server": "http://proxy.example:8080"}
 
 
+def test_parse_proxy_requires_explicit_port():
+    with pytest.raises(ValueError) as exc:
+        _parse_proxy("http://user:pass@proxy.example", "upwork")
+    assert "upwork" in str(exc.value)  # names the offending platform
+    assert "port" in str(exc.value)
+
+
 # ---------------- API session seeding ----------------
 
 class FakeContext:
     def __init__(self):
         self.cookies = []
         self.init_scripts = []
+        self.pages_made = []
 
     def add_cookies(self, cookies):
         self.cookies.extend(cookies)
 
     def add_init_script(self, script):
         self.init_scripts.append(script)
+
+    def new_page(self):
+        page = FakePage()
+        self.pages_made.append(page)
+        return page
+
+
+class FakeBrowserType:
+    def __init__(self, context=None):
+        self.context = context or FakeContext()
+        self.kwargs = None
+
+    def launch_persistent_context(self, **kwargs):
+        self.kwargs = kwargs
+        return self.context
 
 
 class FakeClient:
@@ -147,9 +182,16 @@ def test_seed_session_applies_enrolled_storage_state():
     ctx = FakeContext()
     apply_storage_state(ctx, state)
     assert ctx.cookies == state["cookies"]
-    assert len(ctx.init_scripts) == 1
-    assert "https://www.fiverr.com" in ctx.init_scripts[0]
-    assert "localStorage.setItem" in ctx.init_scripts[0]
+    # localStorage is written ONCE on the origin (the persistent profile
+    # retains it) — no init script re-applying stale values on every load
+    assert ctx.init_scripts == []
+    assert len(ctx.pages_made) == 1
+    page = ctx.pages_made[0]
+    assert page.navigated == ["https://www.fiverr.com"]
+    assert len(page.evaluated) == 1
+    assert "localStorage.setItem" in page.evaluated[0]
+    assert '["k", "v"]' in page.evaluated[0]
+    assert page.closed
 
     client = FakeClient({"storage_state": state, "credentials_present": True})
     mgr = _manager(client)
@@ -173,6 +215,106 @@ def test_seed_session_falls_back_when_absent_or_unreachable():
 
     # no client at all (e.g. worker.login) → no-op
     _manager(None)._seed_session(FakeContext(), "guru", 1)
+
+
+# ---------------- per-account proxy selection ----------------
+
+def _launch_kwargs(monkeypatch, tmp_path, session, platform="upwork",
+                   platform_proxy=None):
+    """Run get_context with a fake browser type; return its launch kwargs."""
+    from worker.browser import BrowserManager
+    from worker.config import Config
+    if platform_proxy:
+        monkeypatch.setenv(f"WORKER_PROXY_{platform.upper()}", platform_proxy)
+    mgr = BrowserManager(Config(session_dir=tmp_path),
+                         client=FakeClient(session))
+    browser_type = FakeBrowserType()
+    mgr._browser_type = browser_type
+    assert mgr.get_context(platform, 7) is browser_type.context
+    return browser_type.kwargs
+
+
+def test_per_account_proxy_wins_over_platform_default(monkeypatch, tmp_path):
+    kwargs = _launch_kwargs(
+        monkeypatch, tmp_path,
+        {"storage_state": None, "credentials_present": True,
+         "proxy_url": "http://user:pw@tenant-proxy:9000"},
+        platform_proxy="http://platform-proxy:8080")
+    assert kwargs["proxy"] == {"server": "http://tenant-proxy:9000",
+                               "username": "user", "password": "pw"}
+
+
+def test_platform_proxy_fallback_when_account_has_none(monkeypatch, tmp_path):
+    kwargs = _launch_kwargs(
+        monkeypatch, tmp_path,
+        {"storage_state": None, "credentials_present": True, "proxy_url": None},
+        platform_proxy="http://platform-proxy:8080")
+    assert kwargs["proxy"] == {"server": "http://platform-proxy:8080"}
+
+
+def test_no_proxy_configured_launches_direct(monkeypatch, tmp_path):
+    monkeypatch.delenv("WORKER_PROXY_UPWORK", raising=False)
+    kwargs = _launch_kwargs(
+        monkeypatch, tmp_path,
+        {"storage_state": None, "credentials_present": False, "proxy_url": None})
+    assert "proxy" not in kwargs
+
+
+def test_port_less_proxy_fails_fast(monkeypatch, tmp_path):
+    from worker.browser import BrowserManager
+    from worker.config import Config
+    monkeypatch.setenv("WORKER_PROXY_UPWORK", "http://proxy.example")
+    mgr = BrowserManager(Config(session_dir=tmp_path), client=None)
+    mgr._browser_type = FakeBrowserType()
+    with pytest.raises(ValueError, match="upwork"):
+        mgr.get_context("upwork", 7)
+
+
+# ---------------- idle context reaper ----------------
+
+class FakeStorageContext:
+    def __init__(self):
+        self.closed = False
+
+    def storage_state(self, path):
+        Path(path).write_text("{}")
+
+    def close(self):
+        self.closed = True
+
+
+def test_reap_idle_contexts_closes_stale_keeps_fresh(tmp_path):
+    from worker.browser import BrowserManager
+    from worker.config import Config
+    mgr = BrowserManager(Config(session_dir=tmp_path, context_idle_sec=1800),
+                         client=None)
+    now = [10_000.0]
+    mgr._now = lambda: now[0]
+    stale, fresh = FakeStorageContext(), FakeStorageContext()
+    mgr.session_dir_for("upwork", 1).mkdir(parents=True)
+    mgr._contexts[("upwork", 1)] = stale
+    mgr._last_used[("upwork", 1)] = now[0] - 1900  # past the TTL
+    mgr._contexts[("fiverr", 2)] = fresh
+    mgr._last_used[("fiverr", 2)] = now[0] - 60
+
+    mgr.reap_idle_contexts()
+
+    assert stale.closed and ("upwork", 1) not in mgr._contexts
+    assert ("upwork", 1) not in mgr._last_used
+    # closing flushed the storage_state to disk, owner-only
+    assert _mode(tmp_path / "upwork" / "user_1" / "storage_state.json") == 0o600
+    assert not fresh.closed and mgr._contexts[("fiverr", 2)] is fresh
+
+
+def test_reap_disabled_with_nonpositive_ttl(tmp_path):
+    from worker.browser import BrowserManager
+    from worker.config import Config
+    mgr = BrowserManager(Config(session_dir=tmp_path, context_idle_sec=0),
+                         client=None)
+    mgr._contexts[("guru", 1)] = FakeStorageContext()
+    mgr._last_used[("guru", 1)] = 0.0  # ancient — would always be stale
+    mgr.reap_idle_contexts()
+    assert ("guru", 1) in mgr._contexts
 
 
 # ---------------- session-dir / artifact permissions ----------------

@@ -259,7 +259,9 @@ def get_stealth_session(platform: str, user_id: int, db: Session = Depends(get_d
     enrolled via the Accounts UI) instead of the CLI login flow. Tenancy
     comes from the explicit user_id — the worker pool serves all tenants,
     same as stealth-task polling. Secret values other than the storage_state
-    itself are never returned.
+    itself are never returned. Also carries the account's `proxy_url`
+    setting (None when unset) so each tenant's traffic can be isolated to
+    its own exit IP instead of sharing one platform-level proxy.
 
     The read is scoped to an active claim: the worker only fetches a session
     while executing a claimed task for this (platform, user_id), so without
@@ -295,10 +297,12 @@ def get_stealth_session(platform: str, user_id: int, db: Session = Depends(get_d
         if disabled:
             raise HTTPException(
                 409, f"platform '{platform}' is disabled — enable it on the Accounts page")
-        return {"storage_state": None, "credentials_present": False}
+        return {"storage_state": None, "credentials_present": False, "proxy_url": None}
+    proxy_url = (account.settings or {}).get("proxy_url")
     creds = CredentialVault(db, user_id).load(platform, account.principal)
     if not creds:
-        return {"storage_state": None, "credentials_present": False}
+        return {"storage_state": None, "credentials_present": False,
+                "proxy_url": proxy_url}
     storage_state = None
     raw_state = creds.get("storage_state_json")
     if raw_state:
@@ -307,7 +311,8 @@ def get_stealth_session(platform: str, user_id: int, db: Session = Depends(get_d
         except (ValueError, TypeError):
             log.warning("stealth-session %s/%s: stored storage_state_json is invalid",
                         platform, user_id)
-    return {"storage_state": storage_state, "credentials_present": True}
+    return {"storage_state": storage_state, "credentials_present": True,
+            "proxy_url": proxy_url}
 
 
 def _task_out(t: StealthTask) -> dict:

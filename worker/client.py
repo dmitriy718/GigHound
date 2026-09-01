@@ -84,9 +84,10 @@ class WorkerClient:
     def get_stealth_session(self, platform: str, user_id: int) -> dict:
         """Fetch the vault-enrolled browser session for (platform, user_id).
 
-        Returns {"storage_state": dict|None, "credentials_present": bool} —
-        the storage_state (when enrolled via the Accounts UI) lets the worker
-        seed its browser context without the CLI login flow.
+        Returns {"storage_state": dict|None, "credentials_present": bool,
+        "proxy_url": str|None} — the storage_state (when enrolled via the
+        Accounts UI) lets the worker seed its browser context without the
+        CLI login flow; proxy_url pins a per-account exit IP when set.
         """
         resp = self._request("GET", "/api/gigs/stealth-session",
                              params={"platform": platform, "user_id": user_id})

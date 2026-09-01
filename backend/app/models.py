@@ -245,7 +245,8 @@ class PlatformAccount(Base):
     mode: Mapped[str] = mapped_column(String(20), default="api")  # api|stealth|hybrid|disabled
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     credential_ref: Mapped[str] = mapped_column(String(200), default="")
-    # Platform-specific knobs: bidder_id (freelancer user id), on_behalf_of (upwork agency member)
+    # Platform-specific knobs: bidder_id (freelancer user id), on_behalf_of (upwork
+    # agency member), proxy_url (per-account worker proxy)
     settings: Mapped[dict] = mapped_column(JSONType, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

@@ -37,3 +37,10 @@ def test_proxy_per_platform(monkeypatch):
     cfg = Config(worker_token="t")
     assert cfg.proxy_for("upwork") == "http://u:p@host:8080"
     assert cfg.proxy_for("fiverr") is None
+
+
+def test_context_idle_sec_from_env(monkeypatch):
+    monkeypatch.delenv("WORKER_CONTEXT_IDLE_SEC", raising=False)
+    assert Config(worker_token="t").context_idle_sec == 1800
+    monkeypatch.setenv("WORKER_CONTEXT_IDLE_SEC", "300")
+    assert Config(worker_token="t").context_idle_sec == 300
