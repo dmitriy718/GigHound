@@ -122,6 +122,27 @@ def test_upwork_outcome_tick_enqueues_scrape_task(db, user, monkeypatch):
     assert upwork_outcome_user_core(user.id)["enqueued"] == 0
 
 
+def test_upwork_outcome_tick_circuit_open_not_counted(db, user, monkeypatch):
+    """A scrape task skipped by the circuit breaker is recorded for UI
+    visibility but must not count as enqueued work (it will never run)."""
+    from app.tasks import upwork_outcome_user_core
+    monkeypatch.setattr("app.tasks.SessionLocal", sessionmaker(bind=db.bind))
+
+    db.add(PlatformAccount(user_id=user.id, platform="upwork", label="uw",
+                           enabled=True))
+    db.commit()
+    job = _job(db, user.id)
+    _item(db, user.id, job, status="submitted")
+
+    circuit_breaker.open_circuit("upwork", "manual halt")
+    result = upwork_outcome_user_core(user.id)
+    assert result["enqueued"] == 0 and result["task_ids"] == []
+    task = db.query(StealthTask).filter(
+        StealthTask.task_type == "scrape_proposal_status").one()
+    assert task.status == "skipped_circuit_open"
+    assert "manual halt" in task.result["reason"]
+
+
 def test_upwork_outcome_tick_skips_without_account_or_items(db, user, monkeypatch):
     from app.tasks import upwork_outcome_user_core
     monkeypatch.setattr("app.tasks.SessionLocal", sessionmaker(bind=db.bind))

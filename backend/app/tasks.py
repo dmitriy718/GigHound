@@ -78,6 +78,11 @@ celery_app.conf.beat_schedule = {
         "task": "app.tasks.retention_tick",
         "schedule": crontab(hour=4, minute=11),  # daily 04:11 UTC
     },
+    "stealth-reaper": {
+        # reset tasks stuck in `claimed` when a worker dies mid-task
+        "task": "app.tasks.stealth_reaper_tick",
+        "schedule": crontab(minute="4,9,14,19,24,29,34,39,44,49,54,59"),
+    },
 }
 celery_app.conf.timezone = "UTC"
 
@@ -87,6 +92,8 @@ AUTO_ARCHIVE_STALE = timedelta(days=14)
 RETENTION_ARCHIVED_JOB_AGE = timedelta(days=90)
 RETENTION_STEALTH_TASK_AGE = timedelta(days=30)
 RETENTION_AUDIT_AGE = timedelta(days=365)
+STEALTH_CLAIM_TIMEOUT = timedelta(minutes=15)
+STEALTH_MAX_RECLAIMS = 3
 
 
 @celery_app.task(name="app.tasks.fiverr_buyer_request_tick")
@@ -440,8 +447,8 @@ def retention_tick_core() -> dict:
     - archived jobs fetched >90 days ago — except any still referenced by the
       proposal queue (archived jobs normally have none; referenced ones are
       skipped and counted);
-    - done/failed stealth tasks completed (or, lacking a completion stamp,
-      created) >30 days ago;
+    - done/failed/skipped_circuit_open stealth tasks completed (or, lacking a
+      completion stamp, created) >30 days ago;
     - audit_log rows older than 365 days.
     Returns and logs per-category counts.
     """
@@ -472,7 +479,8 @@ def retention_tick_core() -> dict:
             totals["stealth_tasks_deleted"] += (
                 db.query(StealthTask)
                 .filter(StealthTask.user_id == user_id,
-                        StealthTask.status.in_(["done", "failed"]),
+                        StealthTask.status.in_(["done", "failed",
+                                                "skipped_circuit_open"]),
                         func.coalesce(StealthTask.completed_at,
                                       StealthTask.created_at) < tasks_cutoff)
                 .delete(synchronize_session=False))
@@ -531,5 +539,51 @@ def follow_up_due_user_core(user_id: int) -> dict:
             log.exception("follow-up due failed for user %d (%s)", user_id, exc)
             db.rollback()
             return {"queued": [], "skipped": 0, "error": str(exc)}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.tasks.stealth_reaper_tick")
+def stealth_reaper_tick() -> dict:
+    """Reset stealth tasks stuck in `claimed` (see stealth_reaper_tick_core)."""
+    return stealth_reaper_tick_core()
+
+
+def stealth_reaper_tick_core() -> dict:
+    """Reap zombie claims: a worker that crashes mid-task leaves the row
+    `claimed` forever — its review-queue item would stay queued_for_browser
+    and (for scrape tasks) block outcome sync for that tenant+platform.
+
+    claimed longer than STEALTH_CLAIM_TIMEOUT → back to `pending` (claim
+    fields cleared, reclaim_count incremented); once reclaim_count reaches
+    STEALTH_MAX_RECLAIMS the task is failed for good.
+    """
+    from .models import StealthTask
+
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now(timezone.utc) - STEALTH_CLAIM_TIMEOUT
+        zombies = (db.query(StealthTask)
+                   .filter(StealthTask.status == "claimed",
+                           StealthTask.claimed_at < cutoff)
+                   .all())
+        reclaimed, failed = [], []
+        for task in zombies:
+            if task.reclaim_count < STEALTH_MAX_RECLAIMS:
+                task.status = "pending"
+                task.claimed_by = None
+                task.claimed_at = None
+                task.reclaim_count += 1
+                reclaimed.append(task.id)
+                log.warning("stealth task %d reclaimed (dead worker; reclaim %d/%d)",
+                            task.id, task.reclaim_count, STEALTH_MAX_RECLAIMS)
+            else:
+                task.status = "failed"
+                task.result = {"error": "reclaim limit reached (worker died 3 times)"}
+                failed.append(task.id)
+                log.warning("stealth task %d failed: reclaim limit reached "
+                            "(worker died %d times)", task.id, STEALTH_MAX_RECLAIMS)
+        db.commit()
+        return {"reclaimed": reclaimed, "failed": failed}
     finally:
         db.close()

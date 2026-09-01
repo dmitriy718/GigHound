@@ -1,8 +1,8 @@
 """Retention beat (retention_tick_core): hard-deletes archived jobs older
-than 90 days (unless still referenced by the proposal queue), done/failed
-stealth tasks older than 30 days, and audit_log rows older than 365 days —
-all tenant-scoped. Boundaries use ±1 day around each cutoff so the tests are
-not racy against the tick's internal clock.
+than 90 days (unless still referenced by the proposal queue), done/failed/
+skipped_circuit_open stealth tasks older than 30 days, and audit_log rows
+older than 365 days — all tenant-scoped. Boundaries use ±1 day around each
+cutoff so the tests are not racy against the tick's internal clock.
 """
 from datetime import datetime, timedelta, timezone
 
@@ -55,7 +55,8 @@ def test_retention_boundaries(Session, monkeypatch):
     db.commit()
 
     # stealth tasks: done 31d ago → deleted; done 29d ago → kept;
-    # failed 40d ago (completed_at set) → deleted; pending 40d ago → kept
+    # failed 40d ago (completed_at set) → deleted; pending 40d ago → kept;
+    # skipped_circuit_open 40d ago → deleted; skipped 29d ago → kept
     now = datetime.now(timezone.utc)
     t1 = StealthTask(user_id=user.id, platform="fiverr", task_type="scrape_gig_metrics",
                      status="done", created_at=now - timedelta(days=35),
@@ -68,7 +69,11 @@ def test_retention_boundaries(Session, monkeypatch):
                      completed_at=now - timedelta(days=40))
     t4 = StealthTask(user_id=user.id, platform="fiverr", task_type="scrape_gig_metrics",
                      status="pending", created_at=now - timedelta(days=40))
-    db.add_all([t1, t2, t3, t4])
+    t5 = StealthTask(user_id=user.id, platform="upwork", task_type="submit_upwork_proposal",
+                     status="skipped_circuit_open", created_at=now - timedelta(days=40))
+    t6 = StealthTask(user_id=user.id, platform="upwork", task_type="submit_upwork_proposal",
+                     status="skipped_circuit_open", created_at=now - timedelta(days=29))
+    db.add_all([t1, t2, t3, t4, t5, t6])
     db.commit()
 
     # audit log: 366d → deleted; 364d → kept
@@ -81,12 +86,12 @@ def test_retention_boundaries(Session, monkeypatch):
 
     totals = retention_tick_core()
     assert totals == {"jobs_deleted": 1, "jobs_skipped_referenced": 1,
-                      "stealth_tasks_deleted": 2, "audit_log_deleted": 1}
+                      "stealth_tasks_deleted": 3, "audit_log_deleted": 1}
 
     remaining = {j.external_id for j in db.query(Job).all()}
     assert remaining == {"fresh-archived", "old-new", "referenced"}
     remaining_tasks = {t.id for t in db.query(StealthTask).all()}
-    assert remaining_tasks == {t2.id, t4.id}
+    assert remaining_tasks == {t2.id, t4.id, t6.id}
     remaining_audit = {a.id for a in db.query(AuditLog).all()}
     assert remaining_audit == {a2.id}
     db.close()

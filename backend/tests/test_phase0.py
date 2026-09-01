@@ -297,10 +297,58 @@ def test_upwork_proposals_requires_approved_queue_item(client, monkeypatch):
     logs = _audit_rows(Session, "proposal_queued")
     assert len(logs) == 1 and logs[0].detail["proposal_queue_item_id"] == item_id
 
+    # the item waits for the browser worker (same contract as /submit)
+    db = Session()
+    try:
+        assert db.get(ProposalQueueItem, item_id).status == "queued_for_browser"
+    finally:
+        db.close()
+
     # a pending item cannot be queued
     pending = _make_item(Session, uid)
     assert c.post("/api/adapters/upwork/proposals", headers=_auth(token),
                   json={"proposal_queue_item_id": pending}).status_code == 409
+
+
+def test_upwork_submit_paths_409_when_circuit_open(client, monkeypatch):
+    from app import circuit_breaker
+
+    c, Session = client
+    _FakeUpworkAdapter.calls = []
+    monkeypatch.setattr("app.routers.adapters.UpworkAgencyAdapter", _FakeUpworkAdapter)
+    monkeypatch.setattr("app.adapters.upwork_agency.UpworkAgencyAdapter", _FakeUpworkAdapter)
+    token = _register(c)
+    uid = _user_id(Session)
+    adapter_item = _make_item(Session, uid, status="approved", reviewed_by="operator",
+                              submission_result={"on_behalf_of": "jane"})
+    submit_item = _make_item(Session, uid, status="approved", reviewed_by="operator",
+                             submission_result={"on_behalf_of": "jane"})
+
+    circuit_breaker.open_circuit("upwork", "manual halt")
+    try:
+        # adapters path: 409, item stays approved, no audit row
+        r = c.post("/api/adapters/upwork/proposals", headers=_auth(token),
+                   json={"proposal_queue_item_id": adapter_item})
+        assert r.status_code == 409
+        assert "circuit OPEN for upwork" in r.json()["detail"]
+
+        # proposals /submit path: same guard
+        r = c.post(f"/api/proposals/{submit_item}/submit", headers=_auth(token))
+        assert r.status_code == 409
+        assert "circuit OPEN for upwork" in r.json()["detail"]
+    finally:
+        circuit_breaker.close_circuit("upwork", "test cleanup")
+
+    db = Session()
+    try:
+        assert db.get(ProposalQueueItem, adapter_item).status == "approved"
+        assert db.get(ProposalQueueItem, submit_item).status == "approved"
+        from app.models import StealthTask
+        skipped = db.query(StealthTask).filter(
+            StealthTask.status == "skipped_circuit_open").all()
+        assert len(skipped) == 2  # recorded for UI visibility, but never queued
+    finally:
+        db.close()
 
 
 # ---------------- submit: audit row + upwork adapter close ----------------
