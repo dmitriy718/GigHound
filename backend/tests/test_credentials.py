@@ -432,14 +432,14 @@ def test_stealth_session_null_when_absent(client):
               headers=WORKER_HEADERS)
     assert r.status_code == 200
     assert r.json() == {"storage_state": None, "credentials_present": False,
-                        "proxy_url": None}
+                        "proxy_url": None, "timezone": None, "locale": None}
 
     # account exists but nothing enrolled
     _account(db, u.id, platform="fiverr")
     r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
               headers=WORKER_HEADERS)
     assert r.json() == {"storage_state": None, "credentials_present": False,
-                        "proxy_url": None}
+                        "proxy_url": None, "timezone": None, "locale": None}
 
     # username/password enrollment: present, but no storage_state to seed from
     acct = db.query(PlatformAccount).filter_by(user_id=u.id, platform="fiverr").one()
@@ -450,7 +450,7 @@ def test_stealth_session_null_when_absent(client):
     r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
               headers=WORKER_HEADERS)
     assert r.json() == {"storage_state": None, "credentials_present": True,
-                        "proxy_url": None}
+                        "proxy_url": None, "timezone": None, "locale": None}
 
 
 def test_stealth_session_includes_account_proxy_url(client):
@@ -472,6 +472,30 @@ def test_stealth_session_includes_account_proxy_url(client):
     body = r.json()
     assert body["proxy_url"] == "http://user:pw@tenant-proxy:9000"
     assert body["storage_state"] == STORAGE_STATE
+
+
+def test_stealth_session_includes_timezone_locale(client):
+    """Per-account fingerprint geo rides along so the worker can align the
+    browser fingerprint with the account/proxy geo (None when unset)."""
+    c, Session = client
+    db = Session()
+    u = _user(db, "geo@example.com")
+    acct = _account(db, u.id, platform="fiverr")
+    r = c.post(f"/api/accounts/{acct.id}/credentials",
+               json={"secrets": {"storage_state_json": json.dumps(STORAGE_STATE)}},
+               headers=_headers(u))
+    assert r.status_code == 204
+    acct.settings = {"timezone": "Europe/Berlin", "locale": "de-DE"}
+    db.commit()
+
+    _claimed_task(db, u.id)
+    r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
+              headers=WORKER_HEADERS)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["timezone"] == "Europe/Berlin"
+    assert body["locale"] == "de-DE"
+    assert body["proxy_url"] is None  # unset settings key → None, not absent
 
 
 def test_stealth_session_requires_worker_token(client):

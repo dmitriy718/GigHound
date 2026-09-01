@@ -1,6 +1,7 @@
 """Shared handler scaffolding: context, page fetch, extraction helpers."""
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass
 
@@ -32,11 +33,46 @@ def fetch_page(ctx: HandlerContext, platform: str, user_id: int, url: str):
     SessionExpiredError when the session is logged out — so "no data" is
     never mistaken for a dead session."""
     page = ctx.browser.new_page(platform, user_id)
+    _warm_entry(page, platform, url)
     page.goto(url, wait_until="domcontentloaded")
     human_delay(1.0, 2.5)
     raise_if_challenge(page, platform)
     _raise_if_session_expired(page, platform)
+    _simulate_reading(page)
     return page
+
+
+def _warm_entry(page, platform: str, url: str):
+    """Vary the entry path: a cold direct goto on every visit is anomalous,
+    so drop in on the platform's base URL first (as a returning user would)
+    before heading to the target. Best-effort — never fatal."""
+    base = platform_config(platform).get("base_url")
+    if not base or url == base or not url.startswith(base):
+        return
+    try:
+        page.goto(base, wait_until="domcontentloaded")
+        human_delay(0.6, 1.6)
+    except Exception as exc:  # noqa: BLE001 — warm-up is nice-to-have
+        log.debug("warm-up navigation to %s failed: %s", base, exc)
+
+
+def _simulate_reading(page):
+    """Light pre-extraction behavior: a few smooth-ish scrolls and a short
+    read pause scaled to content length — humans scroll and skim before they
+    would ever 'extract' anything. Best-effort, never fatal."""
+    try:
+        for _ in range(random.randint(1, 3)):
+            page.mouse.wheel(0, random.randint(300, 900))
+            human_delay(0.2, 0.6)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("pre-extraction scroll failed: %s", exc)
+    try:
+        length = page.evaluate(
+            "() => document.body ? document.body.innerText.length : 0") or 0
+    except Exception as exc:  # noqa: BLE001
+        log.debug("content-length probe failed: %s", exc)
+        length = 0
+    human_delay(0.5, max(0.6, min(2.5, 0.5 + length / 4000)))
 
 
 def _raise_if_session_expired(page, platform: str):

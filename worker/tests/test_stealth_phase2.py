@@ -260,3 +260,58 @@ def test_scrape_posts_extracted_metrics(monkeypatch):
     result = handle_scrape_gig_metrics(task, _ctx(_FakeBrowser(), client))
     assert client.metrics == [(11, 1240, 37, 0, 0.0)]
     assert result["scraped"][0]["gig_id"] == 11
+
+
+# ---------------- scrape-flow humanization ----------------
+
+class _InstrumentedPage(_FakePage):
+    """Records goto/wheel/query_selector order so tests can assert that
+    warm-up navigation and scrolling happen before extraction."""
+
+    def __init__(self, markers=None, content_len=3000):
+        super().__init__(markers=markers)
+        self.order = []
+        self._content_len = content_len
+        self.mouse = SimpleNamespace(
+            move=lambda *a, **k: None,
+            wheel=lambda dx, dy: self.order.append(("wheel", dy)))
+
+    def goto(self, url, wait_until=None):
+        self.order.append(("goto", url))
+        super().goto(url, wait_until)
+
+    def query_selector(self, selector):
+        self.order.append(("query", selector))
+        return super().query_selector(selector)
+
+    def evaluate(self, script):
+        return self._content_len
+
+
+def test_scrape_warmup_scrolls_before_extraction():
+    fields = platform_config("fiverr")["metrics_fields"]
+    marker = platform_config("fiverr")["logged_in_marker"]
+
+    class _El:
+        def __init__(self, text):
+            self._text = text
+
+        def inner_text(self):
+            return self._text
+
+    page = _InstrumentedPage(markers={marker: object(),
+                                      fields["impressions"]: _El("1,240")})
+    ctx = _ctx(_FakeBrowser(page))
+    target = "https://www.fiverr.com/seller_dashboard/gigs"
+    task = _FakeTask({"gigs": [{"id": 11, "url": target}]}, platform="fiverr")
+    result = handle_scrape_gig_metrics(task, ctx)  # real fetch_page path
+    assert result["scraped"][0]["gig_id"] == 11
+
+    # warm entry: the platform base URL is visited before the target
+    gotos = [v for kind, v in page.order if kind == "goto"]
+    assert gotos == ["https://www.fiverr.com", target]
+    # 1-3 scrolls, all before the metrics selectors are read
+    wheels = [i for i, e in enumerate(page.order) if e[0] == "wheel"]
+    assert 1 <= len(wheels) <= 3
+    first_extract = page.order.index(("query", fields["impressions"]))
+    assert all(w < first_extract for w in wheels)

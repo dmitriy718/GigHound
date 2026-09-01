@@ -85,9 +85,11 @@ class WorkerClient:
         """Fetch the vault-enrolled browser session for (platform, user_id).
 
         Returns {"storage_state": dict|None, "credentials_present": bool,
-        "proxy_url": str|None} — the storage_state (when enrolled via the
-        Accounts UI) lets the worker seed its browser context without the
-        CLI login flow; proxy_url pins a per-account exit IP when set.
+        "proxy_url": str|None, "timezone": str|None, "locale": str|None} —
+        the storage_state (when enrolled via the Accounts UI) lets the worker
+        seed its browser context without the CLI login flow; proxy_url pins a
+        per-account exit IP when set; timezone/locale (when set) align the
+        fingerprint geo with the account/proxy geo.
         """
         resp = self._request("GET", "/api/gigs/stealth-session",
                              params={"platform": platform, "user_id": user_id})

@@ -44,8 +44,10 @@ class FakeBrowser:
 
 def make_ctx(client):
     from worker.config import Config
-    return HandlerContext(config=Config(worker_token="t"), client=client,
-                          browser=FakeBrowser())
+    # active_hours="" disables the circadian gate so these tests are
+    # deterministic regardless of the wall clock
+    return HandlerContext(config=Config(worker_token="t", active_hours=""),
+                          client=client, browser=FakeBrowser())
 
 
 def ok_handler(task, ctx):
@@ -202,3 +204,65 @@ def test_poll_once_survives_bad_task(monkeypatch):
     ctx.config.platforms = ("fiverr",)
     assert runner.poll_once(ctx) == 2  # second task still processed
     assert processed == [8, 9]
+
+
+# ---------------- circadian active-hours gate ----------------
+
+def test_circadian_gate_window_boundaries():
+    from worker.config import Config
+    cfg = Config(worker_token="t", active_hours="8-23")
+    assert runner._may_run_now("scrape_gig_metrics", cfg, hour=10) is True
+    assert runner._may_run_now("scrape_gig_metrics", cfg, hour=3) is False
+    assert runner._may_run_now("scrape_gig_metrics", cfg, hour=8) is True   # inclusive
+    assert runner._may_run_now("scrape_gig_metrics", cfg, hour=23) is False  # exclusive
+    # legacy alias resolves to a scrape kind and is gated too
+    assert runner._may_run_now("gig_scrape_metrics", cfg, hour=3) is False
+
+
+def test_circadian_gate_always_allows_submits():
+    from worker.config import Config
+    cfg = Config(worker_token="t", active_hours="8-23")
+    for kind in ("submit_upwork_proposal", "submit_fiverr_offer", "submit_proposal"):
+        assert runner._may_run_now(kind, cfg, hour=3) is True
+    # disabled window → everything runs
+    cfg_off = Config(worker_token="t", active_hours="")
+    assert runner._may_run_now("scrape_gig_metrics", cfg_off, hour=3) is True
+
+
+def test_active_hours_window_parsing():
+    from worker.config import Config
+    assert Config(worker_token="t", active_hours="8-23").active_hours_window() == (8, 23)
+    assert Config(worker_token="t", active_hours="").active_hours_window() is None
+    assert Config(worker_token="t", active_hours="off").active_hours_window() is None
+    with pytest.raises(RuntimeError, match="WORKER_ACTIVE_HOURS"):
+        Config(worker_token="t", active_hours="soonish").active_hours_window()
+    with pytest.raises(RuntimeError, match="WORKER_ACTIVE_HOURS"):
+        Config(worker_token="t", active_hours="23-8").active_hours_window()
+
+
+def test_poll_once_skips_scrapes_outside_window_runs_submits(monkeypatch):
+    from worker.config import Config
+    client = FakeClient()
+    client.poll_tasks = lambda platform: [
+        StealthTaskOut(id=1, user_id=1, platform=platform,
+                       task_type="scrape_gig_metrics"),
+        StealthTaskOut(id=2, user_id=1, platform=platform,
+                       task_type="submit_upwork_proposal"),
+    ]
+    processed = []
+    monkeypatch.setattr(runner, "process_task",
+                        lambda t, c: processed.append((t.id, t.task_type)))
+    # pin the clock to 3am — outside the default 8-23 window
+    class _FakeDatetime:
+        @staticmethod
+        def now(tz=None):
+            from datetime import datetime
+            return datetime(2026, 9, 1, 3, 0, tzinfo=tz)
+
+    monkeypatch.setattr(runner, "datetime", _FakeDatetime)
+    ctx = HandlerContext(config=Config(worker_token="t", active_hours="8-23"),
+                         client=client, browser=FakeBrowser())
+    ctx.config.platforms = ("fiverr",)
+    assert runner.poll_once(ctx) == 1
+    assert processed == [(2, "submit_upwork_proposal")]
+    assert ("claim", 1) not in client.calls  # scrape never claimed, stays queued

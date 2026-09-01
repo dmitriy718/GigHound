@@ -48,7 +48,8 @@ use playwright ≥ 1.49 — 1.45 pins a greenlet that doesn't build there.
 | `WORKER_HEADLESS` | `true` | set `false` to watch the browser |
 | `WORKER_SESSION_DIR` | `worker/.sessions` | persistent browser profiles (gitignored) |
 | `WORKER_POLL_INTERVAL_SEC` / `WORKER_POLL_JITTER_SEC` | `45` / `15` | poll pacing (≈30–60s) |
-| `WORKER_TIMEZONE` / `WORKER_LOCALE` | `America/New_York` / `en-US` | browser fingerprint |
+| `WORKER_TIMEZONE` / `WORKER_LOCALE` | `America/New_York` / `en-US` | browser fingerprint defaults (per-account `timezone`/`locale` account settings override) |
+| `WORKER_ACTIVE_HOURS` | `8-23` | circadian window (hours in `WORKER_TIMEZONE`); scrape/fetch tasks stay queued outside it, submit tasks always run. Empty/`off` disables |
 | `WORKER_ALLOW_SUBMIT` | unset (off) | final-submit gate — see safety model |
 
 Run: `worker/.venv/bin/python -m worker` (or `--once` for a single sweep).

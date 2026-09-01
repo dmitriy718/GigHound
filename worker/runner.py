@@ -12,16 +12,40 @@ import argparse
 import logging
 import random
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from .browser import BrowserManager, CaptchaDetectedError, SessionExpiredError
 from .client import BackendError, ClaimConflictError, WorkerClient
 from .config import load_config
-from .handlers import get_handler
+from .handlers import get_handler, LEGACY_ALIASES
 from .handlers.base import HandlerContext, SelectorSuspectError
 
 log = logging.getLogger(__name__)
+
+# human-approved submissions run regardless of the circadian window: a human
+# just clicked approve — delaying that is a product bug, not stealth.
+SUBMIT_KINDS = frozenset({"submit_upwork_proposal", "submit_fiverr_offer",
+                          "submit_proposal"})
+
+
+def _may_run_now(task_type: str, config, hour: int | None = None) -> bool:
+    """Circadian gate: outside WORKER_ACTIVE_HOURS (hours in config.timezone)
+    scrape/fetch tasks stay queued — accounts active at 3:47am local every
+    night are anomalous. Submit kinds always run (see SUBMIT_KINDS).
+    Per-tenant timezone alignment is future work."""
+    kind = LEGACY_ALIASES.get(task_type, task_type)
+    if kind in SUBMIT_KINDS:
+        return True
+    window = config.active_hours_window()
+    if window is None:
+        return True
+    lo, hi = window
+    if hour is None:
+        hour = datetime.now(ZoneInfo(config.timezone)).hour
+    return lo <= hour < hi
 
 
 def process_task(task, ctx: HandlerContext) -> None:
@@ -100,6 +124,10 @@ def poll_once(ctx: HandlerContext) -> int:
             log.error("poll failed for %s: %s", platform, exc)
             continue
         for task in tasks:
+            if not _may_run_now(task.task_type, ctx.config):
+                log.info("task %d (%s) outside active hours — leaving it queued",
+                         task.id, task.task_type)
+                continue
             try:
                 process_task(task, ctx)
             except Exception:  # noqa: BLE001 — one bad task must not kill the sweep

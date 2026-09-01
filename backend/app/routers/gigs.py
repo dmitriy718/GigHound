@@ -261,7 +261,9 @@ def get_stealth_session(platform: str, user_id: int, db: Session = Depends(get_d
     same as stealth-task polling. Secret values other than the storage_state
     itself are never returned. Also carries the account's `proxy_url`
     setting (None when unset) so each tenant's traffic can be isolated to
-    its own exit IP instead of sharing one platform-level proxy.
+    its own exit IP instead of sharing one platform-level proxy, plus
+    optional `timezone`/`locale` settings so the worker can align the
+    browser fingerprint's geo with the account/proxy geo.
 
     The read is scoped to an active claim: the worker only fetches a session
     while executing a claimed task for this (platform, user_id), so without
@@ -297,12 +299,15 @@ def get_stealth_session(platform: str, user_id: int, db: Session = Depends(get_d
         if disabled:
             raise HTTPException(
                 409, f"platform '{platform}' is disabled — enable it on the Accounts page")
-        return {"storage_state": None, "credentials_present": False, "proxy_url": None}
-    proxy_url = (account.settings or {}).get("proxy_url")
+        return {"storage_state": None, "credentials_present": False, "proxy_url": None,
+                "timezone": None, "locale": None}
+    settings = account.settings or {}
+    geo = {"proxy_url": settings.get("proxy_url"),
+           "timezone": settings.get("timezone"),
+           "locale": settings.get("locale")}
     creds = CredentialVault(db, user_id).load(platform, account.principal)
     if not creds:
-        return {"storage_state": None, "credentials_present": False,
-                "proxy_url": proxy_url}
+        return {"storage_state": None, "credentials_present": False, **geo}
     storage_state = None
     raw_state = creds.get("storage_state_json")
     if raw_state:
@@ -311,8 +316,7 @@ def get_stealth_session(platform: str, user_id: int, db: Session = Depends(get_d
         except (ValueError, TypeError):
             log.warning("stealth-session %s/%s: stored storage_state_json is invalid",
                         platform, user_id)
-    return {"storage_state": storage_state, "credentials_present": True,
-            "proxy_url": proxy_url}
+    return {"storage_state": storage_state, "credentials_present": True, **geo}
 
 
 def _task_out(t: StealthTask) -> dict:

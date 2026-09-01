@@ -26,19 +26,132 @@ from .platforms import challenge_markers
 
 log = logging.getLogger(__name__)
 
-# small curated rotation of current-ish desktop Chrome user agents
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+VIEWPORTS = [(1366, 768), (1440, 900), (1536, 864), (1920, 1080)]
+
+# fallback Chromium build when the playwright package's own metadata can't be
+# read — pinned to the playwright 1.62 bundled browser
+_FALLBACK_CHROMIUM_VERSION = "151.0.7922.34"
+
+# coherent desktop OS profiles: UA platform token, Sec-CH-UA platform, and a
+# WebGL vendor/renderer that plausibly belongs to that OS (a GPU-less
+# container reports SwiftShader — a loud datacenter tell)
+_OS_PROFILES = [
+    {"ua_os": "Windows NT 10.0; Win64; x64", "ch_ua_platform": "Windows",
+     "webgl_vendor": "Google Inc. (Intel)",
+     "webgl_renderer": ("ANGLE (Intel, Intel(R) UHD Graphics 630 "
+                        "Direct3D11 vs_5_0 ps_5_0, D3D11)")},
+    {"ua_os": "Macintosh; Intel Mac OS X 10_15_7", "ch_ua_platform": "macOS",
+     "webgl_vendor": "Google Inc. (Intel)",
+     "webgl_renderer": ("ANGLE (Intel Inc., Intel(R) UHD Graphics 630, "
+                        "OpenGL 4.5)")},
+    {"ua_os": "X11; Linux x86_64", "ch_ua_platform": "Linux",
+     "webgl_vendor": "Google Inc. (Intel)",
+     "webgl_renderer": ("ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 "
+                        "(CFL GT2), OpenGL 4.5)")},
 ]
 
-VIEWPORTS = [(1366, 768), (1440, 900), (1536, 864), (1920, 1080)]
+
+def _detect_chromium_version() -> str:
+    """Full version of the Chromium playwright actually bundles (from the
+    package's browsers.json), so the UA string and Sec-CH-UA never contradict
+    the real engine build."""
+    try:
+        import playwright  # lazy, like sync_playwright — needs the package
+        browsers = json.loads((Path(playwright.__file__).parent
+                               / "driver" / "package" / "browsers.json").read_text())
+        for entry in browsers.get("browsers", []):
+            if entry.get("name") == "chromium" and entry.get("browserVersion"):
+                return entry["browserVersion"]
+    except Exception as exc:  # noqa: BLE001
+        log.debug("chromium version detection failed: %s", exc)
+    return _FALLBACK_CHROMIUM_VERSION
+
+
+def build_fingerprint(timezone: str, locale: str) -> dict:
+    """One coherent per-account fingerprint bundle: UA derived from the real
+    bundled Chromium (userAgentData would leak it otherwise), matching
+    Sec-CH-UA brands, viewport, WebGL strings, timezone and locale. Generated
+    once per (platform, user_id) and persisted — accounts don't change
+    browsers every few hours."""
+    version = _detect_chromium_version()
+    major = version.split(".")[0]
+    os_profile = random.choice(_OS_PROFILES)
+    width, height = random.choice(VIEWPORTS)
+    return {
+        "user_agent": (f"Mozilla/5.0 ({os_profile['ua_os']}) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       f"Chrome/{version} Safari/537.36"),
+        "sec_ch_ua": [
+            {"brand": "Not(A:Brand", "version": "24"},
+            {"brand": "Chromium", "version": major},
+            {"brand": "Google Chrome", "version": major},
+        ],
+        "sec_ch_ua_full_version": version,
+        "sec_ch_ua_platform": os_profile["ch_ua_platform"],
+        "viewport": {"width": width, "height": height},
+        "webgl_vendor": os_profile["webgl_vendor"],
+        "webgl_renderer": os_profile["webgl_renderer"],
+        "timezone": timezone,
+        "locale": locale,
+    }
+
+
+_STEALTH_INIT_BODY = """
+  try { Object.defineProperty(navigator, 'webdriver',
+        { get: () => undefined }); } catch (e) {}
+  try {
+    const langs = [fp.locale, fp.locale.split('-')[0]];
+    Object.defineProperty(navigator, 'languages', { get: () => langs });
+    Object.defineProperty(navigator, 'language', { get: () => fp.locale });
+  } catch (e) {}
+  try {
+    const protos = [window.WebGLRenderingContext && WebGLRenderingContext.prototype,
+                    window.WebGL2RenderingContext && WebGL2RenderingContext.prototype];
+    for (const proto of protos) {
+      if (!proto) continue;
+      const orig = proto.getParameter;
+      proto.getParameter = function (pname) {
+        if (pname === 37445) return fp.webgl_vendor;    // UNMASKED_VENDOR_WEBGL
+        if (pname === 37446) return fp.webgl_renderer;  // UNMASKED_RENDERER_WEBGL
+        return orig.call(this, pname);
+      };
+    }
+  } catch (e) {}
+  try { Object.defineProperty(navigator, 'plugins',
+        { get: () => [0, 1, 2] }); } catch (e) {}  // non-empty PluginArray shape
+  try {
+    if (navigator.userAgentData) {
+      const brands = fp.sec_ch_ua;
+      const full = fp.sec_ch_ua_full_version;
+      const fullVersionList = brands.map(b => ({
+        brand: b.brand, version: /Chrom/.test(b.brand) ? full : b.version + '.0.0.0' }));
+      const data = {
+        brands, mobile: false, platform: fp.sec_ch_ua_platform,
+        getHighEntropyValues: () => Promise.resolve({
+          brands, fullVersionList, platform: fp.sec_ch_ua_platform,
+          uaFullVersion: full, mobile: false, model: '',
+          architecture: 'x86', bitness: '64' }),
+        toJSON: () => ({ brands, mobile: false, platform: fp.sec_ch_ua_platform }),
+      };
+      Object.defineProperty(navigator, 'userAgentData', { get: () => data });
+    }
+  } catch (e) {}
+})();"""
+
+
+def _stealth_init_script(fp: dict) -> str:
+    """Permanent anti-detect init script built from the fingerprint bundle.
+    Each patch is individually try/catch-guarded so one failure never breaks
+    page loads."""
+    payload = json.dumps({
+        "locale": fp["locale"],
+        "webgl_vendor": fp["webgl_vendor"],
+        "webgl_renderer": fp["webgl_renderer"],
+        "sec_ch_ua": fp["sec_ch_ua"],
+        "sec_ch_ua_full_version": fp["sec_ch_ua_full_version"],
+        "sec_ch_ua_platform": fp["sec_ch_ua_platform"],
+    })
+    return "(() => {\n  const fp = " + payload + ";" + _STEALTH_INIT_BODY
 
 
 class CaptchaDetectedError(Exception):
@@ -79,6 +192,26 @@ def mouse_wiggle(page, moves: int = 3):
         _sleep(random.uniform(0.05, 0.2))
 
 
+def _type_chars(page, text: str, base_delay_ms: float):
+    """Type `text` char-by-char with human cadence: the wpm base jittered
+    ±40%, occasional 'thinking' pauses, a longer beat after punctuation, and
+    rare double-strike bursts. A constant inter-keystroke cadence is itself
+    a bot signature. Per-char delay is capped to keep runtime sane."""
+    i = 0
+    while i < len(text):
+        # rare burst: two chars fired off inside one short interval
+        burst = 2 if i + 1 < len(text) and random.random() < 0.06 else 1
+        for ch in text[i:i + burst]:
+            page.keyboard.press("Space" if ch == " " else ch)
+            delay_ms = min(350.0, base_delay_ms * random.uniform(0.6, 1.4))
+            if ch in ".,;:!?":
+                delay_ms += random.uniform(100, 300)
+            _sleep(delay_ms / 1000)
+            if random.random() < 0.05:  # "thinking" pause
+                _sleep(random.uniform(0.2, 0.6))
+        i += burst
+
+
 def type_with_plan(page, selector: str, text: str,
                    typing_plan: list[dict] | None = None,
                    wpm: tuple[int, int] = (45, 80)):
@@ -100,10 +233,10 @@ def type_with_plan(page, selector: str, text: str,
                 page.keyboard.press("Backspace")
                 _sleep(random.uniform(0.03, 0.08))
         lo, hi = wpm
-        delay_ms = int(60000 / (random.randint(lo, hi) * 5))  # 5 chars/word
-        page.keyboard.type(word, delay=delay_ms)
+        base_ms = 60000 / (random.randint(lo, hi) * 5)  # 5 chars/word
+        _type_chars(page, word, base_ms)
         if i < len(words) - 1:
-            page.keyboard.type(" ", delay=delay_ms)
+            _type_chars(page, " ", base_ms)
 
 
 def detect_challenge(page, platform: str) -> str | None:
@@ -219,29 +352,51 @@ class BrowserManager:
             self._last_used[key] = self._now()
             return self._contexts[key]
         user_data_dir = _mkdir_private(self.session_dir_for(platform, user_id))
-        width, height = random.choice(VIEWPORTS)
+        # fetch the enrolled session before launch: it may pin a per-account
+        # proxy and per-account fingerprint geo (timezone/locale), both of
+        # which must be known when the context is created
+        session = self._fetch_session(platform, user_id)
+        fp = self._fingerprint_for(platform, user_id, session)
         kwargs = {
             "user_data_dir": str(user_data_dir),
             "headless": self.config.headless,
-            "user_agent": random.choice(USER_AGENTS),
-            "viewport": {"width": width, "height": height},
-            "locale": self.config.locale,
-            "timezone_id": self.config.timezone,
+            "user_agent": fp["user_agent"],
+            "viewport": fp["viewport"],
+            "locale": fp["locale"],
+            "timezone_id": fp["timezone"],
             "args": ["--disable-blink-features=AutomationControlled"],
         }
-        # fetch the enrolled session before launch: it may pin a per-account
-        # proxy, which must be known when the context is created
-        session = self._fetch_session(platform, user_id)
         proxy_url = session.get("proxy_url") or self.config.proxy_for(platform)
         if proxy_url:
             kwargs["proxy"] = _parse_proxy(proxy_url, platform)
             log.info("%s/user %s via proxy %s",
                      platform, user_id, proxy_url.split("@")[-1])
         context = self._browser_type.launch_persistent_context(**kwargs)
+        context.add_init_script(_stealth_init_script(fp))
         self._seed_session(context, platform, user_id, session)
         self._contexts[key] = context
         self._last_used[key] = self._now()
         return context
+
+    def _fingerprint_for(self, platform: str, user_id: int, session: dict) -> dict:
+        """Load the persisted fingerprint bundle for this (platform, user),
+        generating + persisting it (owner-only, like storage_state) on first
+        use. Session-provided timezone/locale (per-account geo, aligned with
+        the proxy exit) win over the config defaults — but only at generation
+        time; afterwards the bundle is stable across launches."""
+        path = self.session_dir_for(platform, user_id) / "fingerprint.json"
+        try:
+            return json.loads(path.read_text())
+        except FileNotFoundError:
+            pass
+        except (ValueError, OSError) as exc:
+            log.warning("unreadable fingerprint for %s/user %s (%s) — regenerating",
+                        platform, user_id, exc)
+        fp = build_fingerprint(timezone=session.get("timezone") or self.config.timezone,
+                               locale=session.get("locale") or self.config.locale)
+        path.write_text(json.dumps(fp, indent=2))
+        os.chmod(path, 0o600)  # sits beside session cookies — owner-only
+        return fp
 
     def reap_idle_contexts(self):
         """Close contexts idle beyond WORKER_CONTEXT_IDLE_SEC (flushing

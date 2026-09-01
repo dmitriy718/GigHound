@@ -45,6 +45,25 @@ class Config:
     timezone: str = field(default_factory=lambda: os.getenv(
         "WORKER_TIMEZONE", "America/New_York"))
     locale: str = field(default_factory=lambda: os.getenv("WORKER_LOCALE", "en-US"))
+    # circadian window, hours in `timezone` ("8-23"); "" / "off" disables it
+    active_hours: str = field(default_factory=lambda: os.getenv(
+        "WORKER_ACTIVE_HOURS", "8-23"))
+
+    def active_hours_window(self) -> tuple[int, int] | None:
+        """Parse active_hours "8-23" → (8, 23); None disables the gate."""
+        raw = (self.active_hours or "").strip()
+        if not raw or raw.lower() in ("off", "none", "always"):
+            return None
+        try:
+            lo_s, hi_s = raw.split("-", 1)
+            lo, hi = int(lo_s), int(hi_s)
+        except ValueError:
+            raise RuntimeError(
+                f"WORKER_ACTIVE_HOURS must look like '8-23', got {raw!r}")
+        if not (0 <= lo < hi <= 24):
+            raise RuntimeError(
+                f"WORKER_ACTIVE_HOURS must satisfy 0 <= start < end <= 24, got {raw!r}")
+        return lo, hi
 
     def proxy_for(self, platform: str) -> str | None:
         """Per-platform proxy URL, e.g. WORKER_PROXY_UPWORK=http://user:pass@host:port"""
