@@ -192,6 +192,73 @@ def test_revert_keeps_status_when_nothing_changes(client):
     assert r.json()["reviewed_by"] == "operator"
 
 
+def test_revert_allows_pending_review(client):
+    c, Session = client
+    token = _register(c)
+    uid = _user_id(Session)
+    item_id = _make_item(
+        Session, uid, status="pending_review", text="edited text",
+        versions=[{"text": "original text", "bid": 500.0, "by": "generator",
+                   "at": "2026-08-29T00:00:00+00:00"}])
+
+    r = c.post(f"/api/proposals/{item_id}/revert", headers=_auth(token),
+               json={"version_index": 0})
+    assert r.status_code == 200
+    assert r.json()["proposal_text"] == "original text"
+    assert r.json()["status"] == "pending_review"
+
+
+def test_revert_rejects_submitted_item(client):
+    """Reverting a submitted item would flip it back to pending_review, from
+    which approve → submit sends a SECOND bid for the same job."""
+    c, Session = client
+    token = _register(c)
+    uid = _user_id(Session)
+    item_id = _make_item(
+        Session, uid, status="submitted", text="sent text",
+        versions=[{"text": "original text", "bid": 500.0, "by": "generator",
+                   "at": "2026-08-29T00:00:00+00:00"}])
+
+    r = c.post(f"/api/proposals/{item_id}/revert", headers=_auth(token),
+               json={"version_index": 0})
+    assert r.status_code == 409
+    assert "submitted" in r.json()["detail"]
+    db = Session()
+    try:
+        item = db.get(ProposalQueueItem, item_id)
+        assert item.status == "submitted" and item.proposal_text == "sent text"
+    finally:
+        db.close()
+
+
+# ---------------- approve: empty text guard ----------------
+
+def test_approve_rejects_empty_proposal_text(client):
+    c, Session = client
+    token = _register(c)
+    uid = _user_id(Session)
+    item_id = _make_item(Session, uid, text="real draft text")
+
+    for blank in ("", "   \n\t "):
+        r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
+                   json={"reviewer": "operator", "proposal_text": blank})
+        assert r.status_code == 422, r.text
+
+    db = Session()
+    try:
+        item = db.get(ProposalQueueItem, item_id)
+        assert item.status == "pending_review"
+        assert item.proposal_text == "real draft text"
+    finally:
+        db.close()
+
+    # a normal approve still works
+    r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
+               json={"reviewer": "operator"})
+    assert r.status_code == 200
+    assert r.json()["status"] == "approved"
+
+
 # ---------------- adapter write endpoints are approval-bound ----------------
 
 class _FakeFreelancerAdapter:
@@ -378,6 +445,41 @@ def test_submit_success_writes_audit_and_closes_adapter(client, monkeypatch):
     assert logs[0].detail["proposal_id"] == item_id
     assert logs[0].detail["channel"] == "upwork_agency_queue"
     assert logs[0].detail["platform_response_id"] == "rec-1"
+
+
+def test_duplicate_submit_409s_after_atomic_claim(client, monkeypatch):
+    """The second submit (double-click / client retry) must lose the atomic
+    approved → submitting claim instead of placing a second bid."""
+    c, Session = client
+    _FakeUpworkAdapter.calls = []
+    monkeypatch.setattr("app.adapters.upwork_agency.UpworkAgencyAdapter", _FakeUpworkAdapter)
+    token = _register(c)
+    uid = _user_id(Session)
+    item_id = _make_item(Session, uid, status="approved", reviewed_by="operator",
+                         submission_result={"on_behalf_of": "jane"})
+
+    r = c.post(f"/api/proposals/{item_id}/submit", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    r = c.post(f"/api/proposals/{item_id}/submit", headers=_auth(token))
+    assert r.status_code == 409
+    assert "already submitted or in flight" in r.json()["detail"]
+    assert len(_FakeUpworkAdapter.calls) == 1  # exactly one external submission
+
+    # a pre-dispatch 409 (circuit open) releases the claim back to approved
+    from app import circuit_breaker
+    retry_item = _make_item(Session, uid, status="approved", reviewed_by="operator",
+                            submission_result={"on_behalf_of": "jane"})
+    circuit_breaker.open_circuit("upwork", "manual halt")
+    try:
+        r = c.post(f"/api/proposals/{retry_item}/submit", headers=_auth(token))
+        assert r.status_code == 409
+    finally:
+        circuit_breaker.close_circuit("upwork", "test cleanup")
+    db = Session()
+    try:
+        assert db.get(ProposalQueueItem, retry_item).status == "approved"
+    finally:
+        db.close()
 
 
 # ---------------- ingest hardening ----------------

@@ -20,7 +20,7 @@ interface OfferEdits {
 }
 
 const editsFrom = (item: ProposalQueueItem): OfferEdits => ({
-  proposal_text: item.humanized_text ?? item.proposal_text,
+  proposal_text: item.humanized_text || item.proposal_text,
   bid_amount: item.bid_amount != null ? String(item.bid_amount) : '',
 });
 

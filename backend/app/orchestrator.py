@@ -166,7 +166,7 @@ def generation_gates_pass(db: Session, job: Job, ctx: PipelineContext | None = N
         db.query(ProposalQueueItem)
         .filter(ProposalQueueItem.job_id == job.id,
                 ProposalQueueItem.status.in_(
-                    ["pending_review", "approved", "submitted",
+                    ["pending_review", "approved", "submitting", "submitted",
                      "queued_for_browser", "generation_failed"]))
         .first()
     )
