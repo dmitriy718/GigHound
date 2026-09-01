@@ -22,6 +22,7 @@ from .database import SessionLocal
 from .fiverr_monitor import enqueue_buyer_request_fetch
 from .gig_analytics import enqueue_metrics_scrape
 from .models import Job, ProposalQueueItem, User
+from .stealth import FETCH_BUYER_REQUESTS
 
 log = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ def fiverr_buyer_request_tick_core() -> dict:
                 in_flight = (db.query(StealthTask)
                              .filter(StealthTask.user_id == user.id,
                                      StealthTask.platform == "fiverr",
-                                     StealthTask.task_type == "fiverr_fetch_buyer_requests",
+                                     StealthTask.task_type == FETCH_BUYER_REQUESTS,
                                      StealthTask.status.in_(("pending", "claimed")))
                              .first())
                 if in_flight is not None:
@@ -387,15 +388,18 @@ def generation_retry_tick_core() -> dict:
             retries = int(result.get("generation_retries") or 0)
             if retries >= GENERATION_MAX_RETRIES:
                 continue
-            result["generation_retries"] = retries + 1
-            item.submission_result = result
-            db.commit()
             try:
                 generate_proposal_task.delay(item.job_id)
-                retried.append(item.id)
             except Exception as exc:  # noqa: BLE001 — broker down; try next tick
                 log.warning("generation retry enqueue failed for item %d (%s)",
                             item.id, exc)
+                continue
+            # count the attempt only once the retry is actually enqueued —
+            # a broker blip must not burn one of the GENERATION_MAX_RETRIES
+            result["generation_retries"] = retries + 1
+            item.submission_result = result
+            db.commit()
+            retried.append(item.id)
         return {"retried": retried}
     finally:
         db.close()

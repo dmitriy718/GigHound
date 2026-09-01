@@ -3,6 +3,7 @@ competitor intel, buyer-request inbox, and stealth-task handoff."""
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import get_args
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import update
@@ -18,7 +19,7 @@ from ..models import (Gig, GigMetric, GigTemplate, CompetitorSnapshot,
                       PlatformAccount, ProposalQueueItem, StealthTask, User)
 from ..schemas import (CompetitorSnapshotOut, GigMetricIn, GigMetricOut,
                        GigOut, GigTemplateIn, GigTemplateOut,
-                       StealthTaskClaimIn)
+                       Platform, StealthTaskClaimIn)
 from ..stealth import SUBMIT_UPWORK_PROPOSAL
 
 router = APIRouter(prefix="/api/gigs", tags=["gigs"])
@@ -144,9 +145,13 @@ def list_gigs(platform: str | None = None, status: str | None = None,
 @router.post("", response_model=GigOut, status_code=201)
 def register_gig(body: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Register an externally-created gig for tracking."""
+    platform = body.get("platform")
+    if platform not in get_args(Platform):
+        raise HTTPException(422, f"unsupported platform {platform!r} — "
+                                 f"must be one of {list(get_args(Platform))}")
     gig = Gig(
         user_id=user.id,
-        platform=body["platform"], title=body.get("title", ""),
+        platform=platform, title=body.get("title", ""),
         external_id=body.get("external_id", ""), url=body.get("url", ""),
         status=body.get("status", "draft"), price_min=body.get("price_min"),
         template_id=body.get("template_id"),

@@ -31,6 +31,21 @@ services:
       timeout: 3s
       retries: 12
 
+  # One-shot schema migration: backend/celery services wait for this to
+  # finish, so celery tasks never run against a pre-migration schema on a
+  # fresh deploy. (The backend image CMD also migrates — idempotent.)
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment: *backend-env
+    command: alembic upgrade head
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
   # All-in-one app container: builds the frontend bundle (stage 1 of
   # backend/Dockerfile) and serves it via FastAPI StaticFiles alongside the
   # API. Ollama URL defaults to http://ollama:11434/v1 inside containers
@@ -56,6 +71,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   celery-worker:
     build:
@@ -73,6 +90,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   celery-beat:
     build:
@@ -90,6 +109,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   # Optional local LLM for proposal drafting. Opt-in:
   #   docker compose --profile llm up -d

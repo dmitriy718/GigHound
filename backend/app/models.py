@@ -419,7 +419,7 @@ class StealthTask(Base):
     # canonical kinds (app.stealth): fetch_buyer_requests | scrape_gig_metrics |
     # scrape_competitors | create_gig_draft | submit_upwork_proposal |
     # submit_fiverr_offer | submit_proposal
-    # legacy types still emitted by older enqueue paths: fiverr_create_gig |
+    # legacy types may exist in old rows (no longer emitted): fiverr_create_gig |
     # fiverr_fetch_buyer_requests | gig_scrape_metrics | upwork_catalog_upsert
     payload: Mapped[dict] = mapped_column(JSONType, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)

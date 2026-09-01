@@ -10,6 +10,7 @@ per job.
 import logging
 from datetime import datetime, timedelta, timezone
 
+import redis
 from rapidfuzz import fuzz
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -174,5 +175,10 @@ async def run_ingest(body: IngestJobsIn, db: Session, user: User) -> IngestResul
             db.commit()
             alerts_sent += 1
 
-    cache.invalidate_prefix("preview:")
+    # jobs are already committed — a Redis failure here must not 500 the
+    # ingest; a stale preview cache is the lesser evil
+    try:
+        cache.invalidate_prefix("preview:")
+    except redis.RedisError as exc:
+        log.warning("preview cache invalidation failed (%s); continuing", exc)
     return IngestResult(ingested=ingested, auto_archived=auto_archived, alerts_sent=alerts_sent)

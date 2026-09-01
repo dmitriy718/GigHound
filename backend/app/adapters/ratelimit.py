@@ -20,6 +20,7 @@ import weakref
 from datetime import datetime, timezone
 
 import httpx
+import redis
 
 from ..cache import cache
 
@@ -119,9 +120,15 @@ def consume_daily_action(platform: str, principal: str) -> int:
         return 0
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     key = f"rl:{platform}:{principal}:{today}"
-    used = cache._r.incr(key)
-    if used == 1:
-        cache._r.expire(key, 48 * 3600)
+    try:
+        used = cache._r.incr(key)
+        if used == 1:
+            cache._r.expire(key, 48 * 3600)
+    except redis.RedisError as exc:
+        # graceful no-op per module docstring: Redis down → no budget
+        # enforcement, pacing via the shared limiter still applies
+        log.warning("Redis unavailable (%s); daily budget check skipped", exc)
+        return 0
     if used > cap:
         raise DailyBudgetExceeded(
             f"{platform}: daily action budget of {cap} reached for '{principal}'; "

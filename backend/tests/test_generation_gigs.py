@@ -278,7 +278,7 @@ def _fiverr_template(db, user_id):
 def test_gig_creation_queue_draft_only(db, user):
     tpl = _fiverr_template(db, user.id)
     task, err = queue_gig_creation(db, tpl)
-    assert err == "" and task.task_type == "fiverr_create_gig"
+    assert err == "" and task.task_type == "create_gig_draft"
     assert task.payload["save_as_draft"] is True
     # 1 draft/hour cap
     task2, err2 = queue_gig_creation(db, tpl)

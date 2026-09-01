@@ -10,7 +10,9 @@ import logging
 import time
 from datetime import datetime, timezone
 
+import redis
 from rapidfuzz import fuzz
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import circuit_breaker
@@ -18,6 +20,7 @@ from .auth import platform_account_settings
 from .cache import cache
 from .models import (AuditLog, GigTemplate, Job, ProposalQueueItem, StealthTask)
 from .schemas import ClientInfo
+from .stealth import CREATE_GIG_DRAFT, FETCH_BUYER_REQUESTS
 
 log = logging.getLogger(__name__)
 
@@ -27,12 +30,20 @@ GIG_DRAFTS_PER_HOUR = 1
 _local_counters: dict[str, tuple[int, float]] = {}
 
 
-def _counter(key: str, window_sec: float) -> int:
-    """Increment-and-get a counter with a rolling window (Redis or local)."""
+def _counter(key: str, window_sec: float) -> int | None:
+    """Increment-and-get a counter with a rolling window (Redis or local).
+
+    Returns None when Redis errors mid-run: the cap cannot be enforced, so
+    callers must skip the gated action conservatively (never send offers or
+    create gigs when the limit can't be verified)."""
     if cache._r is not None:
-        n = cache._r.incr(key)
-        if n == 1:
-            cache._r.expire(key, int(window_sec))
+        try:
+            n = cache._r.incr(key)
+            if n == 1:
+                cache._r.expire(key, int(window_sec))
+        except redis.RedisError as exc:
+            log.warning("Redis counter unavailable (%s); cap cannot be enforced", exc)
+            return None
         return n
     count, reset_at = _local_counters.get(key, (0, time.time() + window_sec))
     if time.time() > reset_at:
@@ -44,7 +55,10 @@ def _counter(key: str, window_sec: float) -> int:
 
 def _peek(key: str) -> int:
     if cache._r is not None:
-        v = cache._r.get(key)
+        try:
+            v = cache._r.get(key)
+        except redis.RedisError:
+            return 0  # display-only path; degrade to "nothing used"
         return int(v) if v else 0
     return _local_counters.get(key, (0, 0))[0]
 
@@ -62,21 +76,28 @@ def offers_remaining_today(user_id: int) -> int:
 # ---------------- gig creation ----------------
 
 def queue_gig_creation(db: Session, template: GigTemplate) -> tuple[StealthTask | None, str]:
-    """Queue a fiverr_create_gig stealth task (DRAFT only — never auto-publish).
+    """Queue a create_gig_draft stealth task (DRAFT only — never auto-publish).
 
     Returns (task, error). Enforces circuit breaker + 1 draft/hour cap.
+    Only fiverr gig drafts are supported by the worker.
     """
+    if template.platform != "fiverr":
+        log.info("gig creation skipped for platform %s: only fiverr gig drafts "
+                 "are supported by the worker", template.platform)
+        return None, f"gig creation not supported for '{template.platform}'"
     allowed, reason = circuit_breaker.check(template.platform, template.user_id)
     if not allowed:
         return None, reason
     count = _counter(f"gigdraft:{template.platform}:{template.user_id}", 3600)
+    if count is None:
+        return None, "gig draft rate limit cannot be enforced (Redis down) — try again"
     if count > GIG_DRAFTS_PER_HOUR:
         return None, f"gig draft rate limit: {GIG_DRAFTS_PER_HOUR}/hour per account"
 
     task = StealthTask(
         user_id=template.user_id,
         platform=template.platform,
-        task_type=f"{template.platform}_create_gig" if template.platform != "fiverr" else "fiverr_create_gig",
+        task_type=CREATE_GIG_DRAFT,
         payload={
             "template_id": template.id,
             "template": template.template_json,
@@ -94,29 +115,16 @@ def queue_gig_creation(db: Session, template: GigTemplate) -> tuple[StealthTask 
 
 
 def queue_upwork_catalog_upsert(db: Session, template: GigTemplate) -> tuple[StealthTask | None, str]:
-    """Upwork Project Catalog: text fields go via API where available; image
-    upload + publish step are stealth tasks. auto_publish respected per template,
-    defaulting to draft-for-review."""
+    """Upwork Project Catalog drafts are not supported by the worker yet (no
+    upwork gig-form config) — log and skip cleanly instead of queueing a
+    stealth task that would fail 100% of the time."""
     allowed, reason = circuit_breaker.check("upwork", template.user_id)
     if not allowed:
         return None, reason
-    task = StealthTask(
-        user_id=template.user_id,
-        platform="upwork",
-        task_type="upwork_catalog_upsert",
-        payload={
-            "template_id": template.id,
-            "template": template.template_json,
-            "publish": bool(template.auto_publish),  # default False → draft
-        },
-    )
-    db.add(task)
-    db.add(AuditLog(user_id=template.user_id, action_type="gig_created", platform="upwork", detail={
-        "template_id": template.id, "auto_publish": bool(template.auto_publish),
-    }))
-    db.commit()
-    db.refresh(task)
-    return task, ""
+    log.info("upwork catalog upsert skipped for template %d (user %d): "
+             "catalog drafts aren't supported by the worker yet",
+             template.id, template.user_id)
+    return None, "upwork catalog drafts aren't supported by the worker yet"
 
 
 # ---------------- buyer request monitor ----------------
@@ -170,10 +178,6 @@ def process_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> d
     matched = matching_buyer_requests(db, user_id, requests)
     queued = 0
     for req in matched:
-        if offers_remaining_today(user_id) <= 0:
-            log.info("fiverr daily offer cap reached (%d/day, user %d)",
-                     FIVERR_DAILY_OFFER_LIMIT, user_id)
-            break
         ext_id = str(req.get("id") or req.get("url") or req.get("title", "")[:80])
         exists = (db.query(Job)
                   .filter(Job.user_id == user_id,
@@ -181,6 +185,19 @@ def process_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> d
                   .first())
         if exists:
             continue
+        # the atomic INCR IS the cap check — a check-then-increment peek would
+        # let two concurrent runs both pass and exceed the 10/day ToS cap.
+        # (Over-counts slightly when a queued offer later fails to flush —
+        # cosmetic only.)
+        count = _counter(_offers_key(user_id), 86400)
+        if count is None:
+            log.warning("offer cap cannot be enforced (Redis down); skipping "
+                        "buyer request cycle for user %d", user_id)
+            break
+        if count > FIVERR_DAILY_OFFER_LIMIT:
+            log.info("fiverr daily offer cap reached (%d/day, user %d)",
+                     FIVERR_DAILY_OFFER_LIMIT, user_id)
+            break
         job = Job(
             user_id=user_id,
             external_id=ext_id, platform="fiverr",
@@ -198,7 +215,13 @@ def process_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> d
             status="new",
         )
         db.add(job)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError:
+            # unique (user_id, platform, external_id) — a concurrent monitor
+            # run posted the same request after our exists check
+            db.rollback()
+            continue
         offer_text = generate_custom_offer(req)
         item = ProposalQueueItem(
             user_id=user_id,
@@ -211,12 +234,13 @@ def process_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> d
             confidence=60.0,
         )
         db.add(item)
-        _counter(_offers_key(user_id), 86400)
         db.add(AuditLog(user_id=user_id, action_type="buyer_request_sent", platform="fiverr", detail={
             "job_id": job.id, "offer": offer_text[:200], "status": "queued_for_approval",
         }))
+        # commit per request so an IntegrityError rollback above only drops
+        # the duplicate, never the offers already queued this cycle
+        db.commit()
         queued += 1
-    db.commit()
     return {"queued": queued, "offers_remaining": offers_remaining_today(user_id)}
 
 
@@ -231,7 +255,7 @@ def enqueue_buyer_request_fetch(db: Session, user_id: int) -> StealthTask | None
     allowed, reason = circuit_breaker.check("fiverr", user_id)
     if not allowed:
         log.warning("buyer request fetch skipped: %s", reason)
-        task = StealthTask(user_id=user_id, platform="fiverr", task_type="fiverr_fetch_buyer_requests",
+        task = StealthTask(user_id=user_id, platform="fiverr", task_type=FETCH_BUYER_REQUESTS,
                            payload={}, status="skipped_circuit_open",
                            result={"reason": reason})
         db.add(task)
@@ -242,7 +266,7 @@ def enqueue_buyer_request_fetch(db: Session, user_id: int) -> StealthTask | None
         log.warning("buyer request fetch skipped for user %d: no fiverr seller "
                     "username configured (account settings)", user_id)
         return None
-    task = StealthTask(user_id=user_id, platform="fiverr", task_type="fiverr_fetch_buyer_requests",
+    task = StealthTask(user_id=user_id, platform="fiverr", task_type=FETCH_BUYER_REQUESTS,
                        payload={"username": username})
     db.add(task)
     db.commit()

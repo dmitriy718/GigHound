@@ -17,7 +17,8 @@ SUBMIT_FIVERR_OFFER = "submit_fiverr_offer"
 SUBMIT_PROPOSAL = "submit_proposal"
 SCRAPE_PROPOSAL_STATUS = "scrape_proposal_status"
 
-# legacy task_type → canonical kind (must match backend app.stealth.LEGACY_ALIASES)
+# legacy task_type → canonical kind (must match backend app.stealth.LEGACY_ALIASES).
+# No backend code emits these anymore — kept so older queued rows stay executable.
 LEGACY_ALIASES = {
     "fiverr_fetch_buyer_requests": FETCH_BUYER_REQUESTS,
     "gig_scrape_metrics": SCRAPE_GIG_METRICS,
