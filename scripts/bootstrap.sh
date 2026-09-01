@@ -20,6 +20,9 @@ if [[ ! -f "$ENV_FILE" ]]; then
 else
   echo ".env already exists — filling only missing/placeholder secrets"
 fi
+# .env holds DB credentials and signing keys — never leave it world-readable
+# (cp/sed would otherwise inherit the umask, often 644).
+chmod 600 "$ENV_FILE"
 
 rand_hex() { # rand_hex <bytes>
   if command -v openssl >/dev/null 2>&1; then
@@ -47,13 +50,17 @@ fill() {
     echo "  $key: already set — leaving as-is"
     return
   fi
+  # sed -i.bak + rm is portable across GNU and BSD/macOS (plain `sed -i` is not)
   if grep -qE "^# *${key}=" "$ENV_FILE"; then
-    sed -i "s|^# *${key}=.*|${key}=${value}|" "$ENV_FILE"
+    sed -i.bak "s|^# *${key}=.*|${key}=${value}|" "$ENV_FILE" && rm -f "$ENV_FILE.bak"
   elif grep -qE "^${key}=" "$ENV_FILE"; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+    sed -i.bak "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" && rm -f "$ENV_FILE.bak"
   else
+    # appending onto a file without a trailing newline would corrupt the last line
+    [[ -n "$(tail -c 1 "$ENV_FILE")" ]] && printf '\n' >> "$ENV_FILE"
     printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
   fi
+  chmod 600 "$ENV_FILE"  # sed -i recreates the file — re-tighten after edits
   echo "  $key: generated"
 }
 
@@ -67,8 +74,10 @@ cat <<'EOF'
 Done. Next steps:
 
   docker compose up --build -d                                   # db, redis, backend, celery
-  docker compose exec backend python -m scripts.seed_defaults    # demo data (optional)
-  open http://localhost:8000   # demo login: demo@gighound.local / demo1234
+  docker compose exec backend python -m scripts.seed_defaults    # demo data (optional, DEV ONLY —
+                                                                 # published credentials; the seed
+                                                                 # refuses when GIGHOUND_ENV=production)
+  open http://localhost:8000   # dev-only demo login: demo@gighound.local / demo1234
 
 Notes:
   - The backend container runs `alembic upgrade head` on startup.

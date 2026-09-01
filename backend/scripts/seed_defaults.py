@@ -3,6 +3,10 @@
 All rows are tenant-owned (AD-1), so seeding happens under a demo account:
     email: demo@gighound.local   password: demo1234
 
+These are PUBLISHED credentials — the demo account is created in development
+only. When GIGHOUND_ENV=production the seed refuses unless --with-demo is
+passed explicitly.
+
 Idempotent: a default is only created when the demo user's collection is
 completely empty, so running this repeatedly (or against a populated DB)
 never duplicates or overwrites user data. Wired defaults reference the
@@ -12,6 +16,7 @@ Run:  .venv/bin/python -m scripts.seed_defaults   (from backend/)
       python scripts/seed_defaults.py             (also works — path self-fixes)
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -24,6 +29,15 @@ from app import models as m
 
 DEMO_EMAIL = "demo@gighound.local"
 DEMO_PASSWORD = "demo1234"
+
+
+def _demo_allowed(argv: list[str]) -> bool:
+    """The demo account is a published-credential login: allowed in dev
+    (default), refused under GIGHOUND_ENV=production unless the operator
+    explicitly opts in with --with-demo."""
+    if "--with-demo" in argv:
+        return True
+    return os.getenv("GIGHOUND_ENV", "").strip().lower() != "production"
 
 
 def get_or_create_demo_user(db) -> m.User:
@@ -215,6 +229,16 @@ def seed(db) -> list[str]:
 
 
 def main() -> None:
+    if not _demo_allowed(sys.argv[1:]):
+        print("GIGHOUND_ENV=production: refusing to create the demo account "
+              f"({DEMO_EMAIL} / {DEMO_PASSWORD}) — its credentials are "
+              "published. Pass --with-demo to override.")
+        return
+    env = os.getenv("GIGHOUND_ENV", "").strip().lower()
+    if env not in ("", "dev", "development"):
+        print(f"WARNING: creating the demo account ({DEMO_EMAIL} / "
+              f"{DEMO_PASSWORD}) with GIGHOUND_ENV={env} — these credentials "
+              "are public; delete this account on any reachable deployment.")
     db = SessionLocal()
     try:
         created = seed(db)
