@@ -574,3 +574,71 @@ stealth worker — all up via compose with healthchecks/service_healthy working 
 
 **Remaining unverified (unchanged):** live-platform selectors (need real accounts), GitHub CI
 (account billing lock — user action).
+
+
+---
+
+## 2026-09-01 — Phase 0 of review-round-2 plan implemented and verified ("stop the bleeding")
+
+Basis: `evolution/review-2026-08-31/implementation-plan.md` (user approved Phase 0). All 18
+work items implemented in 6 clusters, each committed separately; master `1089519`..`ec61c84`.
+
+**Cluster A — worker liveness (P0-1, P0-2).** `worker/runner.py`: success-path `complete_task`
+treats `ClaimConflictError` as benign (task already finalized server-side); `httpx.TransportError`
+tolerated in poll loop, per-task processing, and failure reports; one bad task can no longer kill
+the sweep. Compose: worker gets `restart: unless-stopped`, `shm_size: '1gb'`, /proc-based
+healthcheck; db/redis get restart policies; backend image CMD `exec`s uvicorn (SIGTERM works);
+image HEALTHCHECK on `/api/health` (the real route — `/health` was the SPA fallback); celery
+services opt out of the HTTP healthcheck. Worker 57 tests.
+
+**Cluster B — stealth-task lifecycle (P0-3..P0-5).** New `reclaim_count` column (migration
+`d3f8a2c91e07`); `stealth_reaper_tick` (5-min beat) returns stale `claimed` tasks to `pending`
+(15-min timeout, 3-reclaim cap → failed); retention also purges `skipped_circuit_open`.
+adapters.py Upwork submit path now flips items to `queued_for_browser` (status contract unified
+with proposals.py — duplicate-submission hole closed). Both submit paths 409 on circuit-open
+instead of stranding items; status-sync stops counting skipped tasks as enqueued. Backend 222 tests.
+
+**Cluster C — submit guards & data-loss (P0-6..P0-8).** Submit endpoint transitions
+`approved→submitting` via conditional UPDATE before any external call (second submit → 409);
+pre-dispatch failures release back to `approved`; `revert_version` refuses terminal/in-flight
+statuses; `submitting` added to status enums (backend + frontend). Editors use `||` so empty
+`humanized_text` falls through (approve-wipes-text closed); approve rejects empty proposal_text
+(422); schema emits `humanized_text: null` when unset. `API_URL` defaults to same-origin `''`;
+`wsUrl` derives `ws(s)://host` from `window.location` — prod bundle no longer hardcodes
+localhost:8000. Backend 226 tests; tsc + build clean.
+
+**Cluster D — tenancy & fan-out (P0-9..P0-12).** Upwork accepts OAuth OR storage_state
+credentials (dual validation; Accounts UI 3-way picker); linkedin/indeed enrollment removed.
+Circuit breaker scoped `circuit:{platform}:{user_id}` for auto-trips (global opens still block
+everyone); gig-draft cap per-account. Buyer-request tick skips users without an enabled fiverr
+account or with an in-flight fetch; both ticks got per-tenant error isolation. Enqueue carries
+seller username from account settings (skips when unset); worker fails loudly without it,
+absolutizes URLs, stable brief IDs (sha1 fallback), no hardcoded USD. Backend 236, worker 69 tests.
+
+**Cluster E — output integrity (P0-13, P0-16).** `inject_personality` splits with captured
+separators and rejoins verbatim — paragraph breaks survive; `strip_ai_tells` gains `,,` and
+leading-`.` artifact passes. Negative-keyword jobs archive at ingest regardless of filter
+thresholds; generation gate refuses excluded jobs. Backend 241 tests.
+
+**Cluster F — infra & resilience (P0-14,15,17,18).** One-shot `migrate` compose service gates
+backend/celery on schema readiness. Digest sent-count reflects actual SMTP delivery; SMTP/DIGEST
+vars in `.env.example`. Generation-retry counter increments only after successful enqueue;
+fiverr offer cap enforced by atomic INCR (fail-closed when Redis can't enforce); buyer-request
+flush IntegrityError-guarded. Cache client: socket timeouts, per-op RedisError containment, lazy
+reconnect; breaker/textgen/ratelimit/ingest degrade instead of 500ing. `upwork_catalog_upsert` +
+non-fiverr gig drafts no longer emitted (429 "not supported yet" instead of 100%-fail tasks);
+`register_gig` validates platform; emitters use canonical task kinds + resolvability test.
+Backend 254 tests.
+
+**Verification (all self-run, not delegated):**
+- Gates: backend 254/254, worker 69/69, `tsc -b` + `vite build` clean.
+- Images rebuilt; full stack up; backend + worker report `(healthy)` via the NEW healthchecks.
+- `migrate` service ran `c4e2a81f05b7 → d3f8a2c91e07`; `reclaim_count` confirmed in DB.
+- Reaper smoke: seeded a 20-min-stale claimed task → `stealth_reaper_tick_core()` returned
+  `{'reclaimed': [184]}` with "reclaim 1/3" logged. Worker then picked it up and completed it
+  (200) WITHOUT the process dying — the original crash-on-success path exercised live.
+- Redis-outage smoke: `docker compose stop redis` → `GET /api/jobs` 200, `POST /api/jobs/ingest`
+  200 (previously 500 after commit); restart → 200, lazy recovery confirmed; smoke rows cleaned.
+- Worker loop alive throughout, polling all 4 platforms.
+
+**Phase 0 status: COMPLETE (18/18).** Next: Phase 1 (security hardening) on user approval.
