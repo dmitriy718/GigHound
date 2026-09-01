@@ -11,7 +11,8 @@ from app.database import Base
 from app.models import (Keyword, KeywordGroup, PortfolioItem, ProfileTemplate,
                         ProposalQueueItem, RateCardEntry, SearchFilter,
                         SearchProfile, Job, User)
-from app.orchestrator import maybe_queue_proposal, select_portfolio_items
+from app.orchestrator import (generation_gates_pass, maybe_queue_proposal,
+                              select_portfolio_items)
 from app.schemas import ClientInfo, JobIngest
 from app.scoring import compute_quality_score
 
@@ -191,3 +192,19 @@ async def test_maybe_queue_proposal_pipeline(db, user):
     good.status = "archived"
     db.commit()
     assert await maybe_queue_proposal(db, good) is None
+
+
+def test_generation_gate_refuses_negative_keyword_excluded(db, user):
+    excluded = Job(user_id=user.id, external_id="neg-g1", platform="upwork",
+                   title="WordPress site", description="wordpress work",
+                   status="new", job_type="fixed", quality_score=0.0,
+                   score_breakdown={"keyword_match": 0,
+                                    "excluded_by_negative_keyword": 1})
+    normal = Job(user_id=user.id, external_id="ok-g1", platform="upwork",
+                 title="React app", description="react work",
+                 status="new", job_type="fixed", quality_score=80.0)
+    db.add_all([excluded, normal])
+    db.commit()
+
+    assert generation_gates_pass(db, excluded) is False
+    assert generation_gates_pass(db, normal) is True  # no profiles → open gate

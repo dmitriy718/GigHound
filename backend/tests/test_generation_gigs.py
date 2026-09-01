@@ -5,8 +5,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app import circuit_breaker
-from app.antidetect import (build_typing_plan, humanize, pick_opening,
-                            sentence_stats, strip_ai_tells)
+from app.antidetect import (build_typing_plan, humanize, inject_personality,
+                            pick_opening, sentence_stats, strip_ai_tells)
 from app.database import Base
 from app.fiverr_monitor import (matching_buyer_requests, offers_remaining_today,
                                 process_buyer_requests, queue_gig_creation)
@@ -87,6 +87,26 @@ def test_strip_banned_phrases_and_ai_tells():
     assert "i hope this finds you well" not in low
     assert low.count("moreover") == 0 and low.count("additionally") == 0
     assert "1. First" not in out and "2. Second" not in out
+
+
+def test_strip_banned_phrase_mid_sentence_leaves_no_artifacts():
+    out = strip_ai_tells("Well, I hope this message finds you well, I can help")
+    assert ",," not in out
+    assert out == "Well, I can help"
+    out = strip_ai_tells("I hope this finds you well. I can help")
+    assert not out.startswith(".")
+    assert out == "I can help"
+
+
+def test_inject_personality_preserves_paragraphs():
+    import random
+    random.seed(0)  # deterministic marker choice
+    text = ("Your project caught my eye. The scope is clear.\n\n"
+            "I can start this week. The timeline works.\n\n"
+            "Happy to discuss details. Looking forward to it.")
+    out = inject_personality(text)
+    assert out != text  # a marker was injected (only "I can start…" is eligible)
+    assert out.count("\n\n") == 2  # paragraph boundaries survive
 
 
 def test_sentence_stats_distribution():

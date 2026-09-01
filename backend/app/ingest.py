@@ -132,6 +132,13 @@ async def run_ingest(body: IngestJobsIn, db: Session, user: User) -> IngestResul
             job.duplicate_of = dup.id
             job.red_flags = (job.red_flags or []) + ["duplicate posting"]
 
+        # Negative-keyword exclusion archives unconditionally, thresholds or not
+        if (job.score_breakdown or {}).get("excluded_by_negative_keyword"):
+            job.status = "archived"
+            auto_archived += 1
+            db.commit()
+            continue
+
         # Auto-archive below the strictest (lowest) active threshold
         thresholds = [f.quality_threshold for f in filters]
         if thresholds and job.quality_score < min(thresholds):

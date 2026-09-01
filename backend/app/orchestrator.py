@@ -154,10 +154,12 @@ def _passes_profile_filters(filters: dict[int, SearchFilter], job: Job,
 
 
 def generation_gates_pass(db: Session, job: Job, ctx: PipelineContext | None = None) -> bool:
-    """Cheap inline checks (no LLM): archived/duplicate/kill-switch/already-
-    queued/profile match/filter gate."""
+    """Cheap inline checks (no LLM): archived/duplicate/negative-keyword/
+    kill-switch/already-queued/profile match/filter gate."""
     if job.status == "archived":
         return False
+    if (job.score_breakdown or {}).get("excluded_by_negative_keyword"):
+        return False  # defense-in-depth for jobs ingested before exclusion archived
     if job.is_duplicate:
         return False  # duplicates don't each get a full LLM draft
     if not platform_enabled(db, job.user_id, job.platform):

@@ -257,6 +257,38 @@ async def test_ingest_enqueues_generation_without_llm_call(db, user, no_broker, 
     assert db.query(ProposalQueueItem).count() == 0
 
 
+@pytest.mark.asyncio
+async def test_negative_keyword_archived_even_without_filters(db, user, no_broker):
+    from app.ingest import run_ingest
+
+    group = KeywordGroup(user_id=user.id, name="neg")
+    group.keywords = [Keyword(term="wordpress", kind="negative", weight=0.0)]
+    db.add(group)
+    db.commit()
+
+    body = IngestJobsIn(jobs=[JobIngest(external_id="neg-1", platform="upwork",
+                                        title="WordPress site needed",
+                                        description="wordpress theme work")])
+    result = await run_ingest(body, db, user)
+    assert result.auto_archived == 1 and result.ingested == 0
+    job = db.query(Job).filter(Job.external_id == "neg-1").one()
+    assert job.status == "archived"
+    assert no_broker == []  # excluded jobs never reach generation
+
+
+@pytest.mark.asyncio
+async def test_normal_job_without_filters_still_ingests(db, user, no_broker):
+    from app.ingest import run_ingest
+
+    body = IngestJobsIn(jobs=[JobIngest(external_id="ok-1", platform="upwork",
+                                        title="React app",
+                                        description="react typescript work")])
+    result = await run_ingest(body, db, user)
+    assert result.ingested == 1 and result.auto_archived == 0
+    job = db.query(Job).filter(Job.external_id == "ok-1").one()
+    assert job.status != "archived"
+
+
 def test_generate_proposal_core_creates_queue_item(db, user, monkeypatch):
     Session = sessionmaker(bind=db.get_bind())
     monkeypatch.setattr("app.tasks.SessionLocal", Session)
