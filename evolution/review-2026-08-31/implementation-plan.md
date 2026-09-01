@@ -1,6 +1,6 @@
 # Review Round 2 — Implementation Plan
 
-Date: 2026-08-31 · Status: **PROPOSED — awaiting user approval** · Basis: 7 audit reports in this folder (pass-1, pass-2a, pass-2b, pass-3a..3d, cross-verification). Every item below was confirmed by direct source re-read and/or independent multi-pass corroboration (see cross-verification.md). Item IDs reference the pass reports.
+Date: 2026-08-31 · Status: **PHASE 0 IMPLEMENTED 2026-09-01 (18/18, verified — see ../implementation-log.md); Phases 1-5 pending approval** · Basis: 7 audit reports in this folder (pass-1, pass-2a, pass-2b, pass-3a..3d, cross-verification). Every item below was confirmed by direct source re-read and/or independent multi-pass corroboration (see cross-verification.md). Item IDs reference the pass reports.
 
 **Ground rules for implementation:** one commit per work item (or tight cluster); run the full gate after each phase — backend `pytest -q` (currently 217), worker `pytest -q` (currently 52), frontend `tsc -b` + `vite build`; never leave the gate red between phases; update docs when behavior changes.
 
