@@ -47,6 +47,7 @@ interface RejectDraft {
 const STATUS_COLORS: Record<ProposalStatus, string> = {
   pending_review: 'var(--amber)',
   approved: 'var(--accent)',
+  submitting: 'var(--accent)',
   rejected: 'var(--red)',
   queued_for_browser: 'var(--accent)',
   submitted: 'var(--green)',
@@ -77,7 +78,7 @@ const BID_ADVICE_COLORS: Record<BidAdvice['recommendation'], string> = {
 };
 
 const editsFrom = (item: ProposalQueueItem): DraftEdits => ({
-  proposal_text: item.humanized_text ?? item.proposal_text,
+  proposal_text: item.humanized_text || item.proposal_text,
   bid_amount: item.bid_amount != null ? String(item.bid_amount) : '',
   bid_period_days: item.bid_period_days != null ? String(item.bid_period_days) : '',
 });

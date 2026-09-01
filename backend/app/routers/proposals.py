@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from ..auth import (get_current_user, get_owned, platform_account_settings,
@@ -24,6 +25,9 @@ log = logging.getLogger(__name__)
 
 def _with_job(item: ProposalQueueItem, job: Job | None) -> ProposalQueueOut:
     out = ProposalQueueOut.model_validate(item)
+    # "" (column default) serializes as null so the frontend can fall back
+    # to proposal_text with a plain falsy check
+    out.humanized_text = item.humanized_text or None
     out.job = JobOut.model_validate(job) if job else None
     return out
 
@@ -98,6 +102,8 @@ def approve_proposal(item_id: int, body: ProposalReviewAction, db: Session = Dep
         raise HTTPException(409, f"cannot approve a proposal in status '{item.status}'")
     if not body.reviewer:
         raise HTTPException(400, "reviewer identity is required")
+    if body.proposal_text is not None and not body.proposal_text.strip():
+        raise HTTPException(422, "proposal_text must not be empty")
     edited = False
     if body.proposal_text is not None and body.proposal_text != item.proposal_text:
         item.proposal_text = body.proposal_text
@@ -289,6 +295,8 @@ def revert_version(item_id: int, body: dict, db: Session = Depends(get_db), user
     item = get_owned(db, ProposalQueueItem, item_id, user)
     if not item:
         raise HTTPException(404, "proposal not found")
+    if item.status not in ("pending_review", "approved"):
+        raise HTTPException(409, f"cannot revert a proposal in status '{item.status}'")
     versions = item.versions or []
     idx = body.get("version_index", 0)
     if not (0 <= idx < len(versions)):
@@ -383,14 +391,25 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
     item = get_owned(db, ProposalQueueItem, item_id, user)
     if not item:
         raise HTTPException(404, "proposal not found")
-    if item.status != "approved":
-        raise HTTPException(409, "only approved proposals can be submitted (human review boundary)")
     if not platform_enabled(db, user.id, item.platform):
         raise HTTPException(
             409, f"platform '{item.platform}' is disabled — enable it on the Accounts page")
     job = db.get(Job, item.job_id)
     if not job:
         raise HTTPException(404, "job not found")
+    # atomic claim approved → submitting BEFORE any external call, so a
+    # concurrent/duplicate submit (double-click, client retry) loses the race
+    # here instead of placing a second real-money bid — same conditional-update
+    # pattern as the stealth-task claim in gigs.py
+    res = db.execute(
+        update(ProposalQueueItem)
+        .where(ProposalQueueItem.id == item.id,
+               ProposalQueueItem.status == "approved")
+        .values(status="submitting")
+    )
+    db.commit()
+    if res.rowcount == 0:
+        raise HTTPException(409, "proposal is not approved (already submitted or in flight)")
 
     channel = ""
     response_id = None
@@ -480,6 +499,11 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
                 "leave this item approved and it will be picked up there",
             )
     except HTTPException:
+        # pre-dispatch failure (missing bidder config, unsupported platform,
+        # circuit open): release the claim so the item can be fixed and
+        # submitted again instead of stranding in "submitting"
+        item.status = "approved"
+        db.commit()
         raise
     except Exception as exc:  # noqa: BLE001
         item.status = "failed"

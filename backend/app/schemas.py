@@ -320,7 +320,7 @@ class ProposalQueueOut(BaseModel):
     job_id: int
     platform: str
     proposal_text: str
-    humanized_text: str = ""
+    humanized_text: Optional[str] = None
     bid_amount: Optional[float]
     bid_period_days: Optional[int]
     bid_rationale: str = ""

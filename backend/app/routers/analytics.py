@@ -18,8 +18,8 @@ from ..models import ProposalQueueItem, Template, User
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
-_ACTIVE_STATUSES = ("pending_review", "approved", "submitted", "queued_for_browser")
-_APPROVED_STATUSES = ("approved", "submitted", "queued_for_browser")
+_ACTIVE_STATUSES = ("pending_review", "approved", "submitting", "submitted", "queued_for_browser")
+_APPROVED_STATUSES = ("approved", "submitting", "submitted", "queued_for_browser")
 _SUBMITTED_STATUSES = ("submitted", "queued_for_browser")
 
 # bid_amount bands (USD): (label, lower, upper)

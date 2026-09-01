@@ -32,10 +32,16 @@ import type {
   TrendAnalytics,
 } from '../types';
 
+// Empty string = same origin (the backend serves SPA + API + WS together);
+// VITE_API_URL only overrides this for split dev setups.
 export const API_URL: string =
-  (import.meta.env.VITE_API_URL as string | undefined) ?? 'http://localhost:8000';
+  (import.meta.env.VITE_API_URL as string | undefined) ?? '';
 
 export function wsUrl(path: string): string {
+  if (!API_URL) {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${proto}//${window.location.host}${path}`;
+  }
   return API_URL.replace(/^http/, 'ws') + path;
 }
 

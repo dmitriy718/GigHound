@@ -292,8 +292,8 @@ class ProposalQueueItem(Base):
     needs_review: Mapped[bool] = mapped_column(Boolean, default=False)  # confidence < 50
     versions: Mapped[list] = mapped_column(JSONType, default=list)  # [{text,bid,by,at}]
     status: Mapped[str] = mapped_column(String(20), default="pending_review", index=True)
-    # pending_review | generation_failed | approved | rejected | submitted |
-    # queued_for_browser (upwork: awaiting external browser worker) | failed
+    # pending_review | generation_failed | approved | submitting | rejected |
+    # submitted | queued_for_browser (upwork: awaiting external browser worker) | failed
     rejection_reason: Mapped[str | None] = mapped_column(String(50), nullable=True)
     rejection_notes: Mapped[str] = mapped_column(Text, default="")
     outcome: Mapped[str] = mapped_column(String(20), default="pending")

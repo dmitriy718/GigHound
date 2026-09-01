@@ -228,6 +228,7 @@ export interface PlatformAccount {
 export type ProposalStatus =
   | 'pending_review'
   | 'approved'
+  | 'submitting' // in-flight submit (atomic claim); transient — excluded from filter dropdown
   | 'rejected'
   | 'queued_for_browser' // Upwork: waiting on the external browser worker; flips to 'submitted' when done
   | 'submitted'
