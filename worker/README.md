@@ -28,9 +28,11 @@ poll GET /api/gigs/stealth-tasks?platform=&status=pending   (worker token, all t
 
 ```bash
 python3 -m venv worker/.venv
-worker/.venv/bin/pip install -r worker/requirements.txt
+worker/.venv/bin/pip install -r worker/requirements-dev.txt   # runtime + test deps
 worker/.venv/bin/python -m playwright install chromium   # add --with-deps on a fresh Linux
 ```
+
+(`requirements.txt` alone is the runtime set the production image installs.)
 
 Python 3.12 is the supported runtime (the Dockerfile uses it). On Python 3.14
 use playwright ≥ 1.49 — 1.45 pins a greenlet that doesn't build there.
@@ -50,7 +52,9 @@ use playwright ≥ 1.49 — 1.45 pins a greenlet that doesn't build there.
 | `WORKER_POLL_INTERVAL_SEC` / `WORKER_POLL_JITTER_SEC` | `45` / `15` | poll pacing (≈30–60s) |
 | `WORKER_TIMEZONE` / `WORKER_LOCALE` | `America/New_York` / `en-US` | browser fingerprint defaults (per-account `timezone`/`locale` account settings override) |
 | `WORKER_ACTIVE_HOURS` | `8-23` | circadian window (hours in `WORKER_TIMEZONE`); scrape/fetch tasks stay queued outside it, submit tasks always run. Empty/`off` disables |
+| `WORKER_TASK_TIMEOUT_SEC` | `600` | per-task wall-clock budget; a task that exceeds it is failed with `{"error": "task timeout"}` (enforced at pacing checkpoints — the Playwright sync API is thread-affine, so a hard cancel isn't possible) |
 | `WORKER_ALLOW_SUBMIT` | unset (off) | final-submit gate — see safety model |
+| `WORKER_ALLOW_SUBMIT_{PLATFORM}` | falls back to `WORKER_ALLOW_SUBMIT` | per-platform override of the final-submit gate, e.g. `WORKER_ALLOW_SUBMIT_UPWORK=1` opens submit for Upwork only |
 
 Run: `worker/.venv/bin/python -m worker` (or `--once` for a single sweep).
 
@@ -91,6 +95,14 @@ The worker keeps one persistent Chromium profile per `(platform, user_id)` under
 If a session expires, tasks will start failing with `captcha: true`/login
 redirects — re-enroll via the UI or re-run the login utility.
 
+**One worker per `worker_sessions` volume.** Never scale the worker by
+pointing two replicas at the same session volume: two Chromiums on one
+`user_data_dir` corrupt the profile lock and put one account in two browsers
+at once (a linkage/ban risk). Run one worker per volume (or per-worker named
+volumes). At context launch the worker logs a loud warning when the profile's
+Chromium `SingletonLock` is held by a live process — treat that warning as a
+misconfiguration, not noise.
+
 ## Safety model (HITL boundary)
 
 - The worker only executes tasks the **backend** creates, and submission tasks
@@ -107,7 +119,9 @@ redirects — re-enroll via the UI or re-run the login utility.
 - `submit_proposal` (PeoplePerHour/Guru) and `submit_fiverr_offer` are
   **manual-assist**: they fill the form with human-like typing, take a
   screenshot, and stop. The final submit click happens only when the operator
-  sets `WORKER_ALLOW_SUBMIT=1`; the task result always records which happened.
+  opens the gate for that task's platform (`WORKER_ALLOW_SUBMIT_<PLATFORM>=1`,
+  falling back to the global `WORKER_ALLOW_SUBMIT=1`); the task result always
+  records which happened.
 - `submit_upwork_proposal` does click submit — that click *is* the approved
   action (agency BM flow for an approved queue item). Any challenge mid-flow
   escalates to a human instead of retrying.
@@ -147,8 +161,9 @@ typing-plan consumption.
 docker compose -f docker-compose.yml -f docker-compose.worker.yml up worker
 ```
 
-The override adds a `worker` service (python:3.12 + Chromium) that depends on
-the `backend` service — note the base `docker-compose.yml` currently has the
+The override adds a `worker` service (python:3.12 + Chromium, running as a
+non-root `gighound` user with runtime-only deps) that depends on the
+`backend` service — note the base `docker-compose.yml` currently has the
 backend service commented out; uncomment it (or point `GIGHOUND_API_URL` at a
 host backend) before bringing the worker up. The build context is `./worker`;
 `worker/.dockerignore` keeps local `.venv/`, `__pycache__/`, `.pytest_cache/`,

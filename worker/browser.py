@@ -175,8 +175,39 @@ class SessionExpiredError(Exception):
                          + (f": {detail}" if detail else ""))
 
 
+class TaskTimeoutError(Exception):
+    """The task blew its wall-clock budget (WORKER_TASK_TIMEOUT_SEC). Raised
+    from pacing checkpoints — see arm_task_deadline."""
+
+
+# Cooperative per-task deadline. A hard cancel would mean running the handler
+# on a worker thread, but the Playwright sync API is thread-affine: its
+# greenlet event loop is bound to the thread where sync_playwright() started
+# (main()), and any call from another thread dies with greenlet.error
+# ("Cannot switch to a different thread"). So instead every pacing checkpoint
+# (_sleep backs human_delay, type_with_plan's per-char cadence, mouse_wiggle —
+# the places a task actually burns wall-clock) checks the deadline and bails.
+# A wedge inside a single Playwright call is still bounded by Playwright's own
+# navigation/selector timeouts.
+_TASK_DEADLINE: float | None = None
+
+
+def arm_task_deadline(timeout_sec: float):
+    """Start the per-task wall-clock budget; <= 0 disables enforcement."""
+    global _TASK_DEADLINE
+    _TASK_DEADLINE = time.monotonic() + timeout_sec if timeout_sec > 0 else None
+
+
+def disarm_task_deadline():
+    global _TASK_DEADLINE
+    _TASK_DEADLINE = None
+
+
 def _sleep(seconds: float):
-    """Indirection so tests can patch out real sleeping."""
+    """Indirection so tests can patch out real sleeping. Also the pacing
+    checkpoint where the per-task wall-clock budget is enforced."""
+    if _TASK_DEADLINE is not None and time.monotonic() > _TASK_DEADLINE:
+        raise TaskTimeoutError("task exceeded WORKER_TASK_TIMEOUT_SEC")
     _real_sleep(seconds)
 
 
@@ -352,6 +383,7 @@ class BrowserManager:
             self._last_used[key] = self._now()
             return self._contexts[key]
         user_data_dir = _mkdir_private(self.session_dir_for(platform, user_id))
+        self._warn_if_profile_locked(platform, user_id, user_data_dir)
         # fetch the enrolled session before launch: it may pin a per-account
         # proxy and per-account fingerprint geo (timezone/locale), both of
         # which must be known when the context is created
@@ -447,9 +479,48 @@ class BrowserManager:
                  platform, user_id)
 
     def new_page(self, platform: str, user_id: int):
-        context = self.get_context(platform, user_id)
-        page = context.pages[0] if context.pages else context.new_page()
-        return page
+        """A FRESH page on the (platform, user) context — never a reused one:
+        a crashed task's leftover DOM state (open modal, half-filled form)
+        must not leak into the next task. Pages accumulate on the context
+        until the runner calls close_pages after each task."""
+        return self.get_context(platform, user_id).new_page()
+
+    def close_pages(self, platform: str, user_id: int):
+        """Close every page on the (platform, user) context (task hygiene:
+        called by the runner after each task). Best-effort per page."""
+        context = self._contexts.get((platform, user_id))
+        if context is None:
+            return
+        for page in list(context.pages):
+            try:
+                page.close()
+            except Exception as exc:  # noqa: BLE001
+                log.debug("page close failed for %s/user %s: %s",
+                          platform, user_id, exc)
+
+    def _warn_if_profile_locked(self, platform: str, user_id: int,
+                                user_data_dir: Path):
+        """Loud warning when the profile dir looks claimed by a LIVE Chromium
+        — the signature of two workers sharing one worker_sessions volume
+        (profile-lock corruption + one account active from two browsers).
+        Warning-only: a stale SingletonLock after a crash is normal and
+        Chromium cleans it up itself."""
+        lock = user_data_dir / "SingletonLock"
+        try:
+            pid = int(lock.readlink().rsplit("-", 1)[-1])
+        except (ValueError, OSError):
+            return  # no lock (or not a Chromium symlink) — nothing to check
+        try:
+            os.kill(pid, 0)  # raises ProcessLookupError when the holder is dead
+        except ProcessLookupError:
+            return  # stale lock after a crash — Chromium cleans it up itself
+        except PermissionError:
+            pass  # alive, owned by another user — still a live holder
+        log.warning("%s/user %s profile %s is locked by LIVE pid %d — is a "
+                    "second worker sharing this worker_sessions volume? Two "
+                    "Chromiums on one user_data_dir corrupt the profile and "
+                    "put one account in two browsers at once",
+                    platform, user_id, user_data_dir, pid)
 
     def close_session(self, platform: str, user_id: int):
         context = self._contexts.pop((platform, user_id), None)

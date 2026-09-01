@@ -33,8 +33,13 @@ class Config:
     headless: bool = field(default_factory=lambda: _bool("WORKER_HEADLESS", True))
     session_dir: Path = field(default_factory=lambda: Path(os.getenv(
         "WORKER_SESSION_DIR", str(Path(__file__).parent / ".sessions"))))
-    # final-submit gate for manual-assist handlers (see README safety model)
+    # final-submit gate for manual-assist handlers (see README safety model);
+    # global default — WORKER_ALLOW_SUBMIT_<PLATFORM> overrides per platform
     allow_submit: bool = field(default_factory=lambda: _bool("WORKER_ALLOW_SUBMIT", False))
+    # per-task wall-clock budget, enforced at pacing checkpoints (worker loop
+    # is single-threaded; see browser.arm_task_deadline)
+    task_timeout_sec: float = field(default_factory=lambda: float(
+        os.getenv("WORKER_TASK_TIMEOUT_SEC", "600")))
     poll_interval_sec: float = field(default_factory=lambda: float(
         os.getenv("WORKER_POLL_INTERVAL_SEC", "45")))
     poll_jitter_sec: float = field(default_factory=lambda: float(
@@ -68,6 +73,15 @@ class Config:
     def proxy_for(self, platform: str) -> str | None:
         """Per-platform proxy URL, e.g. WORKER_PROXY_UPWORK=http://user:pass@host:port"""
         return os.getenv(f"WORKER_PROXY_{platform.upper()}") or None
+
+    def allow_submit_for(self, platform: str) -> bool:
+        """Per-platform final-submit gate: WORKER_ALLOW_SUBMIT_<PLATFORM>
+        (e.g. WORKER_ALLOW_SUBMIT_UPWORK=1) wins; the global
+        WORKER_ALLOW_SUBMIT is the fallback default."""
+        v = os.getenv(f"WORKER_ALLOW_SUBMIT_{platform.upper()}")
+        if v:  # an empty value (e.g. compose passthrough default) means unset
+            return v.lower() in ("1", "true", "yes", "on")
+        return self.allow_submit
 
     def validate(self) -> None:
         if not self.worker_token:

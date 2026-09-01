@@ -37,9 +37,13 @@ class FakeClient:
 class FakeBrowser:
     def __init__(self):
         self.reaps = 0
+        self.pages_closed = []
 
     def reap_idle_contexts(self):
         self.reaps += 1
+
+    def close_pages(self, platform, user_id):
+        self.pages_closed.append((platform, user_id))
 
 
 def make_ctx(client):
@@ -109,6 +113,47 @@ def test_handler_crash_reports_failure(monkeypatch):
     assert outcome["success"] is False
     assert "selector drifted" in outcome["result"]["error"]
     assert outcome["result"]["error_type"] == "RuntimeError"
+
+
+def test_pages_closed_after_task(monkeypatch):
+    """Task hygiene: the task's pages are closed whether it succeeds or
+    fails, so leftover DOM state never leaks into the next task."""
+    client = FakeClient()
+    ctx = make_ctx(client)
+    monkeypatch.setattr(runner, "get_handler", lambda tt: ok_handler)
+    runner.process_task(StealthTaskOut(id=10, user_id=1, platform="fiverr",
+                                       task_type="scrape_gig_metrics"), ctx)
+    assert ctx.browser.pages_closed == [("fiverr", 1)]
+
+    def crashing(task, ctx):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner, "get_handler", lambda tt: crashing)
+    runner.process_task(StealthTaskOut(id=11, user_id=1, platform="fiverr",
+                                       task_type="scrape_gig_metrics"), ctx)
+    assert ctx.browser.pages_closed == [("fiverr", 1), ("fiverr", 1)]
+
+
+def test_task_timeout_reports_failure(monkeypatch):
+    """A handler that burns past WORKER_TASK_TIMEOUT_SEC is cut off at the
+    next pacing checkpoint and reported as a timeout failure."""
+    from worker import browser
+    client = FakeClient()
+
+    def handler(task, ctx):
+        browser._real_sleep(0.2)  # e.g. wedged mid typing-plan
+        browser._sleep(0)  # the next pacing checkpoint raises TaskTimeoutError
+
+    monkeypatch.setattr(runner, "get_handler", lambda tt: handler)
+    ctx = make_ctx(client)
+    ctx.config.task_timeout_sec = 0.05
+    runner.process_task(StealthTaskOut(id=12, user_id=1, platform="fiverr",
+                                       task_type="scrape_gig_metrics"), ctx)
+    outcome = client.completed[0]
+    assert outcome["success"] is False
+    assert outcome["result"] == {"error": "task timeout", "timeout_sec": 0.05}
+    assert browser._TASK_DEADLINE is None  # disarmed for the next task
+    assert ctx.browser.pages_closed == [("fiverr", 1)]
 
 
 def test_unknown_task_type_fails_task(monkeypatch):
