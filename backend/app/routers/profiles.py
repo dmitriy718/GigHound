@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from ..auth import get_current_user, get_owned, scoped
 from ..database import get_db
 from ..models import PortfolioItem, ProfileTemplate, RateCardEntry, User
+from ..ratelimit import check_llm_gen_rate
 from ..schemas import (PortfolioItemIn, PortfolioItemOut, ProfileTemplateIn,
                        ProfileTemplateOut, RateCardIn, RateCardOut)
 
@@ -34,6 +35,7 @@ async def generate_profile_template(body: dict, user: User = Depends(get_current
 
     prompt = (f"Platform: {platform}. Style notes: {notes or 'none'}. "
               f"Write the template now.")
+    check_llm_gen_rate(user)
     try:
         result = await generateText(
             _PROFILE_GEN_SYSTEM.format(platform=platform), prompt,

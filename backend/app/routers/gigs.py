@@ -17,6 +17,7 @@ from ..gig_analytics import (enqueue_metrics_scrape, record_metrics,
                              store_competitor_snapshot)
 from ..models import (AuditLog, Gig, GigMetric, GigTemplate, CompetitorSnapshot,
                       PlatformAccount, ProposalQueueItem, StealthTask, User)
+from ..ratelimit import check_llm_gen_rate
 from ..schemas import (CompetitorSnapshotOut, GigMetricIn, GigMetricOut,
                        GigOut, GigTemplateIn, GigTemplateOut,
                        Platform, StealthTaskClaimIn)
@@ -46,6 +47,7 @@ def seo_title_score(body: dict, user: User = Depends(get_current_user)):
 
 @router.post("/faqs/generate", response_model=dict)
 async def generate_faqs(body: dict, user: User = Depends(get_current_user)):
+    check_llm_gen_rate(user)
     faqs = await gt.generate_faqs(body.get("gig_type", ""), body.get("title", ""),
                                   int(body.get("count", 4)))
     return {"faqs": faqs}
@@ -149,12 +151,15 @@ def register_gig(body: dict, db: Session = Depends(get_db), user: User = Depends
     if platform not in get_args(Platform):
         raise HTTPException(422, f"unsupported platform {platform!r} — "
                                  f"must be one of {list(get_args(Platform))}")
+    template_id = body.get("template_id")
+    if template_id is not None and not get_owned(db, GigTemplate, template_id, user):
+        raise HTTPException(404, "gig template not found")
     gig = Gig(
         user_id=user.id,
         platform=platform, title=body.get("title", ""),
         external_id=body.get("external_id", ""), url=body.get("url", ""),
         status=body.get("status", "draft"), price_min=body.get("price_min"),
-        template_id=body.get("template_id"),
+        template_id=template_id,
     )
     db.add(gig)
     db.commit()

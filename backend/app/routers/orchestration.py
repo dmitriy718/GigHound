@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 from ..auth import get_current_user, get_owned, scoped
 from ..boolquery import BooleanQueryError, parse_boolean_query
 from ..database import get_db
-from ..models import PlatformAccount, SearchProfile, User
+from ..models import (KeywordGroup, PlatformAccount, SearchFilter,
+                      SearchProfile, User)
 from ..schemas import (PlatformAccountIn, PlatformAccountOut, SearchProfileIn,
                        SearchProfileOut)
 
@@ -19,9 +20,22 @@ def list_search_profiles(db: Session = Depends(get_db), user: User = Depends(get
     return scoped(db, SearchProfile, user).all()
 
 
+def _validate_refs(body: SearchProfileIn, db: Session, user: User):
+    """Referenced keyword group / filter must exist and belong to the caller
+    (404 either way — don't leak existence). Null clears the reference and is
+    always allowed (SearchProfileIn is a full-replacement schema)."""
+    if body.keyword_group_id is not None and not get_owned(
+            db, KeywordGroup, body.keyword_group_id, user):
+        raise HTTPException(404, "keyword group not found")
+    if body.filter_id is not None and not get_owned(
+            db, SearchFilter, body.filter_id, user):
+        raise HTTPException(404, "filter not found")
+
+
 @router.post("/search-profiles", response_model=SearchProfileOut, status_code=201)
 def create_search_profile(body: SearchProfileIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _validate_boolean(body.boolean_query)
+    _validate_refs(body, db, user)
     profile = SearchProfile(user_id=user.id, **body.model_dump())
     db.add(profile)
     db.commit()
@@ -35,6 +49,7 @@ def update_search_profile(profile_id: int, body: SearchProfileIn, db: Session = 
     profile = get_owned(db, SearchProfile, profile_id, user)
     if not profile:
         raise HTTPException(404, "search profile not found")
+    _validate_refs(body, db, user)
     for k, v in body.model_dump().items():
         setattr(profile, k, v)
     db.commit()

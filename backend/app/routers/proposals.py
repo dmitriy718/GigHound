@@ -14,6 +14,7 @@ from ..auth import (get_current_user, get_owned, platform_account_settings,
                     platform_enabled, scoped)
 from ..database import get_db
 from ..models import AuditLog, Job, ProposalQueueItem, Template, User
+from ..ratelimit import check_llm_gen_rate
 from ..schemas import (BulkApproveAction, InterviewPrepOut, JobOut, OutcomeAction,
                        ProposalQueueOut, ProposalRejectAction,
                        ProposalReviewAction, TemplateOut)
@@ -47,7 +48,7 @@ def list_proposals(status: str | None = Query(None),
     # batch-load the page's jobs in one query (no per-item db.get)
     jobs = {}
     if items:
-        jobs = {j.id: j for j in db.query(Job)
+        jobs = {j.id: j for j in scoped(db, Job, user)
                 .filter(Job.id.in_({i.job_id for i in items})).all()}
     _refresh_bid_advice(db, items, jobs)
     return {"items": [_with_job(i, jobs.get(i.job_id)) for i in items],
@@ -90,7 +91,7 @@ def get_proposal(item_id: int, db: Session = Depends(get_db), user: User = Depen
     item = get_owned(db, ProposalQueueItem, item_id, user)
     if not item:
         raise HTTPException(404, "proposal not found")
-    return _with_job(item, db.get(Job, item.job_id))
+    return _with_job(item, get_owned(db, Job, item.job_id, user))
 
 
 @router.post("/{item_id}/approve", response_model=ProposalQueueOut)
@@ -197,6 +198,7 @@ async def draft_follow_up(item_id: int, db: Session = Depends(get_db), user: Use
     if not job:
         raise HTTPException(404, "job not found")
     from .. import proposal_gen
+    check_llm_gen_rate(user)
     # release the pooled connection before the (potentially 120s) LLM await;
     # nothing is pending, and post-commit attribute access re-acquires briefly
     db.commit()
@@ -245,6 +247,7 @@ async def interview_prep(item_id: int, db: Session = Depends(get_db), user: User
     if not job:
         raise HTTPException(404, "job not found")
     from .. import proposal_gen
+    check_llm_gen_rate(user)  # cached responses above stay free
     # release the pooled connection before the (potentially 120s) LLM await
     db.commit()
     prep = await proposal_gen.generate_interview_prep(db, item, job)
@@ -347,6 +350,7 @@ async def generate_proposal_template(body: dict, db: Session = Depends(get_db), 
     )
     # release the pooled connection before the (potentially 120s) LLM await —
     # get_current_user already opened a transaction on this session
+    check_llm_gen_rate(user)
     db.commit()
     offline = False
     warning = None
@@ -509,7 +513,10 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
         item.status = "failed"
         item.submission_result = {"error": str(exc)}
         db.commit()
-        raise HTTPException(502, f"submission failed: {exc}")
+        # adapter/library exception strings leak upstream internals — the
+        # detail stays in the server log and the item's submission_result
+        log.exception("proposal submission failed for item %d", item.id)
+        raise HTTPException(502, "submission failed")
 
     # Upwork submissions wait for the external browser worker to confirm;
     # only Freelancer bids are truly "submitted" at this point.

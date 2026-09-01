@@ -10,6 +10,10 @@ from ..schemas import PreviewResult, SearchFilterIn, SearchFilterOut
 
 router = APIRouter(prefix="/api/filters", tags=["filters"])
 
+# Cap the preview scan: it's a count/sample over the most recent jobs, not an
+# export — excluded_count/matched only reflect the scanned window.
+PREVIEW_SCAN_LIMIT = 500
+
 
 def _apply(flt: SearchFilter, body: SearchFilterIn):
     data = body.model_dump()
@@ -72,7 +76,8 @@ def preview_filter(filter_id: int, db: Session = Depends(get_db),
     if cached:
         return cached
 
-    jobs = scoped(db, Job, user).filter(Job.status != "archived").all()
+    jobs = (scoped(db, Job, user).filter(Job.status != "archived")
+            .order_by(Job.fetched_at.desc()).limit(PREVIEW_SCAN_LIMIT).all())
     matched, excluded = [], 0
     for job in jobs:
         ok, _ = job_matches_filter(job, flt)
