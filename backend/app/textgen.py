@@ -24,6 +24,7 @@ import os
 import time
 
 import httpx
+import redis
 
 from .cache import cache
 
@@ -103,9 +104,15 @@ class _TokenBucket:
         window = int(time.time() // 60)
         if cache._r is not None:
             key = f"{self.KEY}:{window}"
-            count = cache._r.incr(key)
-            if count == 1:
-                cache._r.expire(key, 120)
+            try:
+                count = cache._r.incr(key)
+                if count == 1:
+                    cache._r.expire(key, 120)
+            except redis.RedisError as exc:
+                # fail open, matching the design where Redis-down at boot
+                # disables limiting — never block generation on the bucket
+                log.warning("Redis token bucket unavailable (%s); allowing request", exc)
+                return True
             return count <= rpm
         if window != self._local_window:
             self._local_window = window

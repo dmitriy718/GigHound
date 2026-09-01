@@ -566,7 +566,7 @@ def test_buyer_request_tick_skips_accountless_and_stacks_nothing(db, user, monke
     result = fiverr_buyer_request_tick_core()
     assert len(result["enqueued"]) == 1
     task = db.get(StealthTask, result["enqueued"][0])
-    assert task.task_type == "fiverr_fetch_buyer_requests"
+    assert task.task_type == "fetch_buyer_requests"
     assert task.payload == {"username": "seller1"}
 
     # a pending fetch already in flight → no duplicate stacking

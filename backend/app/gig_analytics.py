@@ -6,8 +6,12 @@ from sqlalchemy.orm import Session
 
 from . import circuit_breaker
 from .models import AuditLog, CompetitorSnapshot, Gig, GigMetric, StealthTask
+from .stealth import SCRAPE_GIG_METRICS
 
 log = logging.getLogger(__name__)
+
+# platforms the stealth-browser worker can actually serve (worker/platforms.py)
+WORKER_PLATFORMS = ("fiverr", "upwork", "peopleperhour", "guru")
 
 
 def record_metrics(db: Session, gig: Gig, impressions: int, clicks: int,
@@ -87,10 +91,16 @@ def enqueue_metrics_scrape(db: Session, user_id: int) -> list[StealthTask]:
     platforms = [p for (p,) in db.query(Gig.platform).filter(Gig.user_id == user_id).distinct().all()]
     tasks = []
     for platform in platforms:
+        if platform not in WORKER_PLATFORMS:
+            # the worker can't scrape this platform — don't mint stealth
+            # tasks that would pend forever
+            log.info("metrics scrape skipped for %s: not served by the worker",
+                     platform)
+            continue
         allowed, reason = circuit_breaker.check(platform, user_id)
         task = StealthTask(
             user_id=user_id,
-            platform=platform, task_type="gig_scrape_metrics",
+            platform=platform, task_type=SCRAPE_GIG_METRICS,
             payload={"gigs": [{"id": g.id, "url": g.url, "title": g.title}
                               for g in db.query(Gig).filter(
                                   Gig.user_id == user_id, Gig.platform == platform).all()]},

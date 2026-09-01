@@ -1,8 +1,9 @@
 """Stealth-task kinds and enqueue helpers (AD-4).
 
-Canonical task kinds the browser worker understands. Older enqueue paths
-still emit legacy type strings; the worker maps both via LEGACY_ALIASES, so
-existing rows keep working.
+Canonical task kinds the browser worker understands. All backend enqueue
+paths emit canonical kinds; the LEGACY_ALIASES map below exists only so
+rows queued by pre-AD-4 code stay executable — no backend code emits
+legacy type strings anymore.
 """
 from sqlalchemy.orm import Session
 
@@ -24,7 +25,8 @@ ALL_KINDS = (
     SUBMIT_PROPOSAL, SCRAPE_PROPOSAL_STATUS,
 )
 
-# legacy task_type → canonical kind (emitted by pre-AD-4 enqueue paths)
+# legacy task_type → canonical kind. No backend code emits these anymore —
+# kept so in-flight rows queued by pre-AD-4 paths still resolve.
 LEGACY_ALIASES = {
     "fiverr_fetch_buyer_requests": FETCH_BUYER_REQUESTS,
     "gig_scrape_metrics": SCRAPE_GIG_METRICS,

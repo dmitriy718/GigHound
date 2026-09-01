@@ -52,12 +52,16 @@ def due_digest_user_ids(db: Session, now: datetime | None = None) -> list[int]:
 
 
 def send_user_digest(db: Session, user_id: int) -> int:
-    """Send one user's digest. Returns the job count sent (0 when there is
-    nothing to report or the user has no settings row)."""
+    """Send one user's digest. Returns the job count actually emailed (0 when
+    there is nothing to report, the user has no settings row, or the send
+    was skipped — e.g. SMTP not configured — so the beat-reported `sent`
+    count never claims digests that were only logged)."""
     settings, jobs = digest_jobs_for_user(db, user_id)
     if settings is None or not jobs:
         return 0
-    send_digest_email(jobs, settings.digest_mode)
+    if not send_digest_email(jobs, settings.digest_mode):
+        log.warning("digest_mode active but SMTP not configured; digest not emailed")
+        return 0
     return len(jobs)
 
 
