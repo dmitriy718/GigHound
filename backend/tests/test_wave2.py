@@ -266,6 +266,15 @@ def test_proposal_status_endpoint_maps_and_completes(client, monkeypatch):
     assert sent[0]["type"] == "client_replied"
     assert sent[0]["proposal_id"] == reply_item.id
 
+    # the ingest is audit-logged with the task id and result counts
+    row = (db.query(AuditLog)
+           .filter(AuditLog.action_type == "proposal_status_ingested")
+           .one())
+    assert row.user_id == u.id and row.platform == "upwork"
+    assert row.detail["task_id"] == task.id
+    assert row.detail["results_count"] == 4
+    assert row.detail["outcomes"] == 2 and row.detail["replies"] == 1
+
     # idempotent repost: nothing re-applied, no duplicate broadcast/wins
     r = c.post("/api/gigs/proposal-status",
                json={"task_id": task.id, "results": results},
@@ -365,6 +374,15 @@ def test_proposal_status_endpoint_guards(client):
     assert c.post("/api/gigs/proposal-status",
                   json={"task_id": wrong_kind.id, "results": []},
                   headers=WORKER_HEADERS).status_code == 404
+
+    # a scrape task the worker has not claimed yet is not open for results
+    pending = _scrape_task(db, u.id, status="pending")
+    r = c.post("/api/gigs/proposal-status",
+               json={"task_id": pending.id, "results": []},
+               headers=WORKER_HEADERS)
+    assert r.status_code == 409
+    db.refresh(pending)
+    assert pending.status == "pending"
 
     # cross-tenant results and unknown statuses are skipped, not applied
     item = _item(db, u.id, job)

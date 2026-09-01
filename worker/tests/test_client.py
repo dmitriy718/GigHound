@@ -94,6 +94,7 @@ def test_complete_and_result_posts():
 
     client = make_client(handler)
     assert client.complete_task(1, True, {"fetched": 2})["status"] == "done"
+    assert b'"worker_id": "w-1"' in sent[0][2] or b'"worker_id":"w-1"' in sent[0][2]
     assert client.post_buyer_requests(5, [{"title": "x"}])["queued"] == 2
     assert b'"user_id": 5' in sent[-1][2] or b'"user_id":5' in sent[-1][2]
 
