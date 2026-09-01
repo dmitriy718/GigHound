@@ -522,6 +522,9 @@ def test_ingest_rate_limit(client, monkeypatch):
         def expire(self, key, ttl):
             pass
 
+        def get(self, key):  # JWT denylist lookups on the auth path
+            return None
+
         def scan_iter(self, pattern):
             return iter([])
 

@@ -41,7 +41,16 @@ templates) — the API stays functional and marks responses `"offline": true`.
 | `REDIS_URL` | `redis://localhost:6379/0` | Cache, rate buckets, circuit breaker, openings pool. Graceful no-op fallback when down. |
 | `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated. |
 | `CACHE_TTL_SECONDS` | `300` | TTL for the Redis-backed response cache; graceful no-op when Redis is down. |
-| `GIGHOUND_VAULT_KEY` | — | Fernet key for the credential vault. **Mandatory outside dev mode**: first vault use fails fast without it, unless `GIGHOUND_DEV_NOAUTH=1` (dev then generates a key persisted to `backend/.vault-dev-key`, mode 0600, gitignored). Legacy alias `GIGHUNTER_VAULT_KEY` accepted. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+| `GIGHOUND_VAULT_KEY` | — | Fernet key for the credential vault. **Mandatory outside dev mode**: startup fails fast without it (`validate_auth_config`), unless `GIGHOUND_DEV_NOAUTH=1` (dev then generates a key persisted to `backend/.vault-dev-key`, mode 0600, gitignored). Legacy alias `GIGHUNTER_VAULT_KEY` accepted. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+
+### Vault key rotation
+
+The vault uses a single global Fernet key — there is no multi-key support
+yet, so rotating the key makes every stored credential blob unreadable
+(decrypt fails with `InvalidToken` → "re-enroll credentials"). To rotate:
+generate a new key, deploy it as `GIGHOUND_VAULT_KEY`, then have every user
+re-enroll their platform credentials (`POST /api/accounts/{id}/credentials`).
+Until re-enrollment, credential-dependent adapters fail with an auth error.
 
 ## Auth & tenancy
 

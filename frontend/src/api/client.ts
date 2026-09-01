@@ -69,6 +69,13 @@ export const setOnUnauthorized = (fn: (() => void) | null) => {
   onUnauthorized = fn;
 };
 
+// Same effect as a 401 in request(): clear the token and drop the session.
+// Used by the WS hook when the server closes the socket with 4401.
+export const forceUnauthorized = () => {
+  clearToken();
+  onUnauthorized?.();
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   const token = getToken();
@@ -211,6 +218,9 @@ export const sendDigest = () =>
   request<{ jobs_in_digest: number; emailed: boolean }>('/api/alerts/digest/send', {
     method: 'POST',
   });
+// One-time WS auth ticket — keeps the JWT out of the WS query string (access logs).
+export const getWsTicket = () =>
+  request<{ ticket: string }>('/api/alerts/ws-ticket', { method: 'POST' });
 
 // ---- Profile management ----
 

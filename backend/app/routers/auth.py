@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from ..auth import (create_access_token, get_current_user, hash_password,
-                    verify_password)
+                    invalidate_user_tokens, revoke_token, verify_password)
 from ..cache import cache
 from ..config import ALLOW_REGISTRATION
 from ..database import get_db
@@ -73,22 +73,37 @@ def me(user: User = Depends(get_current_user)):
     return user
 
 
+def _bearer_token(request: Request) -> str | None:
+    """Raw JWT from the Authorization header of the current request."""
+    auth = request.headers.get("Authorization", "")
+    return auth[7:] if auth.startswith("Bearer ") else None
+
+
 @router.post("/logout", response_model=dict)
-def logout(user: User = Depends(get_current_user)):
-    """Stateless JWTs are discarded client-side; this endpoint only
-    acknowledges the logout (no server-side revocation in v1)."""
+def logout(request: Request, user: User = Depends(get_current_user)):
+    """Revoke the current token (jti denylist until its exp). Fail-open when
+    Redis is down: the token then stays valid until it expires naturally."""
+    token = _bearer_token(request)
+    if token:
+        revoke_token(token)
     return {"status": "ok"}
 
 
 @router.post("/password", response_model=dict)
-def change_password(body: PasswordChangeIn, db: Session = Depends(get_db),
+def change_password(body: PasswordChangeIn, request: Request,
+                    db: Session = Depends(get_db),
                     user: User = Depends(get_current_user)):
-    """Change the account password. Existing tokens stay valid (stateless JWTs);
-    the client should re-login at its convenience."""
+    """Change the account password. Revokes the current token and invalidates
+    every other outstanding token of this user (per-user not-before), so all
+    clients must re-login. Fail-open when Redis is down."""
     if not verify_password(body.current_password, user.password_hash):
         raise HTTPException(400, "current password is incorrect")
     user.password_hash = hash_password(body.new_password)
     db.commit()
+    token = _bearer_token(request)
+    if token:
+        revoke_token(token)
+    invalidate_user_tokens(user.id)
     return {"status": "ok"}
 
 
