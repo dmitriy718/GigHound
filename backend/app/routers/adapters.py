@@ -177,7 +177,7 @@ def upwork_submit_proposal(body: QueueItemAction, db: Session = Depends(get_db),
     except AdapterError as exc:
         raise HTTPException(400, str(exc))
     # handoff to the stealth-browser worker (AD-4)
-    enqueue_stealth_task(db, user.id, "upwork", SUBMIT_UPWORK_PROPOSAL, {
+    stealth_task = enqueue_stealth_task(db, user.id, "upwork", SUBMIT_UPWORK_PROPOSAL, {
         "job_external_id": job.external_id,
         "job_url": job.url,
         "proposal_text": item.proposal_text,
@@ -188,6 +188,18 @@ def upwork_submit_proposal(body: QueueItemAction, db: Session = Depends(get_db),
         "bid_amount": item.bid_amount,
         "proposal_queue_item_id": item.id,
     })
+    if stealth_task is None or stealth_task.status == "skipped_circuit_open":
+        # circuit open: no worker will ever run this task — leave the item
+        # approved so it stays submittable once the circuit closes
+        reason = ((stealth_task.result or {}).get("reason", "")
+                  if stealth_task is not None else "")
+        if not reason:
+            from .. import circuit_breaker
+            reason = circuit_breaker.check("upwork")[1] or "upwork circuit is open"
+        raise HTTPException(409, reason)
+    # same status contract as routers/proposals.py submit: task completion
+    # (gigs.py _apply_submission_outcome) only flips queued_for_browser items
+    item.status = "queued_for_browser"
     db.add(AuditLog(user_id=user.id, action_type="proposal_queued", platform="upwork", detail={
         "proposal_queue_item_id": item.id, "job_external_id": job.external_id,
         "approved_by": item.reviewed_by, "record_status": record.get("status"),

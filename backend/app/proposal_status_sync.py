@@ -87,9 +87,13 @@ def enqueue_platform_status_scrapes(db: Session,
             checks.append({"proposal_queue_item_id": i.id,
                            "job_external_id": job.external_id if job else "",
                            "job_url": job.url if job else ""})
-        tasks.append(enqueue_stealth_task(db, user_id, platform,
-                                          SCRAPE_PROPOSAL_STATUS,
-                                          {"items": checks}))
+        task = enqueue_stealth_task(db, user_id, platform,
+                                    SCRAPE_PROPOSAL_STATUS,
+                                    {"items": checks})
+        # skipped_circuit_open rows are recorded for UI visibility but will
+        # never run — don't report them as enqueued work
+        if task.status == "pending":
+            tasks.append(task)
     return tasks
 
 

@@ -426,6 +426,10 @@ class StealthTask(Base):
     # pending | claimed | done | failed | skipped_circuit_open
     claimed_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # times the reaper (app.tasks.stealth_reaper_tick) reset a dead worker's
+    # claim back to pending; >= STEALTH_MAX_RECLAIMS → failed for good
+    reclaim_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0,
+                                               server_default="0")
     result: Mapped[dict] = mapped_column(JSONType, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

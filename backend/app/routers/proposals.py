@@ -453,7 +453,7 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
             # handoff to the stealth-browser worker (AD-4): it executes the
             # agency BM submission and completes this task, which flips the
             # item out of queued_for_browser.
-            enqueue_stealth_task(db, user.id, "upwork", SUBMIT_UPWORK_PROPOSAL, {
+            stealth_task = enqueue_stealth_task(db, user.id, "upwork", SUBMIT_UPWORK_PROPOSAL, {
                 "job_external_id": job.external_id,
                 "job_url": job.url,
                 "proposal_text": item.proposal_text,
@@ -464,6 +464,15 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
                 "bid_amount": item.bid_amount,
                 "proposal_queue_item_id": item.id,
             })
+            if stealth_task is None or stealth_task.status == "skipped_circuit_open":
+                # circuit open: the task will never run — leave the item
+                # approved instead of stranding it in queued_for_browser
+                reason = ((stealth_task.result or {}).get("reason", "")
+                          if stealth_task is not None else "")
+                if not reason:
+                    from .. import circuit_breaker
+                    reason = circuit_breaker.check("upwork")[1] or "upwork circuit is open"
+                raise HTTPException(409, reason)
         else:
             raise HTTPException(
                 501,
