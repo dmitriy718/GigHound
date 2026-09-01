@@ -14,7 +14,7 @@ from app.adapters.vault import CredentialVault
 from app.auth import create_access_token, hash_password
 from app.database import Base, get_db
 from app.main import app
-from app.models import AuditLog, PlatformAccount, User
+from app.models import AuditLog, PlatformAccount, StealthTask, User
 
 WORKER_HEADERS = {"Authorization": "Bearer test-worker-token"}
 
@@ -65,6 +65,16 @@ def _account(db, user_id, platform="fiverr", principal="default", credential_ref
     db.add(a)
     db.commit()
     return a
+
+
+def _claimed_task(db, user_id, platform="fiverr"):
+    """Session reads are scoped to an active claim (the worker fetches the
+    session only while executing a claimed task)."""
+    t = StealthTask(user_id=user_id, platform=platform, task_type="fetch_metrics",
+                    payload={}, status="claimed", claimed_by="w-1")
+    db.add(t)
+    db.commit()
+    return t
 
 
 # ---------------- enroll / status / delete ----------------
@@ -157,6 +167,7 @@ def test_enroll_upwork_browser_session(client):
     assert r.json()["keys"] == ["storage_state_json"]
 
     # and the worker can actually consume it via the stealth-session endpoint
+    _claimed_task(db, u.id, platform="upwork")
     r = c.get(f"/api/gigs/stealth-session?platform=upwork&user_id={u.id}",
               headers=WORKER_HEADERS)
     assert r.json()["storage_state"] == STORAGE_STATE
@@ -352,6 +363,7 @@ def test_stealth_session_returns_enrolled_state(client):
                headers=_headers(u))
     assert r.status_code == 204
 
+    _claimed_task(db, u.id)
     r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
               headers=WORKER_HEADERS)
     assert r.status_code == 200, r.text
@@ -359,11 +371,62 @@ def test_stealth_session_returns_enrolled_state(client):
     assert body["credentials_present"] is True
     assert body["storage_state"] == STORAGE_STATE
 
+    # the read is audit-logged (never with the session data itself)
+    row = (db.query(AuditLog)
+           .filter(AuditLog.action_type == "stealth_session_read")
+           .one())
+    assert row.user_id == u.id and row.platform == "fiverr"
+    assert row.detail["worker"] == "worker"
+    assert "abc123secret" not in json.dumps(row.detail)
+
+
+def test_stealth_session_requires_claimed_task(client):
+    c, Session = client
+    db = Session()
+    u = _user(db, "noclaim@example.com")
+    acct = _account(db, u.id, platform="fiverr")
+    r = c.post(f"/api/accounts/{acct.id}/credentials",
+               json={"secrets": {"storage_state_json": json.dumps(STORAGE_STATE)}},
+               headers=_headers(u))
+    assert r.status_code == 204
+
+    # no active claim → the session stays sealed
+    r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
+              headers=WORKER_HEADERS)
+    assert r.status_code == 409
+
+    # a claim for another platform or tenant does not unseal it
+    _claimed_task(db, u.id, platform="upwork")
+    r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
+              headers=WORKER_HEADERS)
+    assert r.status_code == 409
+
+
+def test_stealth_session_mode_disabled_rejected(client):
+    c, Session = client
+    db = Session()
+    u = _user(db, "killSwitch@example.com")
+    acct = _account(db, u.id, platform="fiverr")
+    r = c.post(f"/api/accounts/{acct.id}/credentials",
+               json={"secrets": {"storage_state_json": json.dumps(STORAGE_STATE)}},
+               headers=_headers(u))
+    assert r.status_code == 204
+    acct.mode = "disabled"
+    db.commit()
+
+    # kill switch wins even while a task is claimed
+    _claimed_task(db, u.id)
+    r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
+              headers=WORKER_HEADERS)
+    assert r.status_code == 409
+    assert "disabled" in r.json()["detail"]
+
 
 def test_stealth_session_null_when_absent(client):
     c, Session = client
     db = Session()
     u = _user(db, "nosession@example.com")
+    _claimed_task(db, u.id)
 
     r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
               headers=WORKER_HEADERS)

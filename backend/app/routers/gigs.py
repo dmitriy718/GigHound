@@ -15,7 +15,7 @@ from ..auth import (get_current_user, get_owned, get_worker,
 from ..database import get_db
 from ..gig_analytics import (enqueue_metrics_scrape, record_metrics,
                              store_competitor_snapshot)
-from ..models import (Gig, GigMetric, GigTemplate, CompetitorSnapshot,
+from ..models import (AuditLog, Gig, GigMetric, GigTemplate, CompetitorSnapshot,
                       PlatformAccount, ProposalQueueItem, StealthTask, User)
 from ..schemas import (CompetitorSnapshotOut, GigMetricIn, GigMetricOut,
                        GigOut, GigTemplateIn, GigTemplateOut,
@@ -255,16 +255,41 @@ def get_stealth_session(platform: str, user_id: int, db: Session = Depends(get_d
     comes from the explicit user_id — the worker pool serves all tenants,
     same as stealth-task polling. Secret values other than the storage_state
     itself are never returned.
+
+    The read is scoped to an active claim: the worker only fetches a session
+    while executing a claimed task for this (platform, user_id), so without
+    one the session stays sealed. Every read is audit-logged.
     """
     from ..adapters.vault import CredentialVault
+    claimed = (db.query(StealthTask)
+               .filter(StealthTask.user_id == user_id,
+                       StealthTask.platform == platform,
+                       StealthTask.status == "claimed")
+               .first())
+    if claimed is None:
+        raise HTTPException(409, "no claimed stealth task for this platform/user — "
+                                 "sessions are only served while a task is executing")
+    db.add(AuditLog(user_id=user_id, action_type="stealth_session_read",
+                    platform=platform,
+                    detail={"task_id": claimed.id, "worker": worker}))
+    db.commit()
     account = (db.query(PlatformAccount)
                .filter(PlatformAccount.user_id == user_id,
                        PlatformAccount.platform == platform,
                        PlatformAccount.enabled.is_(True),
+                       PlatformAccount.mode != "disabled",
                        PlatformAccount.credential_ref != "")
                .order_by(PlatformAccount.created_at)
                .first())
     if not account:
+        disabled = (db.query(PlatformAccount)
+                    .filter(PlatformAccount.user_id == user_id,
+                            PlatformAccount.platform == platform,
+                            PlatformAccount.mode == "disabled")
+                    .first())
+        if disabled:
+            raise HTTPException(
+                409, f"platform '{platform}' is disabled — enable it on the Accounts page")
         return {"storage_state": None, "credentials_present": False}
     creds = CredentialVault(db, user_id).load(platform, account.principal)
     if not creds:
@@ -325,10 +350,11 @@ def complete_stealth_task(task_id: int, body: dict, db: Session = Depends(get_db
     task = db.get(StealthTask, task_id)
     if not task:
         raise HTTPException(404, "stealth task not found")
-    # claimed→done/failed is the normal path; pending→done/failed kept for
-    # backward compatibility with pre-claim workers.
-    if task.status not in ("claimed", "pending"):
+    # only the claiming worker may complete its own task
+    if task.status != "claimed":
         raise HTTPException(409, f"stealth task already {task.status}")
+    if task.claimed_by != body.get("worker_id"):
+        raise HTTPException(409, "stealth task claimed by another worker")
     success = body.get("success", True)
     now = datetime.now(timezone.utc)
     task.status = "done" if success else "failed"
@@ -351,6 +377,10 @@ def complete_stealth_task(task_id: int, body: dict, db: Session = Depends(get_db
                 f"{recent_failures} stealth task failures in the last hour",
                 user_id=task.user_id)
     _apply_submission_outcome(db, task, success)
+    db.add(AuditLog(user_id=task.user_id, action_type="stealth_task_completed",
+                    platform=task.platform,
+                    detail={"task_id": task.id, "worker_id": task.claimed_by,
+                            "success": success}))
     db.commit()
     return {"id": task.id, "status": task.status}
 
@@ -399,13 +429,22 @@ async def ingest_proposal_status(body: dict, db: Session = Depends(get_db),
     task = db.get(StealthTask, task_id)
     if task is None or task.task_type != SCRAPE_PROPOSAL_STATUS:
         raise HTTPException(404, "scrape_proposal_status task not found")
+    # the worker posts while it holds the claim; "done" is accepted so an
+    # idempotent repost after server-side completion stays a no-op
+    if task.status not in ("claimed", "done"):
+        raise HTTPException(409, f"scrape_proposal_status task is '{task.status}', "
+                                 "not claimed")
 
     summary = await apply_proposal_status_results(db, task, results)
-    if task.status in ("pending", "claimed"):
+    db.add(AuditLog(user_id=task.user_id, action_type="proposal_status_ingested",
+                    platform=task.platform,
+                    detail={"task_id": task.id, "results_count": len(results),
+                            **summary}))
+    if task.status == "claimed":
         task.status = "done"
         task.result = {"results_count": len(results), **summary}
         task.completed_at = datetime.now(timezone.utc)
-        db.commit()
+    db.commit()
     return {"task_id": task.id, "task_status": task.status, **summary}
 
 

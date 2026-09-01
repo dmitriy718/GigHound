@@ -99,7 +99,8 @@ class WorkerClient:
 
     def complete_task(self, task_id: int, success: bool, result: dict) -> dict:
         resp = self._request("POST", f"/api/gigs/stealth-tasks/{task_id}/complete",
-                             json={"success": success, "result": result})
+                             json={"worker_id": self.worker_id,
+                                   "success": success, "result": result})
         return resp.json()
 
     # ---------------- result posting ----------------
