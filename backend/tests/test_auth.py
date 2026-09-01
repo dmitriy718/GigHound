@@ -208,3 +208,103 @@ def test_ws_accepts_valid_token(client):
     token = _register(c, "ws@example.com")["access_token"]
     with c.websocket_connect(f"/ws/alerts?token={token}") as ws:
         ws.send_text("ping")  # server keeps the socket open for pings
+
+
+# ---------------- revocation & WS tickets (Redis-backed) ----------------
+
+@pytest.fixture()
+def redis_up():
+    """Revocation/ticket tests need the real Redis (db 15 per conftest)."""
+    import redis as redis_lib
+
+    from app.config import REDIS_URL
+    try:
+        redis_lib.Redis.from_url(REDIS_URL, socket_timeout=1).ping()
+    except Exception:
+        pytest.skip("Redis unavailable")
+
+
+def test_old_passlib_hash_still_verifies():
+    """Hashes produced by the retired passlib path are standard $2b$ bcrypt
+    and must keep verifying under the direct-bcrypt implementation."""
+    old = "$2b$12$2HMjFLG/UWchPFKEcdw4K.r2rCFcl77hcxsCNtWxm0f5egU7YCcF6"
+    assert verify_password("correct horse battery staple", old) is True
+    assert verify_password("wrong", old) is False
+
+
+def test_logout_revokes_token(client, redis_up):
+    c, _ = client
+    token = _register(c, "logout@example.com")["access_token"]
+    assert c.get("/api/auth/me", headers=_auth(token)).status_code == 200
+    assert c.post("/api/auth/logout", headers=_auth(token)).status_code == 200
+    # the same token is rejected afterwards (jti denylist)
+    assert c.get("/api/auth/me", headers=_auth(token)).status_code == 401
+
+
+def test_change_password_revokes_tokens(client, redis_up):
+    c, _ = client
+    token = _register(c, "pwrev@example.com", password="old-password")["access_token"]
+    # a second outstanding token minted "in the past" for the same user
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    old_token = jwt.encode({"sub": decode_token(token)["sub"],
+                            "email": "pwrev@example.com", "jti": "old-jti",
+                            "iat": past, "exp": past + timedelta(hours=12)},
+                           SECRET_KEY, algorithm="HS256")
+    assert c.get("/api/auth/me", headers=_auth(old_token)).status_code == 200
+
+    r = c.post("/api/auth/password", headers=_auth(token),
+               json={"current_password": "old-password",
+                     "new_password": "new-password-1"})
+    assert r.status_code == 200
+    # current token dies via the jti denylist, the other via per-user not-before
+    assert c.get("/api/auth/me", headers=_auth(token)).status_code == 401
+    assert c.get("/api/auth/me", headers=_auth(old_token)).status_code == 401
+    # new login works and its token is valid
+    r = c.post("/api/auth/login",
+               json={"email": "pwrev@example.com", "password": "new-password-1"})
+    assert r.status_code == 200
+    new_token = r.json()["access_token"]
+    assert c.get("/api/auth/me", headers=_auth(new_token)).status_code == 200
+
+
+def test_ws_ticket_single_use(client, redis_up):
+    c, _ = client
+    token = _register(c, "ticket@example.com")["access_token"]
+    assert c.post("/api/alerts/ws-ticket").status_code == 401  # auth required
+    r = c.post("/api/alerts/ws-ticket", headers=_auth(token))
+    assert r.status_code == 200
+    ticket = r.json()["ticket"]
+    with c.websocket_connect(f"/ws/alerts?ticket={ticket}") as ws:
+        ws.send_text("ping")
+    # second use of the same ticket → rejected; unknown ticket → rejected
+    with pytest.raises(WebSocketDisconnect):
+        with c.websocket_connect(f"/ws/alerts?ticket={ticket}"):
+            pass
+    with pytest.raises(WebSocketDisconnect):
+        with c.websocket_connect("/ws/alerts?ticket=bogus"):
+            pass
+
+
+# ---------------- startup config validation ----------------
+
+def test_validate_auth_config_vault_key(monkeypatch):
+    from cryptography.fernet import Fernet
+
+    from app.auth import validate_auth_config
+    monkeypatch.delenv("GIGHOUND_VAULT_KEY", raising=False)
+    monkeypatch.delenv("GIGHUNTER_VAULT_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="GIGHOUND_VAULT_KEY is not set"):
+        validate_auth_config()
+    monkeypatch.setenv("GIGHOUND_VAULT_KEY", "not-a-fernet-key")
+    with pytest.raises(RuntimeError, match="not a valid Fernet key"):
+        validate_auth_config()
+    monkeypatch.setenv("GIGHOUND_VAULT_KEY", Fernet.generate_key().decode())
+    validate_auth_config()  # valid key accepted
+
+
+def test_validate_auth_config_vault_dev_fallback(monkeypatch):
+    from app.auth import validate_auth_config
+    monkeypatch.setattr("app.auth.DEV_NOAUTH", True)
+    monkeypatch.delenv("GIGHOUND_VAULT_KEY", raising=False)
+    monkeypatch.delenv("GIGHUNTER_VAULT_KEY", raising=False)
+    validate_auth_config()  # dev mode: ephemeral .vault-dev-key fallback, no raise

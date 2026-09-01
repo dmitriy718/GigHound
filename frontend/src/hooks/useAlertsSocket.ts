@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { wsUrl } from '../api/client';
+import { forceUnauthorized, getWsTicket, wsUrl } from '../api/client';
 import type { Job } from '../types';
 
 export type AlertMessage =
@@ -16,7 +16,7 @@ export type SocketStatus = 'connecting' | 'open' | 'closed';
 
 interface Options {
   onMessage?: (msg: AlertMessage) => void;
-  token?: string | null; // JWT appended as ?token= — reconnects when it changes; no connect without one
+  token?: string | null; // session JWT — exchanged for a one-time WS ticket per connect; reconnects when it changes; no connect without one
 }
 
 /**
@@ -41,10 +41,22 @@ export function useAlertsSocket({ onMessage, token }: Options = {}) {
     let attempts = 0;
     let disposed = false;
 
-    const connect = () => {
+    const connect = async () => {
       if (disposed) return;
       setStatus('connecting');
-      ws = new WebSocket(`${wsUrl('/ws/alerts')}?token=${encodeURIComponent(token)}`);
+      let url: string;
+      try {
+        // Preferred path: one-time ticket, so the JWT never lands in the WS
+        // query string (access logs). Falls back to the legacy ?token= URL
+        // when the ticket store is unavailable (Redis down).
+        const { ticket } = await getWsTicket();
+        if (disposed) return;
+        url = `${wsUrl('/ws/alerts')}?ticket=${encodeURIComponent(ticket)}`;
+      } catch {
+        if (disposed) return;
+        url = `${wsUrl('/ws/alerts')}?token=${encodeURIComponent(token)}`;
+      }
+      ws = new WebSocket(url);
 
       ws.onopen = () => {
         attempts = 0;
@@ -113,7 +125,17 @@ export function useAlertsSocket({ onMessage, token }: Options = {}) {
         retryTimer = window.setTimeout(connect, delay);
       };
 
-      ws.onclose = scheduleReconnect;
+      ws.onclose = (ev) => {
+        if (ev.code === 4401) {
+          // Auth failure (revoked/expired token) — reconnecting would loop
+          // forever; drop the session like a 401 from the API client.
+          if (pingTimer !== undefined) window.clearInterval(pingTimer);
+          setStatus('closed');
+          forceUnauthorized();
+          return;
+        }
+        scheduleReconnect();
+      };
       ws.onerror = () => {
         ws?.close();
       };
