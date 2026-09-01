@@ -276,7 +276,8 @@ class PlatformAccountIn(BaseModel):
     mode: Literal["api", "stealth", "hybrid", "disabled"] = "api"
     enabled: bool = True
     credential_ref: str = ""
-    # recognized keys: bidder_id (freelancer user id), on_behalf_of (upwork agency member)
+    # recognized keys: bidder_id (freelancer user id), on_behalf_of (upwork agency member),
+    # proxy_url (per-account worker proxy — see worker/README.md)
     settings: dict = {}
 
 

@@ -35,7 +35,11 @@ class FakeClient:
 
 
 class FakeBrowser:
-    pass
+    def __init__(self):
+        self.reaps = 0
+
+    def reap_idle_contexts(self):
+        self.reaps += 1
 
 
 def make_ctx(client):
@@ -130,6 +134,7 @@ def test_poll_once_iterates_platforms(monkeypatch):
     ctx.config.platforms = ("fiverr", "upwork")
     assert runner.poll_once(ctx) == 2
     assert polled == ["fiverr", "upwork"]
+    assert ctx.browser.reaps == 1  # idle contexts reaped at sweep start
 
 
 def test_success_path_claim_conflict_is_benign(monkeypatch):

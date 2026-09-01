@@ -39,6 +39,9 @@ class Config:
         os.getenv("WORKER_POLL_INTERVAL_SEC", "45")))
     poll_jitter_sec: float = field(default_factory=lambda: float(
         os.getenv("WORKER_POLL_JITTER_SEC", "15")))
+    # idle browser contexts are closed (and rebuilt on demand) after this long
+    context_idle_sec: float = field(default_factory=lambda: float(
+        os.getenv("WORKER_CONTEXT_IDLE_SEC", "1800")))
     timezone: str = field(default_factory=lambda: os.getenv(
         "WORKER_TIMEZONE", "America/New_York"))
     locale: str = field(default_factory=lambda: os.getenv("WORKER_LOCALE", "en-US"))

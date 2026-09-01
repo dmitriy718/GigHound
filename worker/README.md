@@ -44,6 +44,7 @@ use playwright ≥ 1.49 — 1.45 pins a greenlet that doesn't build there.
 | `WORKER_ID` | `hostname-pid` | identity recorded on claimed tasks |
 | `WORKER_PLATFORMS` | all supported | comma list: `fiverr,upwork,peopleperhour,guru` |
 | `WORKER_PROXY_{PLATFORM}` | — | per-platform proxy, e.g. `WORKER_PROXY_UPWORK=http://user:pass@host:8080` |
+| `WORKER_CONTEXT_IDLE_SEC` | `1800` | close browser contexts idle this long (rebuilt on demand) |
 | `WORKER_HEADLESS` | `true` | set `false` to watch the browser |
 | `WORKER_SESSION_DIR` | `worker/.sessions` | persistent browser profiles (gitignored) |
 | `WORKER_POLL_INTERVAL_SEC` / `WORKER_POLL_JITTER_SEC` | `45` / `15` | poll pacing (≈30–60s) |
@@ -51,6 +52,16 @@ use playwright ≥ 1.49 — 1.45 pins a greenlet that doesn't build there.
 | `WORKER_ALLOW_SUBMIT` | unset (off) | final-submit gate — see safety model |
 
 Run: `worker/.venv/bin/python -m worker` (or `--once` for a single sweep).
+
+### Per-account proxies
+
+A platform account can pin its own proxy via `settings.proxy_url` (editable on
+the Accounts page, e.g. `http://user:pass@host:8080`); the stealth-session
+payload carries it and the worker uses it for that tenant's context, falling
+back to the platform-level `WORKER_PROXY_*` when unset. The proxy is sticky
+per account — sharing one datacenter IP across tenants invites account
+linkage — and its geo should match the account's profile location. Proxy URLs
+must include an explicit port; a port-less URL fails fast with a config error.
 
 ## Session management (log in once per platform)
 

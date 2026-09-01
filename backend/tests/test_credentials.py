@@ -431,13 +431,15 @@ def test_stealth_session_null_when_absent(client):
     r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
               headers=WORKER_HEADERS)
     assert r.status_code == 200
-    assert r.json() == {"storage_state": None, "credentials_present": False}
+    assert r.json() == {"storage_state": None, "credentials_present": False,
+                        "proxy_url": None}
 
     # account exists but nothing enrolled
     _account(db, u.id, platform="fiverr")
     r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
               headers=WORKER_HEADERS)
-    assert r.json() == {"storage_state": None, "credentials_present": False}
+    assert r.json() == {"storage_state": None, "credentials_present": False,
+                        "proxy_url": None}
 
     # username/password enrollment: present, but no storage_state to seed from
     acct = db.query(PlatformAccount).filter_by(user_id=u.id, platform="fiverr").one()
@@ -447,7 +449,29 @@ def test_stealth_session_null_when_absent(client):
     assert r.status_code == 204
     r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
               headers=WORKER_HEADERS)
-    assert r.json() == {"storage_state": None, "credentials_present": True}
+    assert r.json() == {"storage_state": None, "credentials_present": True,
+                        "proxy_url": None}
+
+
+def test_stealth_session_includes_account_proxy_url(client):
+    c, Session = client
+    db = Session()
+    u = _user(db, "proxy@example.com")
+    acct = _account(db, u.id, platform="fiverr")
+    r = c.post(f"/api/accounts/{acct.id}/credentials",
+               json={"secrets": {"storage_state_json": json.dumps(STORAGE_STATE)}},
+               headers=_headers(u))
+    assert r.status_code == 204
+    acct.settings = {"proxy_url": "http://user:pw@tenant-proxy:9000"}
+    db.commit()
+
+    _claimed_task(db, u.id)
+    r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
+              headers=WORKER_HEADERS)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["proxy_url"] == "http://user:pw@tenant-proxy:9000"
+    assert body["storage_state"] == STORAGE_STATE
 
 
 def test_stealth_session_requires_worker_token(client):
