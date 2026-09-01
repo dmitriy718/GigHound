@@ -15,7 +15,17 @@ services:
     volumes:
       # persistent per-(platform, user) browser sessions
       - worker_sessions:/app/.sessions
+    restart: unless-stopped
+    shm_size: '1gb'  # Chromium crashes with Docker's default 64MB /dev/shm
     depends_on: [backend]
+    healthcheck:
+      # no pgrep in python:slim — scan /proc for the `python -m worker` process
+      # (needle built at runtime so the healthcheck itself never self-matches)
+      test: ["CMD", "python", "-c", "import os,sys; n=b'-m\\x00worker'; sys.exit(0 if any(n in open('/proc/'+p+'/cmdline','rb').read() for p in os.listdir('/proc') if p.isdigit()) else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 volumes:
   worker_sessions:

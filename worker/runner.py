@@ -13,6 +13,8 @@ import logging
 import random
 import time
 
+import httpx
+
 from .browser import BrowserManager, CaptchaDetectedError
 from .client import BackendError, ClaimConflictError, WorkerClient
 from .config import load_config
@@ -41,19 +43,30 @@ def process_task(task, ctx: HandlerContext) -> None:
     except CaptchaDetectedError as exc:
         log.warning("task %d hit a challenge on %s (%s) — escalating",
                     task.id, exc.platform, exc.marker)
-        ctx.client.complete_task(task.id, False,
-                                 {"captcha": True, "marker": exc.marker,
-                                  "platform": exc.platform})
+        try:
+            ctx.client.complete_task(task.id, False,
+                                     {"captcha": True, "marker": exc.marker,
+                                      "platform": exc.platform})
+        except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
+            log.error("could not report captcha for task %d: %s", task.id, report_exc)
     except Exception as exc:  # noqa: BLE001 — crash-safe: report, don't die
         log.exception("task %d (%s) failed", task.id, task.task_type)
         try:
             ctx.client.complete_task(task.id, False,
                                      {"error": str(exc)[:500],
                                       "error_type": type(exc).__name__})
-        except (BackendError, ClaimConflictError) as report_exc:
+        except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
             log.error("could not report failure for task %d: %s", task.id, report_exc)
     else:
-        ctx.client.complete_task(task.id, True, result or {})
+        try:
+            ctx.client.complete_task(task.id, True, result or {})
+        except ClaimConflictError:
+            # the handler already finalized the task server-side (e.g. the
+            # proposal-status endpoint marks the task done) — benign
+            log.info("task %d already finalized server-side, skipping completion",
+                     task.id)
+        except httpx.TransportError as exc:
+            log.error("could not report completion for task %d: %s", task.id, exc)
 
 
 def poll_once(ctx: HandlerContext) -> int:
@@ -62,11 +75,14 @@ def poll_once(ctx: HandlerContext) -> int:
     for platform in ctx.config.platforms:
         try:
             tasks = ctx.client.poll_tasks(platform)
-        except (BackendError, ClaimConflictError) as exc:
+        except (BackendError, ClaimConflictError, httpx.TransportError) as exc:
             log.error("poll failed for %s: %s", platform, exc)
             continue
         for task in tasks:
-            process_task(task, ctx)
+            try:
+                process_task(task, ctx)
+            except Exception:  # noqa: BLE001 — one bad task must not kill the sweep
+                log.exception("task %d (%s) processing blew up", task.id, task.task_type)
             executed += 1
     return executed
 
