@@ -687,3 +687,59 @@ untrusted content at all four prompt-assembly sites; adversarial-fixture tests.
 **Phase 1 gate items:** all test-covered (forged worker_id → 409; cross-tenant refs → 404;
 post-password-change token rejected; WS ticket single-use; prod seed refuses demo). Stack rebuild
 deferred to Phase 2 end (worker-heavy changes land there).
+
+
+---
+
+## 2026-09-01 — Phase 2 implemented: stealth & ban-risk (8/8)
+
+Basis: plan Phase 2. Implemented in 4 clusters; master `bc96276`..`57923b6`.
+Suites: backend 284→292, worker 72→113, tsc clean.
+
+**Cluster K — submission truthfulness (P2-2, P2-3).** Upwork submit is verified against
+per-platform success/failure markers; ambiguous post-click outcomes report
+`submitted_unverified` (never `failed` — the click happened) so humans reconcile instead of
+double-submitting; backend maps `result.submitted` explicitly; manual-assist gate no longer
+flips unsubmitted work to `submitted`; new status in analytics (not counted submitted) + UI
+("submitted — verify on platform"). `fetch_page` detects login walls/missing logged-in markers
+→ `SessionExpiredError` → `session_expired` task failure + `needs_reenrollment` account flag +
+audit row. Zero-extraction metrics → `selector_suspect` instead of fabricated zeros.
+
+**Cluster L — isolation & session lifecycle (P2-1, P2-5).** stealth-session carries `proxy_url`
+from `PlatformAccount.settings`; worker prefers per-account proxy over platform fallback;
+`_parse_proxy` validates scheme/host/port. localStorage seeded ONCE via evaluate (permanent
+init-script stomping removed); idle context reaper (`WORKER_CONTEXT_IDLE_SEC=1800`) bounds
+Chromium count and makes re-enrollment effective without restart.
+
+**Cluster M — fingerprints & behavior (P2-4, P2-6).** Persistent per-(tenant,platform)
+fingerprint bundles built from the ACTUAL bundled Chromium version (UA + Sec-CH-UA +
+OS-coherent WebGL + viewport + TZ/locale, overrides via session payload), persisted 0600.
+Stealth shim patches webdriver/WebGL/languages/plugins/userAgentData (each guarded).
+Per-keystroke jittered cadence (thinking pauses, punctuation hesitation, bursts; typo plan
+untouched); scrape flows warm-enter via base_url + simulate reading; `WORKER_ACTIVE_HOURS`
+circadian gate keeps scrapes unclaimed off-hours, human-approved submits always run.
+
+**Cluster N — task hygiene & hardening (P2-7, P2-8).** Fresh page per task + `close_pages`
+after each; gig drafts require majority-of-fields (floor 3) before Save-as-Draft with missed-
+selector reporting; cooperative per-task deadline at the `_sleep` chokepoint
+(`WORKER_TASK_TIMEOUT_SEC=600`) — thread-based timeouts empirically impossible with
+thread-affine sync Playwright (greenlet.error), documented. pytest split to
+`requirements-dev.txt`; image runs as `USER gighound` (browsers at /opt/ms-playwright);
+`WORKER_ALLOW_SUBMIT_<PLATFORM>` per-platform gates; SingletonLock live-holder warning.
+
+**Ban-risk scorecard re-score (was → now):**
+| Dimension | Was | Now | Basis |
+|---|---|---|---|
+| Per-tenant IP isolation | 1 | 7 | per-account proxy_url served via task-bound session (needs operator proxies) |
+| Fingerprint consistency | 2 | 8 | persistent coherent bundles, real-Chromium UA/CH-UA, geo overrides |
+| JS-environment patching | 2 | 7 | webdriver/WebGL/languages/plugins/userAgentData shim |
+| Headless concealment | 3 | 6 | shim covers main tells; Sec-CH-UA HTTP headers residual (documented) |
+| Behavioral humanization | 4 | 7 | jittered cadence + warm entry + reading simulation |
+| Timing/circadian plausibility | 3 | 7 | active-hours gate (per-tenant TZ still future work) |
+| Session realism & integrity | 4 | 8 | one-time seeding, expiry detection, re-enrollment surfacing |
+| Navigation naturalness | 2 | 6 | warm entry + scrolls; no referrer chains yet |
+| Safety rails | 7 | 8 | + per-platform submit gates, task deadlines, reaper |
+| Failure-mode truthfulness | 2 | 9 | verified submits, submitted_unverified, no fabricated zeros |
+
+**Overall stealth posture: ~3/10 → ~7/10** (targets met; live-platform selector validation
+remains the designated follow-up, as does per-tenant timezone alignment).
