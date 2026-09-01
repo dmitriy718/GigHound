@@ -159,8 +159,9 @@ def strip_ai_tells(text: str, platform: str = "") -> str:
     # no numbered/bulleted lists in proposals (structural fingerprint)
     out = re.sub(r"(?:^|(?<=[.!?]\s))\s*(?:\d+[.)]|[-•*])\s+", "", out, flags=re.MULTILINE)
     # collapse artifacts left by removals
+    out = re.sub(r",\s*,", ",", out)
     out = re.sub(r",\s*\.", ".", out)
-    out = re.sub(r"^[,\s]+", "", out, flags=re.MULTILINE)
+    out = re.sub(r"^[.,\s]+", "", out, flags=re.MULTILINE)
     out = re.sub(r"\n{3,}", "\n\n", out)
     out = re.sub(r" {2,}", " ", out)
     return out.strip()
@@ -173,7 +174,8 @@ def inject_personality(text: str, max_markers: int = 1) -> str:
     to a subordinate clause ("Funny enough, since your API…") reads worse than
     no marker at all. When nothing eligible exists, the text is left alone.
     """
-    sentences = re.split(r"(?<=[.!?])\s+", text)
+    parts = re.split(r"(?<=[.!?])(\s+)", text)  # keep separators: even indices are sentences
+    sentences = parts[::2]
     if len(sentences) < 3 or max_markers < 1:
         return text
     eligible = [i for i, s in enumerate(sentences)
@@ -182,8 +184,9 @@ def inject_personality(text: str, max_markers: int = 1) -> str:
     if not eligible:
         return text
     idx = random.choice(eligible)
-    sentences[idx] = f"{random.choice(PERSONALITY_MARKERS)} {sentences[idx][0].lower()}{sentences[idx][1:]}"
-    return " ".join(sentences)
+    parts[2 * idx] = (f"{random.choice(PERSONALITY_MARKERS)} "
+                      f"{sentences[idx][0].lower()}{sentences[idx][1:]}")
+    return "".join(parts)
 
 
 def build_typing_plan(text: str, seed: int | None = None) -> list[dict]:
