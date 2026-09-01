@@ -1,5 +1,6 @@
 """Browser-helper tests with a fake page: typing-plan consumption and
 challenge detection. No Playwright import, no browser."""
+import random
 from pathlib import Path
 
 import pytest
@@ -60,7 +61,15 @@ def no_sleep(monkeypatch):
 
 
 def typed_text(page):
-    return "".join(text for kind, text in page.events if kind == "type")
+    """Reconstruct the rendered text: whole-word `type` events (typos) plus
+    per-char `press` events (the humanized path), Backspaces excluded."""
+    out = []
+    for kind, val in page.events:
+        if kind == "type":
+            out.append(val)
+        elif kind == "press" and val != "Backspace":
+            out.append(" " if val == "Space" else val)
+    return "".join(out)
 
 
 def test_typing_plan_typo_correction():
@@ -71,13 +80,12 @@ def test_typing_plan_typo_correction():
 
     assert page.events[0] == ("click", "#field")
     types = [e for e in page.events if e[0] == "type"]
-    # typo typed first, then the real word
-    assert types[0] == ("type", "teh")
-    assert ("type", "the") in types
-    # one backspace per typo char, before the correction
+    # typo typed first (the real word goes through the per-char human path)
+    assert types == [("type", "teh")]
+    # one backspace per typo char, before the correction's first char
     teh_idx = page.events.index(("type", "teh"))
-    the_idx = page.events.index(("type", "the"))
-    backspaces = [e for e in page.events[teh_idx:the_idx] if e == ("press", "Backspace")]
+    t_idx = page.events.index(("press", "t"))
+    backspaces = [e for e in page.events[teh_idx:t_idx] if e == ("press", "Backspace")]
     assert len(backspaces) == 3
     # final rendered text is intact (typo chars are erased by backspaces)
     assert typed_text(page).replace("teh", "", 1) == "the project is yours"
@@ -87,6 +95,28 @@ def test_typing_without_plan_types_verbatim():
     page = FakePage()
     type_with_plan(page, "#field", "hello there world", [])
     assert typed_text(page) == "hello there world"
+
+
+def test_typing_cadence_is_not_constant(monkeypatch):
+    """Same text, two different seeds → different inter-key delay sequences;
+    same seed → identical. A fixed cadence is itself a bot signature."""
+    delays = []
+    monkeypatch.setattr(browser, "_sleep", lambda s: delays.append(round(s, 6)))
+
+    random.seed(1234)
+    type_with_plan(FakePage(), "#f", "hi there.", [])
+    first = list(delays)
+    delays.clear()
+    random.seed(99)
+    type_with_plan(FakePage(), "#f", "hi there.", [])
+    second = list(delays)
+    delays.clear()
+    random.seed(1234)
+    type_with_plan(FakePage(), "#f", "hi there.", [])
+
+    assert first != second
+    assert delays == first
+    assert len(set(first)) > 1  # genuinely varying, not one constant delay
 
 
 def test_detect_challenge_markers():
