@@ -106,8 +106,12 @@ class WorkerClient:
     # ---------------- result posting ----------------
 
     def post_buyer_requests(self, user_id: int, requests: list[dict]) -> dict:
+        # session_verified: fetch_page only returns on a live session, so an
+        # empty list here means "no briefs", never "logged out" (the backend
+        # ignores the extra field — permissive schema)
         resp = self._request("POST", "/api/gigs/buyer-requests/process",
-                             json={"user_id": user_id, "requests": requests})
+                             json={"user_id": user_id, "requests": requests,
+                                   "session_verified": True})
         return resp.json()
 
     def post_metrics(self, gig_id: int, impressions: int, clicks: int,

@@ -232,6 +232,7 @@ export type ProposalStatus =
   | 'rejected'
   | 'queued_for_browser' // Upwork: waiting on the external browser worker; flips to 'submitted' when done
   | 'submitted'
+  | 'submitted_unverified' // click happened but outcome unconfirmed — a human must verify on the platform (never auto-retried)
   | 'failed'
   | 'generation_failed';
 export const PROPOSAL_STATUSES: ProposalStatus[] = [
@@ -240,6 +241,7 @@ export const PROPOSAL_STATUSES: ProposalStatus[] = [
   'rejected',
   'queued_for_browser',
   'submitted',
+  'submitted_unverified',
   'failed',
   'generation_failed',
 ];

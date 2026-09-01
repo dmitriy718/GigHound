@@ -15,11 +15,11 @@ import time
 
 import httpx
 
-from .browser import BrowserManager, CaptchaDetectedError
+from .browser import BrowserManager, CaptchaDetectedError, SessionExpiredError
 from .client import BackendError, ClaimConflictError, WorkerClient
 from .config import load_config
 from .handlers import get_handler
-from .handlers.base import HandlerContext
+from .handlers.base import HandlerContext, SelectorSuspectError
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +49,26 @@ def process_task(task, ctx: HandlerContext) -> None:
                                       "platform": exc.platform})
         except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
             log.error("could not report captcha for task %d: %s", task.id, report_exc)
+    except SessionExpiredError as exc:
+        log.warning("task %d found a dead session on %s (%s) — the account "
+                    "needs re-enrollment", task.id, exc.platform, exc.detail)
+        try:
+            ctx.client.complete_task(task.id, False,
+                                     {"session_expired": True,
+                                      "platform": exc.platform})
+        except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
+            log.error("could not report session expiry for task %d: %s",
+                      task.id, report_exc)
+    except SelectorSuspectError as exc:
+        log.warning("task %d extracted nothing on %s — selectors suspect: %s",
+                    task.id, task.platform, exc)
+        try:
+            ctx.client.complete_task(task.id, False,
+                                     {"selector_suspect": True,
+                                      "error": str(exc)[:500]})
+        except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
+            log.error("could not report selector drift for task %d: %s",
+                      task.id, report_exc)
     except Exception as exc:  # noqa: BLE001 — crash-safe: report, don't die
         log.exception("task %d (%s) failed", task.id, task.task_type)
         try:
