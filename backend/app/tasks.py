@@ -102,12 +102,43 @@ def fiverr_buyer_request_tick() -> dict:
 
     One fetch task per active user — stealth tasks are tenant-owned (AD-1).
     """
+    return fiverr_buyer_request_tick_core()
+
+
+def fiverr_buyer_request_tick_core() -> dict:
+    from .models import PlatformAccount, StealthTask
+
     db = SessionLocal()
     try:
         enqueued = []
         for user in db.query(User).filter(User.is_active.is_(True)).all():
-            task = enqueue_buyer_request_fetch(db, user.id)
-            enqueued.append(task.id if task else None)
+            try:
+                # account-less users can't be scraped — don't generate doomed
+                # tasks that fail in the worker and feed the circuit breaker
+                has_fiverr = (db.query(PlatformAccount)
+                              .filter(PlatformAccount.user_id == user.id,
+                                      PlatformAccount.platform == "fiverr",
+                                      PlatformAccount.enabled.is_(True),
+                                      PlatformAccount.mode != "disabled")
+                              .first())
+                if has_fiverr is None:
+                    continue
+                # don't stack fetches while a previous one is still in flight
+                # (e.g. all workers down — dedupe like proposal_status_sync)
+                in_flight = (db.query(StealthTask)
+                             .filter(StealthTask.user_id == user.id,
+                                     StealthTask.platform == "fiverr",
+                                     StealthTask.task_type == "fiverr_fetch_buyer_requests",
+                                     StealthTask.status.in_(("pending", "claimed")))
+                             .first())
+                if in_flight is not None:
+                    continue
+                task = enqueue_buyer_request_fetch(db, user.id)
+                enqueued.append(task.id if task else None)
+            except Exception as exc:  # noqa: BLE001 — per-user isolation
+                log.exception("buyer request fetch enqueue failed for user %d (%s)",
+                              user.id, exc)
+                db.rollback()
         return {"enqueued": enqueued}
     finally:
         db.close()
@@ -116,11 +147,20 @@ def fiverr_buyer_request_tick() -> dict:
 @celery_app.task(name="app.tasks.gig_analytics_tick")
 def gig_analytics_tick() -> dict:
     """Weekly: enqueue per-platform metrics scrapes (circuit-gated), per user."""
+    return gig_analytics_tick_core()
+
+
+def gig_analytics_tick_core() -> dict:
     db = SessionLocal()
     try:
         enqueued = []
         for user in db.query(User).filter(User.is_active.is_(True)).all():
-            enqueued.extend(t.id for t in enqueue_metrics_scrape(db, user.id))
+            try:
+                enqueued.extend(t.id for t in enqueue_metrics_scrape(db, user.id))
+            except Exception as exc:  # noqa: BLE001 — per-user isolation
+                log.exception("gig analytics enqueue failed for user %d (%s)",
+                              user.id, exc)
+                db.rollback()
         return {"enqueued": enqueued}
     finally:
         db.close()

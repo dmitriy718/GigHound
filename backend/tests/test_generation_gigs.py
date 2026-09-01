@@ -275,6 +275,23 @@ def test_gig_creation_blocked_by_open_circuit(db, user):
     circuit_breaker.close_circuit("fiverr")
 
 
+def test_gig_draft_cap_is_per_user(db, user):
+    """The 1 draft/hour cap is per tenant — another user keeps drafting."""
+    tpl_a = _fiverr_template(db, user.id)
+    task, err = queue_gig_creation(db, tpl_a)
+    assert err == ""
+    task2, err2 = queue_gig_creation(db, tpl_a)
+    assert task2 is None and "rate limit" in err2
+
+    other = User(email="gen-test-2@example.com",
+                 password_hash=hash_password("password123"))
+    db.add(other)
+    db.commit()
+    tpl_b = _fiverr_template(db, other.id)
+    task_b, err_b = queue_gig_creation(db, tpl_b)
+    assert err_b == "" and task_b is not None
+
+
 def test_buyer_request_processing(db, user):
     _fiverr_template(db, user.id)
     requests = [

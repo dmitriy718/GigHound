@@ -140,6 +140,70 @@ def test_enroll_freelancer_tokens(client):
         "access_token": "tok", "refresh_token": "ref"}
 
 
+# ---------------- upwork: BOTH oauth and stealth credential types ----------------
+
+def test_enroll_upwork_browser_session(client):
+    """The worker drives upwork via the browser, so storage_state enrollment
+    must work through the product (not just the ops-only login CLI)."""
+    c, Session = client
+    db = Session()
+    u = _user(db, "uw-state@example.com")
+    acct = _account(db, u.id, platform="upwork")
+    r = c.post(f"/api/accounts/{acct.id}/credentials",
+               json={"secrets": {"storage_state_json": json.dumps(STORAGE_STATE)}},
+               headers=_headers(u))
+    assert r.status_code == 204, r.text
+    r = c.get(f"/api/accounts/{acct.id}/credentials/status", headers=_headers(u))
+    assert r.json()["keys"] == ["storage_state_json"]
+
+    # and the worker can actually consume it via the stealth-session endpoint
+    r = c.get(f"/api/gigs/stealth-session?platform=upwork&user_id={u.id}",
+              headers=WORKER_HEADERS)
+    assert r.json()["storage_state"] == STORAGE_STATE
+
+
+def test_enroll_upwork_userpass_and_tokens(client):
+    c, Session = client
+    db = Session()
+    u = _user(db, "uw-dual@example.com")
+    acct = _account(db, u.id, platform="upwork", principal="up")
+    r = c.post(f"/api/accounts/{acct.id}/credentials",
+               json={"secrets": {"username": "me@example.com", "password": "hunter2"}},
+               headers=_headers(u))
+    assert r.status_code == 204, r.text
+
+    # API tokens still enroll on the same platform (oauth branch preserved)
+    acct2 = _account(db, u.id, platform="upwork", principal="api")
+    r = c.post(f"/api/accounts/{acct2.id}/credentials",
+               json={"secrets": {"access_token": "tok", "refresh_token": "ref"}},
+               headers=_headers(u))
+    assert r.status_code == 204, r.text
+    assert CredentialVault(db, u.id).load("upwork", "api") == {
+        "access_token": "tok", "refresh_token": "ref"}
+
+    # upwork accepts the union of keys but rejects anything outside it
+    r = c.post(f"/api/accounts/{acct2.id}/credentials",
+               json={"secrets": {"access_token": "tok", "api_secret": "zzz"}},
+               headers=_headers(u))
+    assert r.status_code == 422
+
+
+def test_enroll_linkedin_indeed_stealth_rejected(client):
+    """No worker serves linkedin/indeed — stealth enrollment is not supported."""
+    c, Session = client
+    db = Session()
+    u = _user(db, "unsupported@example.com")
+    for platform in ("linkedin", "indeed"):
+        acct = _account(db, u.id, platform=platform, principal=platform)
+        r = c.post(f"/api/accounts/{acct.id}/credentials",
+                   json={"secrets": {"storage_state_json": json.dumps(STORAGE_STATE)}},
+                   headers=_headers(u))
+        assert r.status_code == 422, r.text
+        assert "not supported" in r.json()["detail"]
+        db.refresh(acct)
+        assert acct.credential_ref == ""
+
+
 # ---------------- validation ----------------
 
 @pytest.mark.parametrize("platform,secrets", [

@@ -46,7 +46,7 @@ def enqueue_stealth_task(db: Session, user_id: int, platform: str,
     When the circuit is open the row is recorded as skipped_circuit_open so
     the kill switch is visible in the UI instead of silently dropping work.
     """
-    allowed, reason = circuit_breaker.check(platform)
+    allowed, reason = circuit_breaker.check(platform, user_id)
     task = StealthTask(
         user_id=user_id, platform=platform, task_type=task_type,
         payload=payload,

@@ -330,17 +330,21 @@ def complete_stealth_task(task_id: int, body: dict, db: Session = Depends(get_db
     task.result = body.get("result", {})
     task.completed_at = now
     if not success:
-        # windowed failure counting: trip after N failures in the last hour
+        # windowed failure counting: trip after N failures in the last hour.
+        # Scoped to the tenant — one user's failing session must not halt
+        # every other tenant's enqueues on the platform.
         db.flush()
         recent_failures = (db.query(StealthTask)
                            .filter(StealthTask.platform == task.platform,
+                                   StealthTask.user_id == task.user_id,
                                    StealthTask.status == "failed",
                                    StealthTask.completed_at >= now - STEALTH_FAILURE_WINDOW)
                            .count())
         if recent_failures >= STEALTH_FAILURE_THRESHOLD:
             circuit_breaker.open_circuit(
                 task.platform,
-                f"{recent_failures} stealth task failures in the last hour")
+                f"{recent_failures} stealth task failures in the last hour",
+                user_id=task.user_id)
     _apply_submission_outcome(db, task, success)
     db.commit()
     return {"id": task.id, "status": task.status}

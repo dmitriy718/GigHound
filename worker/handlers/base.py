@@ -97,6 +97,24 @@ def parse_number(text: str | None) -> float | None:
     return value
 
 
+_CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP", "₹": "INR", "₱": "PHP"}
+_CURRENCY_CODES = ("USD", "EUR", "GBP", "AUD", "CAD", "NZD", "INR", "PKR",
+                   "BDT", "PHP", "PLN", "BRL", "NGN", "ZAR")
+
+
+def parse_currency(text: str | None) -> str | None:
+    """'$120' / 'EUR 300' → ISO code, else None (never a guessed default)."""
+    if not text:
+        return None
+    m = re.search(r"\b(" + "|".join(_CURRENCY_CODES) + r")\b", text.upper())
+    if m:
+        return m.group(1)
+    for symbol, code in _CURRENCY_SYMBOLS.items():
+        if symbol in text:
+            return code
+    return None
+
+
 def url_for(ctx: HandlerContext, platform: str, template_key: str, **fmt) -> str:
     template = platform_config(platform)[template_key]
     return template.format(**fmt)

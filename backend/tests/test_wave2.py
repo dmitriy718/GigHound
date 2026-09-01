@@ -536,3 +536,121 @@ def test_bid_advice_refreshed_for_stale_items(client):
     # persisted, not just response-local
     db.refresh(old_item)
     assert old_item.bid_advice["recommendation"] == "skip"
+
+
+# ---------------- 5. buyer-request tick gating (P0-11/P0-12) ----------------
+
+def _fiverr_account(db, user_id, username="seller1", enabled=True, mode="stealth"):
+    acct = PlatformAccount(user_id=user_id, platform="fiverr", label="f",
+                           enabled=enabled, mode=mode,
+                           settings={"username": username} if username else {})
+    db.add(acct)
+    db.commit()
+    return acct
+
+
+def test_buyer_request_tick_skips_accountless_and_stacks_nothing(db, user, monkeypatch):
+    from app.tasks import fiverr_buyer_request_tick_core
+    monkeypatch.setattr("app.tasks.SessionLocal", sessionmaker(bind=db.bind))
+
+    # no fiverr account → no doomed scrape task
+    assert fiverr_buyer_request_tick_core() == {"enqueued": []}
+    assert db.query(StealthTask).count() == 0
+
+    # disabled account → still nothing
+    _fiverr_account(db, user.id, enabled=False)
+    assert fiverr_buyer_request_tick_core() == {"enqueued": []}
+
+    # enabled account with a seller username → task carries it in the payload
+    _fiverr_account(db, user.id)
+    result = fiverr_buyer_request_tick_core()
+    assert len(result["enqueued"]) == 1
+    task = db.get(StealthTask, result["enqueued"][0])
+    assert task.task_type == "fiverr_fetch_buyer_requests"
+    assert task.payload == {"username": "seller1"}
+
+    # a pending fetch already in flight → no duplicate stacking
+    assert fiverr_buyer_request_tick_core() == {"enqueued": []}
+    task.status = "claimed"  # claimed counts as in flight too
+    db.commit()
+    assert fiverr_buyer_request_tick_core() == {"enqueued": []}
+
+
+def test_buyer_request_fetch_skipped_without_seller_username(db, user):
+    from app.fiverr_monitor import enqueue_buyer_request_fetch
+    _fiverr_account(db, user.id, username=None)
+    assert enqueue_buyer_request_fetch(db, user.id) is None
+    assert db.query(StealthTask).count() == 0
+
+
+def test_buyer_request_tick_isolates_failing_user(db, user, monkeypatch):
+    from app import tasks as tasks_mod
+    monkeypatch.setattr("app.tasks.SessionLocal", sessionmaker(bind=db.bind))
+    other = User(email="wave2-tick@example.com",
+                 password_hash=hash_password("password123"))
+    db.add(other)
+    db.commit()
+    _fiverr_account(db, user.id)
+    _fiverr_account(db, other.id, username="seller2")
+
+    real = tasks_mod.enqueue_buyer_request_fetch
+
+    def flaky(db_, user_id):
+        if user_id == user.id:
+            raise RuntimeError("boom")
+        return real(db_, user_id)
+
+    monkeypatch.setattr("app.tasks.enqueue_buyer_request_fetch", flaky)
+    result = tasks_mod.fiverr_buyer_request_tick_core()
+    # the failing user did not abort the sweep for the healthy one
+    assert len(result["enqueued"]) == 1
+    task = db.get(StealthTask, result["enqueued"][0])
+    assert task.user_id == other.id
+
+
+def test_gig_analytics_tick_isolates_failing_user(db, user, monkeypatch):
+    from app import tasks as tasks_mod
+    from app.gig_analytics import enqueue_metrics_scrape as _real_metrics
+    from app.models import Gig
+    monkeypatch.setattr("app.tasks.SessionLocal", sessionmaker(bind=db.bind))
+    other = User(email="wave2-analytics@example.com",
+                 password_hash=hash_password("password123"))
+    db.add(other)
+    db.commit()
+    db.add(Gig(user_id=other.id, platform="fiverr", title="g", url="https://x/g"))
+    db.commit()
+
+    def flaky(db_, user_id):
+        if user_id == user.id:
+            raise RuntimeError("boom")
+        return _real_metrics(db_, user_id)
+
+    monkeypatch.setattr("app.tasks.enqueue_metrics_scrape", flaky)
+    result = tasks_mod.gig_analytics_tick_core()
+    assert len(result["enqueued"]) == 1
+
+
+def test_buyer_request_currency_passthrough(db, user):
+    from app.fiverr_monitor import process_buyer_requests
+    from app.gig_templates import create_template as _create_tpl
+    tpl, problems = _create_tpl(db, user.id, "fiverr", "React Gig", {
+        "title": "I will build a React dashboard",
+        "category": "Programming & Tech", "subcategory": "Website Development",
+        "tags": ["react"],
+        "pricing": {"basic": {"price": 50, "delivery_days": 3, "revisions": 1}},
+        "description": {"hook": "h", "what_you_get": "w", "why_me": "m", "cta": "c"},
+    })
+    assert not problems
+
+    process_buyer_requests(db, user.id, [
+        {"id": "br-eur", "title": "Need a React website", "budget": 100,
+         "description": "react site", "currency": "EUR"},
+    ])
+    assert db.query(Job).filter_by(external_id="br-eur").one().currency == "EUR"
+
+    # undetectable currency (worker sends None) → model default, no crash
+    process_buyer_requests(db, user.id, [
+        {"id": "br-none", "title": "Need a React landing page", "budget": 90,
+         "description": "react page", "currency": None},
+    ])
+    assert db.query(Job).filter_by(external_id="br-none").one().currency == "USD"
