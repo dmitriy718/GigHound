@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .auth import validate_auth_config
-from .config import CORS_ORIGINS
+from .config import BEHIND_TLS, CORS_ORIGINS
 from .routers import (adapters, alerts, analytics, auth, credentials, filters,
                       gigs, jobs, keywords, orchestration, profiles, proposals)
 from .ws_manager import alerts as ws_manager
@@ -36,6 +36,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request, call_next):
+    """Baseline response hardening. The CSP allows the built SPA to function:
+    scripts/styles/images from self, inline styles (the React build emits
+    style attributes), no inline scripts. HSTS only when the deployment is
+    behind TLS (GIGHOUND_BEHIND_TLS=1) — serving it over plain HTTP would be
+    meaningless and break local development."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'")
+    if BEHIND_TLS:
+        response.headers["Strict-Transport-Security"] = \
+            "max-age=31536000; includeSubDomains"
+    return response
 
 app.include_router(auth.router)
 app.include_router(keywords.router)

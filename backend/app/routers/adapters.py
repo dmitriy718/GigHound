@@ -4,6 +4,7 @@ Write actions (bid placement, Upwork proposal queueing) are bound to the
 human review queue: they take a `proposal_queue_item_id` in `approved`
 status and send exactly the queued text/bid — no caller-supplied content.
 """
+import logging
 import os
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -23,6 +24,7 @@ from ..ingest import run_ingest  # reuse scoring/alert pipeline
 from ..stealth import SUBMIT_UPWORK_PROPOSAL, enqueue_stealth_task
 
 router = APIRouter(prefix="/api/adapters", tags=["adapters"])
+log = logging.getLogger(__name__)
 
 
 class SearchRequest(BaseModel):
@@ -74,7 +76,10 @@ async def freelancer_search(body: SearchRequest, db: Session = Depends(get_db), 
             "jobs": [p.model_dump(mode="json", exclude={"raw_data"}) for p in postings],
         }
     except AdapterError as exc:
-        raise HTTPException(502, str(exc))
+        # AdapterError messages can embed upstream API bodies/URLs — log the
+        # detail server-side, return generic text to the client
+        log.warning("adapter call failed for user %d: %s", user.id, exc)
+        raise HTTPException(502, "upstream request failed")
     finally:
         await adapter.close()
 
@@ -108,7 +113,10 @@ async def freelancer_bid(body: QueueItemAction, db: Session = Depends(get_db), u
     except QuotaDepletedError as exc:
         raise HTTPException(429, str(exc))
     except AdapterError as exc:
-        raise HTTPException(502, str(exc))
+        # AdapterError messages can embed upstream API bodies/URLs — log the
+        # detail server-side, return generic text to the client
+        log.warning("adapter call failed for user %d: %s", user.id, exc)
+        raise HTTPException(502, "upstream request failed")
     finally:
         await adapter.close()
     db.add(AuditLog(user_id=user.id, action_type="bid_placed", platform="freelancer", detail={
@@ -141,7 +149,10 @@ async def upwork_search(body: SearchRequest, db: Session = Depends(get_db), user
             "jobs": [p.model_dump(mode="json", exclude={"raw_data"}) for p in postings],
         }
     except AdapterError as exc:
-        raise HTTPException(502, str(exc))
+        # AdapterError messages can embed upstream API bodies/URLs — log the
+        # detail server-side, return generic text to the client
+        log.warning("adapter call failed for user %d: %s", user.id, exc)
+        raise HTTPException(502, "upstream request failed")
     finally:
         await adapter.close()
 
@@ -245,6 +256,9 @@ async def linkedin_search(body: SearchRequest, db: Session = Depends(get_db), us
             "jobs": [p.model_dump(mode="json", exclude={"raw_data"}) for p in postings],
         }
     except AdapterError as exc:
-        raise HTTPException(502, str(exc))
+        # AdapterError messages can embed upstream API bodies/URLs — log the
+        # detail server-side, return generic text to the client
+        log.warning("adapter call failed for user %d: %s", user.id, exc)
+        raise HTTPException(502, "upstream request failed")
     finally:
         await adapter.close()

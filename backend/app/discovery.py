@@ -58,8 +58,9 @@ def search_terms_for_profile(db: Session, profile: SearchProfile) -> list[str]:
         if terms:
             return terms[:SEARCHES_PER_PROFILE]
     if profile.keyword_group_id:
+        # defense-in-depth: a foreign/missing group is treated as absent
         group = db.get(KeywordGroup, profile.keyword_group_id)
-        if group:
+        if group and group.user_id == profile.user_id:
             terms = [k.term for k in group.keywords if k.kind == "primary"]
             if terms:
                 return terms[:SEARCHES_PER_PROFILE]
@@ -72,8 +73,9 @@ def platforms_for_profile(db: Session, profile: SearchProfile) -> list[str]:
     selected: list[str] = []
     if profile.filter_id:
         from .models import SearchFilter
+        # defense-in-depth: a foreign/missing filter is treated as absent
         flt = db.get(SearchFilter, profile.filter_id)
-        if flt and flt.platforms:
+        if flt and flt.user_id == profile.user_id and flt.platforms:
             selected = [p for p in flt.platforms if p in DISCOVERY_PLATFORMS]
     if not selected:
         selected = list(DISCOVERY_PLATFORMS)

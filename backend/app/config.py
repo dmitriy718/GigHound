@@ -11,6 +11,8 @@ DATABASE_URL = os.getenv(
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+# Set when the app sits behind a TLS-terminating proxy — enables the HSTS header.
+BEHIND_TLS = os.getenv("GIGHOUND_BEHIND_TLS") == "1"
 
 # --- Auth (AD-2) ---
 SECRET_KEY = os.getenv("GIGHOUND_SECRET_KEY")

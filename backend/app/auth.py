@@ -25,7 +25,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from .cache import cache
-from .config import DEV_NOAUTH, SECRET_KEY, WORKER_TOKEN
+from .config import CORS_ORIGINS, DEV_NOAUTH, SECRET_KEY, WORKER_TOKEN
 from .database import get_db
 from .models import PlatformAccount, User
 
@@ -51,6 +51,12 @@ def validate_auth_config() -> None:
             "GIGHOUND_WORKER_TOKEN is not set — the stealth worker pool would "
             "be unauthenticated. Set it, or GIGHOUND_DEV_NOAUTH=1 for local "
             "development."
+        )
+    if not DEV_NOAUTH and "*" in CORS_ORIGINS:
+        raise RuntimeError(
+            "CORS_ORIGINS contains '*' — with allow_credentials=True that lets "
+            "any origin make credentialed requests. List explicit origins, or "
+            "set GIGHOUND_DEV_NOAUTH=1 for local development."
         )
     vault_key = os.getenv("GIGHOUND_VAULT_KEY") or os.getenv("GIGHUNTER_VAULT_KEY")
     if not vault_key and not DEV_NOAUTH:
