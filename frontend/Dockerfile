@@ -8,6 +8,8 @@
 # origin) because nginx.conf proxies /api/ and /ws/ to the backend service.
 # Override only when the API lives on a different origin:
 #   docker build --build-arg VITE_API_URL=https://api.example.com frontend/
+# node stays at major-only pinning: the 22.x line is LTS-stable (no breaking
+# minor releases), and npm ci is already locked by package-lock.json.
 FROM node:22-slim AS build
 WORKDIR /web
 ARG VITE_API_URL=""
@@ -17,7 +19,7 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM nginx:alpine
+FROM nginx:1.31.4-alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /web/dist /usr/share/nginx/html
 EXPOSE 80

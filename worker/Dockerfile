@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12.14-slim
 
 WORKDIR /app
 
@@ -6,8 +6,11 @@ WORKDIR /app
 # time) so the non-root runtime user can read them
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 
-COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt \
+# Install from the hashed lock (requirements.txt is the human-edited source;
+# regenerate with: uv pip compile worker/requirements.txt --generate-hashes
+# --python-version 3.12 -o worker/requirements.lock).
+COPY requirements.lock ./requirements.lock
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock \
     && playwright install --with-deps chromium
 
 # build context is ./worker; lay it out as an importable package
