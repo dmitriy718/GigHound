@@ -113,6 +113,9 @@ export default function SearchProfiles() {
 
   const remove = async () => {
     if (draftId == null) return;
+    if (!window.confirm(`Delete search profile "${draft.name}"? Its discovery automation stops.`)) {
+      return;
+    }
     try {
       await deleteSearchProfile(draftId);
       setProfiles((prev) => prev.filter((p) => p.id !== draftId));

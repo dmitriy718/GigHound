@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAlertsSocket } from './hooks/useAlertsSocket';
 import {
   clearToken,
+  completeFreelancerOAuth,
   getMe,
   getToken,
   logout,
@@ -88,10 +89,35 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [accountModal, setAccountModal] = useState<'password' | 'delete' | null>(null);
+  const [oauthNotice, setOauthNotice] = useState<string | null>(null);
   const navRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
 
   const socket = useAlertsSocket({ token });
+
+  // Freelancer OAuth redirect target: the SPA has no router, so the provider
+  // redirect lands here with ?code= in the address bar. Complete the flow,
+  // clean the URL, and land the user on Accounts. Runs when a token is
+  // available (on load, or right after logging in).
+  useEffect(() => {
+    if (!token) return;
+    if (window.location.pathname !== '/oauth/freelancer/callback') return;
+    const code = new URLSearchParams(window.location.search).get('code');
+    window.history.replaceState(null, '', '/');
+    setView('accounts');
+    if (!code) return;
+    const accountId = Number(localStorage.getItem('gh_oauth_account'));
+    localStorage.removeItem('gh_oauth_account');
+    if (!accountId) {
+      setOauthNotice(
+        'OAuth redirect received but the originating account is unknown — paste the code manually in Accounts → Credentials.',
+      );
+      return;
+    }
+    completeFreelancerOAuth(accountId, code)
+      .then(() => setOauthNotice('Freelancer OAuth tokens enrolled.'))
+      .catch((e: Error) => setOauthNotice(`OAuth completion failed: ${e.message}`));
+  }, [token]);
 
   // Any 401 from the API client drops the session back to Login.
   useEffect(() => {
@@ -256,6 +282,14 @@ export default function App() {
       )}
 
       <main className="content">
+        {oauthNotice && (
+          <div className="info-banner" style={{ display: 'flex', justifyContent: 'space-between' }}>
+            {oauthNotice}
+            <button className="btn secondary small" onClick={() => setOauthNotice(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
         <ErrorBoundary label="This view" reload>
           {view === 'jobs' && <JobFeed messages={socket.messages} status={socket.status} onNavigate={setView} />}
           {view === 'proposals' && <ProposalQueue messages={socket.messages} status={socket.status} user={user} />}

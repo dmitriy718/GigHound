@@ -40,6 +40,17 @@ export default function JobFeed({ messages, status: socketStatus, onNavigate }: 
   // stale-response guards: only the newest load/detail request may land
   const loadSeq = useRef(0);
   const selectedIdRef = useRef<number | null>(null);
+  // toast timers: a newer toast clears the older timer; cleared on unmount
+  const toastTimer = useRef<number | null>(null);
+  const noticeTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (toastTimer.current) window.clearTimeout(toastTimer.current);
+      if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     const t = window.setTimeout(() => setDebouncedMinScore(minScore), 250);
@@ -85,7 +96,8 @@ export default function JobFeed({ messages, status: socketStatus, onNavigate }: 
         setJobs((prev) => (prev.some((j) => j.id === job.id) ? prev : [job, ...prev]));
         if (msg.type === 'hot_job') {
           setToast(job);
-          window.setTimeout(() => setToast(null), 8000);
+          if (toastTimer.current) window.clearTimeout(toastTimer.current);
+          toastTimer.current = window.setTimeout(() => setToast(null), 8000);
         }
       }
     }
@@ -119,6 +131,8 @@ export default function JobFeed({ messages, status: socketStatus, onNavigate }: 
       setJobs((prev) => prev.map((j) => (j.id === updated.id ? updated : j)));
       setSelected(updated);
       setError(null);
+      // the row may no longer belong to the active status filter — refetch so it disappears
+      if (status && updated.status !== status) load();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -143,7 +157,8 @@ export default function JobFeed({ messages, status: socketStatus, onNavigate }: 
         `Archived ${res.archived.length} job${res.archived.length === 1 ? '' : 's'}` +
           (res.skipped.length > 0 ? ` · ${res.skipped.length} skipped` : ''),
       );
-      window.setTimeout(() => setNotice(null), 5000);
+      if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+      noticeTimer.current = window.setTimeout(() => setNotice(null), 5000);
       setChecked(new Set());
       setError(null);
       load();

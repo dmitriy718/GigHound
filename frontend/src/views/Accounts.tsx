@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   completeFreelancerOAuth,
   createAccount,
@@ -89,9 +89,18 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
 
   useEffect(loadStatus, [account.id]);
 
+  const noticeTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    },
+    [],
+  );
+
   const flash = (msg: string) => {
     setNotice(msg);
-    window.setTimeout(() => setNotice(null), 4000);
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 4000);
   };
 
   const storageJsonError = (): string | null => {
@@ -171,6 +180,9 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
     setBusy(true);
     try {
       const { authorize_url } = await startFreelancerOAuth(account.id);
+      // the redirect comes back without account context (no state param) —
+      // remember which account started the flow for the SPA callback handler
+      localStorage.setItem('gh_oauth_account', String(account.id));
       window.open(authorize_url, '_blank', 'noopener');
       setOauthStarted(true);
       setError(null);
@@ -412,6 +424,14 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
   const [credAccountId, setCredAccountId] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    },
+    [],
+  );
 
   const reloadAccounts = () => {
     getAccounts()
@@ -462,7 +482,8 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
       closeForm();
       setNotice('Saved.');
       setError(null);
-      window.setTimeout(() => setNotice(null), 3000);
+      if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+      noticeTimer.current = window.setTimeout(() => setNotice(null), 3000);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -470,6 +491,9 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
 
   const remove = async () => {
     if (draftId == null) return;
+    if (!window.confirm(`Delete account "${draft.label}"? Its ${draft.platform} automation stops.`)) {
+      return;
+    }
     try {
       await deleteAccount(draftId);
       setAccounts((prev) => prev.filter((a) => a.id !== draftId));
@@ -590,6 +614,7 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
               <label>Platform</label>
               <select
                 value={draft.platform}
+                disabled={draftId != null} // platform is identity — set at creation only
                 onChange={(e) => setDraft({ ...draft, platform: e.target.value as Platform })}
               >
                 {PLATFORMS.map((p) => (
@@ -598,6 +623,11 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
                   </option>
                 ))}
               </select>
+              {draftId != null && (
+                <span className="muted" style={{ fontSize: 11 }}>
+                  Platform can't change on an existing account — create a new one instead.
+                </span>
+              )}
             </div>
             <div className="field" style={{ flex: 1, marginBottom: 0 }}>
               <label>Label</label>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   createKeywordGroup,
   deleteKeywordGroup,
@@ -28,6 +28,8 @@ export default function KeywordIntelligence() {
   const [suggestPlatform, setSuggestPlatform] = useState<Platform>('upwork');
   const [suggestQuery, setSuggestQuery] = useState('');
   const [suggestions, setSuggestions] = useState<string[]>([]);
+  // snapshot taken when the form opens — backdrop close is blocked while dirty
+  const initialDraft = useRef<Draft>(emptyDraft);
 
   const load = () => {
     getKeywordGroups()
@@ -72,11 +74,14 @@ export default function KeywordIntelligence() {
     }));
 
   const selectGroup = (g: KeywordGroup) => {
-    setDraft({ id: g.id, name: g.name, service_type: g.service_type, keywords: g.keywords });
+    const next = { id: g.id, name: g.name, service_type: g.service_type, keywords: g.keywords };
+    initialDraft.current = next;
+    setDraft(next);
     setShowForm(true);
   };
 
   const newGroup = () => {
+    initialDraft.current = emptyDraft;
     setDraft(emptyDraft);
     setShowForm(true);
   };
@@ -107,6 +112,9 @@ export default function KeywordIntelligence() {
 
   const remove = async () => {
     if (draft.id == null) return;
+    if (!window.confirm(`Delete keyword group "${draft.name}"? Matching and scoring lose these terms.`)) {
+      return;
+    }
     try {
       await deleteKeywordGroup(draft.id);
       setGroups((prev) => prev.filter((g) => g.id !== draft.id));
@@ -166,6 +174,7 @@ export default function KeywordIntelligence() {
         <Modal
           title={draft.id != null ? 'Edit group' : 'New group'}
           onClose={closeForm}
+          dirty={JSON.stringify(draft) !== JSON.stringify(initialDraft.current)}
         >
           <div className="form-row">
             <div className="field" style={{ flex: 1, marginBottom: 0 }}>

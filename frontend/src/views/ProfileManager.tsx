@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   createPortfolioItem,
   createProfileTemplate,
@@ -23,10 +23,19 @@ export default function ProfileManager() {
   const [tab, setTab] = useState<Tab>('templates');
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    },
+    [],
+  );
 
   const flash = (msg: string) => {
     setNotice(msg);
-    window.setTimeout(() => setNotice(null), 3000);
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 3000);
   };
 
   return (
@@ -67,6 +76,8 @@ function TemplatesTab({ setError, flash }: TabProps) {
   const [name, setName] = useState('');
   const [pitch, setPitch] = useState('');
   const [showForm, setShowForm] = useState(false);
+  // snapshot taken when the form opens — backdrop close is blocked while dirty
+  const initial = useRef({ name: '', pitch: '' });
 
   const load = (p: Platform) => {
     getProfileTemplates(p)
@@ -87,6 +98,7 @@ function TemplatesTab({ setError, flash }: TabProps) {
     setSelectedId(t.id);
     setName(t.name);
     setPitch(t.pitch_template);
+    initial.current = { name: t.name, pitch: t.pitch_template };
     setShowForm(true);
   };
 
@@ -95,6 +107,7 @@ function TemplatesTab({ setError, flash }: TabProps) {
     setSelectedId(null);
     setName('');
     setPitch('');
+    initial.current = { name: '', pitch: '' };
   }
 
   const save = async () => {
@@ -116,6 +129,7 @@ function TemplatesTab({ setError, flash }: TabProps) {
 
   const remove = async () => {
     if (selectedId == null) return;
+    if (!window.confirm(`Delete template "${name}"?`)) return;
     try {
       await deleteProfileTemplate(selectedId);
       load(platform);
@@ -169,6 +183,7 @@ function TemplatesTab({ setError, flash }: TabProps) {
         <Modal
           title={selectedId != null ? 'Edit template' : 'New template'}
           onClose={closeForm}
+          dirty={name !== initial.current.name || pitch !== initial.current.pitch}
         >
           <div className="field">
             <label>Name</label>
@@ -258,6 +273,8 @@ function PortfolioTab({ setError, flash }: TabProps) {
   };
 
   const remove = async (id: number) => {
+    const item = items.find((i) => i.id === id);
+    if (!window.confirm(`Delete portfolio item "${item?.title ?? `#${id}`}"?`)) return;
     try {
       await deletePortfolioItem(id);
       load();
@@ -414,6 +431,8 @@ function RateCardTab({ setError, flash }: TabProps) {
   };
 
   const remove = async (id: number) => {
+    const entry = entries.find((e) => e.id === id);
+    if (!window.confirm(`Delete rate card entry "${entry?.skill_category ?? `#${id}`}"?`)) return;
     try {
       await deleteRateCardEntry(id);
       load();

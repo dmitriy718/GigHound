@@ -470,7 +470,7 @@ export interface GigMetricSuggestion {
 }
 
 export interface GigMetric {
-  week: string;
+  week: string | null; // Optional[str] server-side (record_metrics always fills it today)
   impressions: number;
   clicks: number;
   orders: number;
