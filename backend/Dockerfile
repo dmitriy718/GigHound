@@ -4,6 +4,8 @@
 #   docker build -f backend/Dockerfile .
 
 # ---- Stage 1: build the frontend bundle ----
+# node stays at major-only pinning: the 22.x line is LTS-stable (no breaking
+# minor releases), and npm ci is already locked by package-lock.json.
 FROM node:22-slim AS frontend
 WORKDIR /web
 COPY frontend/package.json frontend/package-lock.json ./
@@ -12,15 +14,18 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---- Stage 2: backend runtime (serves API + the dist bundle) ----
-FROM python:3.12-slim
+FROM python:3.12.14-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     GIGHOUND_IN_DOCKER=1 \
     GIGHOUND_FRONTEND_DIST=/app/frontend/dist
 
 WORKDIR /app
-COPY backend/requirements.txt backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt
+# Install from the hashed lock (requirements.txt is the human-edited source;
+# regenerate with: uv pip compile backend/requirements.txt --generate-hashes
+# --python-version 3.12 -o backend/requirements.lock).
+COPY backend/requirements.lock backend/requirements.lock
+RUN pip install --no-cache-dir --require-hashes -r backend/requirements.lock
 
 COPY backend/alembic.ini backend/alembic.ini
 COPY backend/alembic/ backend/alembic/

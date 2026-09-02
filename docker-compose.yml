@@ -4,7 +4,7 @@ x-backend-env: &backend-env
 
 services:
   db:
-    image: postgres:16-alpine
+    image: postgres:16.15-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: gighound
@@ -21,7 +21,10 @@ services:
       retries: 12
 
   redis:
-    image: redis:7-alpine
+    # Valkey: BSD-licensed drop-in fork of Redis 7 (Redis ≥7.4 is SSPL/RSALv2).
+    # Protocol-compatible; ships a redis-cli compat binary, so the healthcheck
+    # below and the redis==5.0.* Python client work unchanged.
+    image: valkey/valkey:8-alpine
     restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379"
@@ -136,7 +139,7 @@ services:
   #   docker compose --profile llm up -d
   # then pull a model:  docker compose exec ollama ollama pull qwen3:4b
   ollama:
-    image: ollama/ollama
+    image: ollama/ollama:0.33.2
     profiles: ["llm"]
     ports:
       - "127.0.0.1:11434:11434"
