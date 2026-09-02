@@ -782,3 +782,31 @@ ProposalQueue 6→8 (drafts survive, truthful versions, retry path, live status)
 BuyerRequestInbox 5→8 (server-side filter, drafts, no crash vector), Accounts 6→8 (OAuth flow,
 confirms, locked platform), Analytics 7→8 (reconnect refetch, timeout), Settings/Onboarding
 7→8 (confirms, modal safety). Weighted: **~5.5/10 → ~8/10** (target met).
+
+
+---
+
+## 2026-09-02 — Phase 4 implemented: supply chain & infra (7/7)
+
+Basis: plan Phase 4. Implemented in 2 clusters; master `04ce924`..`0ca4dbe`.
+Suites: backend 297→298, worker 113, tsc + build clean, **pip-audit + npm audit: 0 known
+vulnerabilities everywhere**.
+
+**Cluster R — runtime upgrades (P4-1, P4-2, P4-6).** fastapi 0.115→0.141.1 / starlette
+0.46.2→1.6.0 — all 7 suppressed advisories cleared with ZERO code changes; the
+`--ignore-vuln` block deleted (pip-audit is a clean hard gate). node:20-slim (EOL) →
+node:22-slim in both Dockerfiles + CI (verified with a real targeted stage build). Google
+Fonts CDN → bundled @fontsource imports (GDPR/SPOF closed, fonts in dist). `.env` excluded
+from docker build context. celery-beat schedule persisted (named volume + `--schedule`).
+Python-version guidance documented (3.12 for CI parity; 3.13+ unblocked now passlib is gone).
+
+**Cluster S — CI & pinning (P4-3, P4-4, P4-5, P4-7).** pip-audit gate extended to worker
+requirements; npm audit gate added (vite 5→6 cleared the esbuild advisory — 0 vulns
+dev+prod); actions SHA-pinned; pip-audit pinned; timeouts + concurrency; dependabot
+(actions/pip/npm/docker — already opened its first PRs). redis → **valkey/valkey:8-alpine**
+(BSD drop-in; ships redis-cli compat — healthcheck unchanged, live-verified); postgres
+16.15-alpine, python 3.12.14-slim, nginx 1.31.4-alpine, ollama 0.33.2 (was :latest).
+uv-compiled hashed `requirements.lock` for backend (50 pkgs) + worker (16); Docker + CI
+install `--require-hashes`. New CI jobs: alembic upgrade-head smoke on real Postgres,
+docker-build check (all 3 images), router-prefix ↔ api-contract.md drift test.
+Full stack rebuilt + booted on the pinned images: all containers healthy.

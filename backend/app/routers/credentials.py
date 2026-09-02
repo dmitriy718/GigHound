@@ -31,16 +31,15 @@ from ..adapters.vault import CredentialVault
 from ..auth import get_current_user, get_owned
 from ..database import get_db
 from ..models import AdapterCredential, AuditLog, PlatformAccount, User
+# canonical sets live in app.platforms; upwork is BOTH oauth + stealth
+from ..platforms import OAUTH_PLATFORMS as _OAUTH_PLATFORMS
+from ..platforms import STEALTH_CREDENTIAL_PLATFORMS as _STEALTH_PLATFORMS
 from ..schemas import CredentialStatusOut, CredentialsIn, OAuthCompleteIn
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/accounts", tags=["credentials"])
 
-_OAUTH_PLATFORMS = ("freelancer", "upwork")
-# stealth platforms served by the browser worker (worker/config.py
-# SUPPORTED_PLATFORMS minus API-driven ones); upwork is BOTH oauth + stealth
-_STEALTH_PLATFORMS = ("fiverr", "peopleperhour", "guru", "upwork")
 _OAUTH_KEYS = {"access_token", "refresh_token"}
 _STEALTH_KEYS = {"storage_state_json", "username", "password"}
 

@@ -6,12 +6,11 @@ from sqlalchemy.orm import Session
 
 from . import circuit_breaker
 from .models import AuditLog, CompetitorSnapshot, Gig, GigMetric, StealthTask
+# canonical set lives in app.platforms (mirror of worker/platforms.py)
+from .platforms import WORKER_PLATFORMS
 from .stealth import SCRAPE_GIG_METRICS
 
 log = logging.getLogger(__name__)
-
-# platforms the stealth-browser worker can actually serve (worker/platforms.py)
-WORKER_PLATFORMS = ("fiverr", "upwork", "peopleperhour", "guru")
 
 
 def record_metrics(db: Session, gig: Gig, impressions: int, clicks: int,

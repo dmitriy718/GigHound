@@ -141,7 +141,8 @@ export default function BuyerRequestInbox({ messages, status: socketStatus, user
     <div>
       <h1>Buyer Requests</h1>
       <p className="page-sub">
-        Fiverr-style buyer requests with auto-drafted offers · always human-reviewed
+        Fiverr-style buyer requests with auto-drafted offers · always human-reviewed · approved
+        offers dispatch to the browser worker (track them in the Proposal Queue)
       </p>
       <ErrorBanner error={error} />
 

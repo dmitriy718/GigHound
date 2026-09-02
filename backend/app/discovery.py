@@ -20,11 +20,10 @@ from .boolquery import parse_boolean_query
 from .cache import cache
 from .ingest import run_ingest
 from .models import KeywordGroup, SearchProfile, User
+from .platforms import DISCOVERY_PLATFORMS
 from .schemas import IngestJobsIn
 
 log = logging.getLogger(__name__)
-
-DISCOVERY_PLATFORMS = ("freelancer", "upwork", "linkedin")
 DISCOVERY_LOCK_SECONDS = 15 * 60  # per-(user, platform) pacing
 SEARCHES_PER_PROFILE = 3          # one search per derived term, capped
 

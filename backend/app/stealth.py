@@ -12,7 +12,7 @@ from .models import StealthTask
 
 FETCH_BUYER_REQUESTS = "fetch_buyer_requests"
 SCRAPE_GIG_METRICS = "scrape_gig_metrics"
-SCRAPE_COMPETITORS = "scrape_competitors"
+SCRAPE_COMPETITORS = "scrape_competitors"  # reserved: no producer (P5-1)
 CREATE_GIG_DRAFT = "create_gig_draft"
 SUBMIT_UPWORK_PROPOSAL = "submit_upwork_proposal"
 SUBMIT_FIVERR_OFFER = "submit_fiverr_offer"
