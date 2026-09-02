@@ -99,6 +99,10 @@ server (`npm run dev` in `frontend/`, port 5173, `VITE_API_URL` pointing at
 the backend). Alternatively `npm run build` once and let the backend serve
 `frontend/dist` — the same path Docker uses.
 
+Python version: CI and Docker run Python 3.12 (supported to 2028) — local
+venvs should ideally use 3.12 too so local test runs match CI. Newer Pythons
+(3.13+) are no longer blocked: passlib, the old 3.13 blocker, is gone.
+
 | Variable | Default | Notes |
 |---|---|---|
 | `GIGHOUND_FRONTEND_DIST` | `<repo>/frontend/dist`; `/app/frontend/dist` in the image | Directory the backend serves as the SPA (StaticFiles with `index.html` fallback; `/api/*` and `/ws/*` are never shadowed). The mount is skipped when the directory does not exist. |

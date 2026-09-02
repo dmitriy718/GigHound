@@ -4,7 +4,7 @@
 #   docker build -f backend/Dockerfile .
 
 # ---- Stage 1: build the frontend bundle ----
-FROM node:20-slim AS frontend
+FROM node:22-slim AS frontend
 WORKDIR /web
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
