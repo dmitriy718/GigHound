@@ -90,6 +90,10 @@ celery_app.conf.timezone = "UTC"
 GENERATION_RETRY_WINDOW = timedelta(hours=24)
 GENERATION_MAX_RETRIES = 2
 AUTO_ARCHIVE_STALE = timedelta(days=14)
+# non-terminal proposal_queue statuses — a job referenced by one of these is
+# still actionable and exempt from auto-archive
+AUTO_ARCHIVE_EXEMPT_QUEUE_STATUSES = ["pending_review", "approved", "submitting",
+                                      "queued_for_browser", "submitted_unverified"]
 RETENTION_ARCHIVED_JOB_AGE = timedelta(days=90)
 RETENTION_STEALTH_TASK_AGE = timedelta(days=30)
 RETENTION_AUDIT_AGE = timedelta(days=365)
@@ -469,9 +473,15 @@ def auto_archive_tick_core() -> dict:
     try:
         now = datetime.now(timezone.utc)
         stale = now - AUTO_ARCHIVE_STALE
+        # jobs with a live (non-terminal) queue item stay in the feed — their
+        # proposal is still actionable and archiving would orphan it
+        live_queue_jobs = (db.query(ProposalQueueItem.job_id)
+                           .filter(ProposalQueueItem.status.in_(
+                               AUTO_ARCHIVE_EXEMPT_QUEUE_STATUSES)))
         archived = (db.query(Job)
                     .filter(Job.status.in_(["new", "notified"]),
-                            or_(Job.apply_deadline < now, Job.fetched_at < stale))
+                            or_(Job.apply_deadline < now, Job.fetched_at < stale),
+                            ~Job.id.in_(live_queue_jobs))
                     .update({"status": "archived"}, synchronize_session=False))
         db.commit()
         return {"archived": archived}

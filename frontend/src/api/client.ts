@@ -278,6 +278,7 @@ export const deleteRateCardEntry = (id: number) =>
 
 export interface ProposalsQuery {
   status?: ProposalStatus;
+  request_type?: string;
   limit?: number;
   offset?: number;
 }
@@ -285,6 +286,7 @@ export interface ProposalsQuery {
 export const getProposals = (query: ProposalsQuery = {}) => {
   const params = new URLSearchParams();
   if (query.status) params.set('status', query.status);
+  if (query.request_type) params.set('request_type', query.request_type);
   if (query.limit !== undefined) params.set('limit', String(query.limit));
   if (query.offset !== undefined) params.set('offset', String(query.offset));
   const qs = params.toString();
@@ -333,6 +335,9 @@ export const followUpProposal = (id: number) =>
   request<ProposalQueueItem>(`/api/proposals/${id}/follow-up`, { method: 'POST' });
 export const getInterviewPrep = (id: number) =>
   request<InterviewPrep>(`/api/proposals/${id}/interview-prep`);
+// Re-run generation for a generation_failed item (resets its auto-retry budget)
+export const retryProposalGeneration = (id: number) =>
+  request<ProposalQueueItem>(`/api/proposals/${id}/retry-generation`, { method: 'POST' });
 
 // ---- Gigs (`/api/gigs`) ----
 

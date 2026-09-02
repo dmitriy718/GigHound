@@ -5,14 +5,16 @@ import {
   getProposals,
   rejectProposal,
 } from '../api/client';
-import type { ProposalQueueItem, RejectionReason } from '../types';
+import type { ProposalQueueItem, RejectionReason, User } from '../types';
 import { REJECTION_REASONS } from '../types';
 import { useNewAlertMessages, useReconnectRefetch, type AlertMessage, type SocketStatus } from '../hooks/useAlertsSocket';
+import { useDrafts } from '../hooks/useDrafts';
 import { ErrorBanner, formatDate } from '../components/common';
 
 interface Props {
   messages: AlertMessage[];
   status: SocketStatus;
+  user?: User | null;
 }
 
 interface OfferEdits {
@@ -25,7 +27,13 @@ const editsFrom = (item: ProposalQueueItem): OfferEdits => ({
   bid_amount: item.bid_amount != null ? String(item.bid_amount) : '',
 });
 
-export default function BuyerRequestInbox({ messages, status: socketStatus }: Props) {
+// an edit entry holding no real changes — approve/reject resets to this
+const isPristine = (item: ProposalQueueItem, e: OfferEdits): boolean => {
+  const base = editsFrom(item);
+  return e.proposal_text === base.proposal_text && e.bid_amount === base.bid_amount;
+};
+
+export default function BuyerRequestInbox({ messages, status: socketStatus, user }: Props) {
   const [offers, setOffers] = useState<{ offers_remaining_today: number; daily_limit: number } | null>(null);
   const [items, setItems] = useState<ProposalQueueItem[]>([]);
   const [edits, setEdits] = useState<Record<number, OfferEdits>>({});
@@ -35,18 +43,15 @@ export default function BuyerRequestInbox({ messages, status: socketStatus }: Pr
   const [rowError, setRowError] = useState<Record<number, string>>({});
   const [busyId, setBusyId] = useState<number | null>(null);
 
+  // P3-3: sessionStorage mirror so a mid-session 401 doesn't destroy unsaved edits
+  const { clearDrafts } = useDrafts(user?.id, items, edits, setEdits, editsFrom, isPristine);
+
   const load = () => {
-    // only actionable (pending) offers — the API filters by status server-side
-    getProposals({ status: 'pending_review', limit: 200 })
+    // only actionable (pending) buyer-request offers — filtered server-side so
+    // requests buried past an arbitrary page cap are never missed
+    getProposals({ status: 'pending_review', request_type: 'buyer_request', limit: 200 })
       .then((page) => {
-        // buyer requests only, deduped by id
-        const seen = new Set<number>();
-        const brs = page.items.filter((p) => {
-          if (p.request_type !== 'buyer_request' || seen.has(p.id)) return false;
-          seen.add(p.id);
-          return true;
-        });
-        setItems(brs);
+        setItems(page.items);
         setError(null);
       })
       .catch((e: Error) => setError(e.message));
@@ -98,6 +103,12 @@ export default function BuyerRequestInbox({ messages, status: socketStatus }: Pr
     })
       .then(() => {
         setItems((prev) => prev.filter((p) => p.id !== item.id));
+        setEdits((prev) => {
+          const next = { ...prev };
+          delete next[item.id];
+          return next;
+        });
+        clearDrafts([item.id]);
         setError(null);
       })
       .catch((e: Error) => setRowError((prev) => ({ ...prev, [item.id]: e.message })))
@@ -114,6 +125,12 @@ export default function BuyerRequestInbox({ messages, status: socketStatus }: Pr
     })
       .then(() => {
         setItems((prev) => prev.filter((p) => p.id !== item.id));
+        setEdits((prev) => {
+          const next = { ...prev };
+          delete next[item.id];
+          return next;
+        });
+        clearDrafts([item.id]);
         setError(null);
       })
       .catch((e: Error) => setRowError((prev) => ({ ...prev, [item.id]: e.message })))

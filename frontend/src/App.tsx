@@ -259,7 +259,7 @@ export default function App() {
         <ErrorBoundary label="This view" reload>
           {view === 'jobs' && <JobFeed messages={socket.messages} status={socket.status} onNavigate={setView} />}
           {view === 'proposals' && <ProposalQueue messages={socket.messages} status={socket.status} user={user} />}
-          {view === 'buyerRequests' && <BuyerRequestInbox messages={socket.messages} status={socket.status} />}
+          {view === 'buyerRequests' && <BuyerRequestInbox messages={socket.messages} status={socket.status} user={user} />}
           {view === 'gigs' && <GigManager />}
           {view === 'analytics' && <Analytics status={socket.status} />}
           {view === 'keywords' && <KeywordIntelligence />}

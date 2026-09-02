@@ -8,6 +8,7 @@ import {
   getProposals,
   markProposalOutcome,
   rejectProposal,
+  retryProposalGeneration,
   revertProposal,
   submitProposal,
   suggestProposalTemplates,
@@ -26,6 +27,7 @@ import type {
 } from '../types';
 import { PROPOSAL_STATUSES, REJECTION_REASONS } from '../types';
 import { useNewAlertMessages, useReconnectRefetch, type AlertMessage, type SocketStatus } from '../hooks/useAlertsSocket';
+import { useDrafts } from '../hooks/useDrafts';
 import { ErrorBanner, ScoreBadge, formatDate, scoreClass } from '../components/common';
 
 interface Props {
@@ -91,6 +93,16 @@ const editsFrom = (item: ProposalQueueItem): DraftEdits => ({
   bid_period_days: item.bid_period_days != null ? String(item.bid_period_days) : '',
 });
 
+// an edit entry holding no real changes — just an opened editor
+const isPristine = (item: ProposalQueueItem, e: DraftEdits): boolean => {
+  const base = editsFrom(item);
+  return (
+    e.proposal_text === base.proposal_text &&
+    e.bid_amount === base.bid_amount &&
+    e.bid_period_days === base.bid_period_days
+  );
+};
+
 const truncate = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
 const PAGE_SIZE = 50;
@@ -124,6 +136,9 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
   const [toast, setToast] = useState<string | null>(null);
   // proposals the socket told us got a client reply (badges even before the reload lands)
   const [repliedIds, setRepliedIds] = useState<Set<number>>(new Set());
+
+  // P3-3: sessionStorage mirror so a mid-session 401 doesn't destroy unsaved edits
+  const { clearDrafts } = useDrafts(user?.id, proposals, edits, setEdits, editsFrom, isPristine);
 
   // Default the reviewer to the logged-in user's display name once it hydrates
   useEffect(() => {
@@ -222,6 +237,8 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
       setProposals((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
     }
     setEdits((prev) => ({ ...prev, [updated.id]: editsFrom(updated) }));
+    // the action succeeded — any stored draft for this item is spent
+    clearDrafts([updated.id]);
   };
 
   const requireReviewer = (id: number): boolean => {
@@ -282,6 +299,11 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
 
   const revert = (item: ProposalQueueItem, versionIndex: number) => {
     void run(item.id, () => revertProposal(item.id, versionIndex));
+  };
+
+  // P3-4: re-run generation for a generation_failed row (requeues the same item)
+  const retryGeneration = (item: ProposalQueueItem) => {
+    void run(item.id, () => retryProposalGeneration(item.id));
   };
 
   // Phase 3: draft a follow-up for a submitted proposal — 409 when not eligible
@@ -349,10 +371,26 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
       setError('Enter a reviewer name first.');
       return;
     }
+    // bulk approve sends only ids — text typed into expanded editors of
+    // selected rows would be silently discarded, so warn first
+    const dirtyCount = [...selected].filter((id) => {
+      const item = proposals.find((p) => p.id === id);
+      const e = edits[id];
+      return item != null && e != null && !isPristine(item, e);
+    }).length;
+    if (
+      dirtyCount > 0 &&
+      !window.confirm(
+        `${dirtyCount} selected row${dirtyCount === 1 ? ' has' : 's have'} unsaved edits that will be discarded — approve anyway?`,
+      )
+    ) {
+      return;
+    }
     setBulkBusy(true);
     bulkApproveProposals([...selected], reviewer.trim())
       .then((res) => {
         showToast(`Bulk approve: ${res.approved.length} approved, ${res.skipped.length} skipped`);
+        clearDrafts(res.approved);
         load();
       })
       .catch((e: Error) => setError(e.message))
@@ -923,6 +961,16 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                   )}
 
                   <div className="form-row" style={{ marginTop: 12, marginBottom: 0 }}>
+                    {item.status === 'generation_failed' && (
+                      <button
+                        className="btn"
+                        disabled={busyId === item.id}
+                        title="Re-run proposal generation for this job (resets the auto-retry budget)"
+                        onClick={() => retryGeneration(item)}
+                      >
+                        {busyId === item.id ? 'Retrying…' : 'Retry generation'}
+                      </button>
+                    )}
                     {item.status === 'pending_review' && (
                       <>
                         <button

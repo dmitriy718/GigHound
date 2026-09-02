@@ -35,6 +35,7 @@ def _with_job(item: ProposalQueueItem, job: Job | None) -> ProposalQueueOut:
 
 @router.get("", response_model=dict)
 def list_proposals(status: str | None = Query(None),
+                   request_type: str | None = Query(None),
                    limit: int = Query(50, ge=1, le=200),
                    offset: int = Query(0, ge=0),
                    db: Session = Depends(get_db),
@@ -42,6 +43,8 @@ def list_proposals(status: str | None = Query(None),
     q = scoped(db, ProposalQueueItem, user)
     if status:
         q = q.filter(ProposalQueueItem.status == status)
+    if request_type:
+        q = q.filter(ProposalQueueItem.request_type == request_type)
     total = q.count()
     items = (q.order_by(ProposalQueueItem.created_at.desc())
              .offset(offset).limit(limit).all())
@@ -107,6 +110,12 @@ def approve_proposal(item_id: int, body: ProposalReviewAction, db: Session = Dep
         raise HTTPException(422, "proposal_text must not be empty")
     edited = False
     if body.proposal_text is not None and body.proposal_text != item.proposal_text:
+        # version the PREVIOUS text before overwriting — the pre-edit draft
+        # the reviewer actually saw must stay revertable (v1 = the original)
+        versions = list(item.versions or [])
+        versions.append({"text": item.proposal_text, "bid": item.bid_amount,
+                         "by": body.reviewer, "at": datetime.now(timezone.utc).isoformat()})
+        item.versions = versions
         item.proposal_text = body.proposal_text
         edited = True
     if body.bid_amount is not None:
@@ -120,11 +129,6 @@ def approve_proposal(item_id: int, body: ProposalReviewAction, db: Session = Dep
             raise HTTPException(404, "template not found")
         item.template_id = tpl.id
     item.save_as_template = body.save_as_template
-    if edited:
-        versions = list(item.versions or [])
-        versions.append({"text": item.proposal_text, "bid": item.bid_amount,
-                         "by": body.reviewer, "at": datetime.now(timezone.utc).isoformat()})
-        item.versions = versions
     item.status = "approved"
     item.reviewed_by = body.reviewer
     item.reviewed_at = datetime.now(timezone.utc)
@@ -319,6 +323,41 @@ def revert_version(item_id: int, body: dict, db: Session = Depends(get_db), user
         item.reviewed_by = None
         item.reviewed_at = None
     db.commit()
+    db.refresh(item)
+    return _with_job(item, db.get(Job, item.job_id))
+
+
+@router.post("/{item_id}/retry-generation", response_model=ProposalQueueOut)
+def retry_generation(item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Re-enqueue generation for a generation_failed item.
+
+    Resets the auto-retry budget (submission_result.generation_retries) and
+    enqueues the job's generation task, whose core regenerates THIS row in
+    place (regenerate_failed_item) — generation_gates_pass would block a
+    fresh item for the same job forever.
+    """
+    item = get_owned(db, ProposalQueueItem, item_id, user)
+    if not item:
+        raise HTTPException(404, "proposal not found")
+    if item.status != "generation_failed":
+        raise HTTPException(
+            409, f"only generation_failed proposals can be retried (status is '{item.status}')")
+    result = dict(item.submission_result or {})
+    result["generation_retries"] = 0
+    item.submission_result = result
+    db.add(AuditLog(user_id=user.id, action_type="generation_retried", platform=item.platform, detail={
+        "proposal_id": item.id, "job_id": item.job_id,
+    }))
+    db.commit()
+    from ..tasks import generate_proposal_task
+    try:
+        generate_proposal_task.delay(item.job_id)
+    except Exception:  # noqa: BLE001 — broker down
+        # the counter reset is committed, so the generation-retry beat will
+        # pick the item up within its window anyway
+        log.warning("retry-generation enqueue failed for item %d (broker down)", item.id)
+        raise HTTPException(
+            503, "task broker unavailable — the auto-retry tick will re-generate this item")
     db.refresh(item)
     return _with_job(item, db.get(Job, item.job_id))
 
