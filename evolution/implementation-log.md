@@ -743,3 +743,42 @@ thread-affine sync Playwright (greenlet.error), documented. pytest split to
 
 **Overall stealth posture: ~3/10 → ~7/10** (targets met; live-platform selector validation
 remains the designated follow-up, as does per-tenant timezone alignment).
+
+
+---
+
+## 2026-09-01/02 — Phase 3 implemented: frontend UX & contract (8/8)
+
+Basis: plan Phase 3. Implemented in 3 clusters; master `d397b04`..`86d0128`.
+Suites: backend 292→297, tsc + build clean. **CI unblocked** (user resolved GitHub billing) —
+runs green on master since Cluster O.
+
+**Cluster O — resilience & WS lifecycle (P3-1, P3-2).** App-level ErrorBoundary (reload);
+crash vectors removed (`!` assertion, unguarded `analysis.required_skills`); 30s fetch timeout;
+debounced min-score slider; stale-response/wrong-drawer races closed with sequence refs.
+Backend broadcasts `proposal_status_changed` on worker submission outcomes (post-commit);
+views refetch on socket reconnect (`useReconnectRefetch`); WS buffer cleared on logout
+(cross-tenant alert leak); dead `digest` WS type removed from hook + docs.
+
+**Cluster P — review-loop preservation (P3-3, P3-4).** Draft edits persist to sessionStorage
+per user, restore only when server text still matches the draft base (survives 401 re-login);
+approve versions the PREVIOUS text (Revert-to-v1 = the AI draft again); bulk-approve warns on
+unsaved edits. JobFeed pager (was capped at 50); buyer requests filter server-side via
+`request_type` (200-cap invisibility gone); `POST /api/proposals/{id}/retry-generation`
+requeues generation_failed items in place (+ UI button); auto-archive spares jobs with live
+queue items.
+
+**Cluster Q — safety & contract truth (P3-5..P3-8).** `window.confirm` on all 7 unconfirmed
+deletes; Modal Escape + dirty-guard (3 biggest forms). SPA auto-handles the Freelancer OAuth
+callback (localStorage account handoff; paste fallback kept); default redirect now the
+all-in-one origin. api-contract.md: Auth + Adapters sections, WS ticket handshake, claim
+binding, `request_type`, retry-generation. Split-frontend path made real: nginx `/api`+`/ws`
+proxy, `ARG VITE_API_URL=""`, `split-frontend` compose profile. `GigMetric.week` type aligned.
+client.ts: header merge can't drop Authorization, Content-Type only with body; toast timers
+tracked; archive refreshes stale rows; platform locked on account edit; gig URL validated.
+
+**Ease-of-use re-score (was → now):** JobFeed 5→8 (pager, debounce, race fixes),
+ProposalQueue 6→8 (drafts survive, truthful versions, retry path, live status),
+BuyerRequestInbox 5→8 (server-side filter, drafts, no crash vector), Accounts 6→8 (OAuth flow,
+confirms, locked platform), Analytics 7→8 (reconnect refetch, timeout), Settings/Onboarding
+7→8 (confirms, modal safety). Weighted: **~5.5/10 → ~8/10** (target met).
