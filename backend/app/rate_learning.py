@@ -8,6 +8,7 @@ historical winning average, bounded to ±20% of the computed estimate.
 import logging
 from datetime import datetime, timezone
 
+import redis
 from sqlalchemy.orm import Session
 
 log = logging.getLogger(__name__)
@@ -23,13 +24,34 @@ def _key(skill_category: str) -> str:
 
 def record_winning_bid(db: Session, user_id: int, skill_category: str, bid_amount: float) -> None:
     from .adapters.vault import StateStore
+    from .cache import cache
 
-    store = StateStore(db, user_id)
-    data = store.get(_PLATFORM, _key(skill_category), {"samples": []})
-    samples = list(data.get("samples") or [])
-    samples.append({"bid_amount": float(bid_amount),
-                    "at": datetime.now(timezone.utc).isoformat()})
-    store.set(_PLATFORM, _key(skill_category), {"samples": samples[-_MAX_SAMPLES:]})
+    # The samples list is read-modify-write: serialize concurrent recorders
+    # (two outcomes synced at once) so no sample is lost. Single writer per
+    # tenant is the normal case — without Redis we accept the tiny race.
+    lock = None
+    if cache._r is not None:
+        try:
+            candidate = cache._r.lock(
+                f"lock:rate_feedback:{user_id}:{skill_category}",
+                timeout=10, blocking_timeout=5)
+            if candidate.acquire():
+                lock = candidate
+        except redis.RedisError as exc:
+            log.warning("rate-learning lock unavailable (%s); proceeding unlocked", exc)
+    try:
+        store = StateStore(db, user_id)
+        data = store.get(_PLATFORM, _key(skill_category), {"samples": []})
+        samples = list(data.get("samples") or [])
+        samples.append({"bid_amount": float(bid_amount),
+                        "at": datetime.now(timezone.utc).isoformat()})
+        store.set(_PLATFORM, _key(skill_category), {"samples": samples[-_MAX_SAMPLES:]})
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except redis.RedisError:
+                pass
 
 
 def winning_bid_samples(db: Session, user_id: int, skill_category: str) -> list[dict]:

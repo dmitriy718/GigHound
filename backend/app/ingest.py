@@ -140,7 +140,9 @@ async def run_ingest(body: IngestJobsIn, db: Session, user: User) -> IngestResul
             db.commit()
             continue
 
-        # Auto-archive below the strictest (lowest) active threshold
+        # Auto-archive only below the LOWEST active threshold: a job at or
+        # above it may still pass the most lenient filter (per-filter gating
+        # lives in filtering.py), so min() is the correct cutoff here
         thresholds = [f.quality_threshold for f in filters]
         if thresholds and job.quality_score < min(thresholds):
             job.status = "archived"

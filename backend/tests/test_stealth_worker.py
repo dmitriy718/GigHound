@@ -304,7 +304,12 @@ def test_complete_submission_flips_queue_item(client):
     assert item.status == "submitted"
 
     # failed submission → item failed with the error carried over
-    item2 = ProposalQueueItem(user_id=u.id, job_id=job.id, platform="upwork",
+    # (own job: one live generated proposal per job — partial unique index)
+    job2 = Job(user_id=u.id, external_id="~def456", platform="upwork",
+               title="Job 2", url="https://www.upwork.com/jobs/~def456")
+    db.add(job2)
+    db.commit()
+    item2 = ProposalQueueItem(user_id=u.id, job_id=job2.id, platform="upwork",
                               proposal_text="hi", status="queued_for_browser")
     db.add(item2)
     db.commit()

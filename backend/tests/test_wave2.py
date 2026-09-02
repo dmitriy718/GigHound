@@ -104,8 +104,12 @@ def test_upwork_outcome_tick_enqueues_scrape_task(db, user, monkeypatch):
     db.commit()
     job = _job(db, user.id)
     open_item = _item(db, user.id, job, status="submitted")
-    browser_item = _item(db, user.id, job, status="queued_for_browser")
-    _item(db, user.id, job, status="pending_review")  # not watched
+    # one live generated proposal per job (partial unique index) — the other
+    # watched/unwatched items park on their own jobs
+    browser_item = _item(db, user.id, _job(db, user.id, external_id="~abc124"),
+                         status="queued_for_browser")
+    _item(db, user.id, _job(db, user.id, external_id="~abc125"),
+          status="pending_review")  # not watched
 
     result = upwork_outcome_user_core(user.id)
     assert result["enqueued"] == 1
@@ -217,9 +221,10 @@ def test_proposal_status_endpoint_maps_and_completes(client, monkeypatch):
     db.commit()
     job = _job(db, u.id)
     hired_item = _item(db, u.id, job)
-    declined_item = _item(db, u.id, job)
-    reply_item = _item(db, u.id, job)
-    quiet_item = _item(db, u.id, job)
+    # one live generated proposal per job (partial unique index)
+    declined_item = _item(db, u.id, _job(db, u.id, external_id="~abc124"))
+    reply_item = _item(db, u.id, _job(db, u.id, external_id="~abc125"))
+    quiet_item = _item(db, u.id, _job(db, u.id, external_id="~abc126"))
     # template win-rate learning must not double-count on reposts
     tpl = Template(user_id=u.id, title="t", platform="upwork",
                    source_proposal_id=hired_item.id)
@@ -298,7 +303,8 @@ def test_proposal_status_applies_for_new_browser_platforms(client, monkeypatch):
     db.commit()
     job = _job(db, u.id, platform="fiverr", external_id="brief-9")
     hired_item = _item(db, u.id, job)
-    reply_item = _item(db, u.id, job)
+    reply_item = _item(db, u.id,
+                       _job(db, u.id, platform="fiverr", external_id="brief-10"))
     foreign = _item(db, other.id,
                     _job(db, other.id, platform="fiverr", external_id="zz"))
     task = _scrape_task(db, u.id, platform="fiverr")
@@ -415,13 +421,19 @@ def test_follow_up_due_gating(db, user, monkeypatch):
     job = _job(db, user.id)
     old = NOW - timedelta(days=6)
     eligible = _item(db, user.id, job, reviewed_at=old)
-    _item(db, user.id, job, reviewed_at=NOW - timedelta(days=2))  # too recent
-    _item(db, user.id, job, status="queued_for_browser",
+    # one live generated proposal per job (partial unique index) — each
+    # gating case parks on its own job
+    _item(db, user.id, _job(db, user.id, external_id="~fu1"),
+          reviewed_at=NOW - timedelta(days=2))  # too recent
+    _item(db, user.id, _job(db, user.id, external_id="~fu2"),
+          status="queued_for_browser",
           reviewed_at=old)  # not confirmed submitted yet
-    _item(db, user.id, job, outcome="hired", reviewed_at=old)  # terminal
-    _item(db, user.id, job, reviewed_at=old,
+    _item(db, user.id, _job(db, user.id, external_id="~fu3"),
+          outcome="hired", reviewed_at=old)  # terminal
+    _item(db, user.id, _job(db, user.id, external_id="~fu4"), reviewed_at=old,
           client_replied_at=NOW)  # client already replied
-    has_child = _item(db, user.id, job, reviewed_at=old)
+    has_child = _item(db, user.id, _job(db, user.id, external_id="~fu5"),
+                      reviewed_at=old)
     _item(db, user.id, job, status="rejected", request_type="follow_up",
           submission_result={"parent_proposal_id": has_child.id})
 
@@ -480,11 +492,14 @@ def test_analytics_trend(client):
     job = _job(db, u.id, platform="freelancer")
 
     replied = _item(db, u.id, job, reviewed_at=NOW, client_replied_at=NOW)
-    hired = _item(db, u.id, job, reviewed_at=NOW)
+    # one live generated proposal per job (partial unique index)
+    hired = _item(db, u.id, _job(db, u.id, platform="freelancer",
+                                 external_id="~tr1"), reviewed_at=NOW)
     from app.templates import record_outcome
     record_outcome(db, hired, "hired")  # stamps outcome_recorded_at
     two_weeks_ago = NOW - timedelta(days=14)
-    _item(db, u.id, job, reviewed_at=two_weeks_ago)
+    _item(db, u.id, _job(db, u.id, platform="freelancer", external_id="~tr2"),
+          reviewed_at=two_weeks_ago)
     # another tenant's data must not leak in
     v = User(email="trend2@example.com",
              password_hash=hash_password("password123"))
@@ -540,7 +555,10 @@ def test_bid_advice_refreshed_for_stale_items(client):
     stale_advice = {"recommendation": "bid", "reason": "computed long ago"}
     old_item = _item(db, u.id, job, status="pending_review",
                      created_at=NOW - timedelta(days=2), bid_advice=stale_advice)
-    fresh_item = _item(db, u.id, job, status="pending_review",
+    fresh_item = _item(db, u.id,
+                       _job(db, u.id, external_id="~ba2",
+                            proposals_count=30, quality_score=50.0),
+                       status="pending_review",
                        created_at=NOW, bid_advice=stale_advice)
 
     headers = {"Authorization": f"Bearer {create_access_token(u)}"}

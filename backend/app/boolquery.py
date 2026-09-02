@@ -24,6 +24,10 @@ class BooleanQueryError(ValueError):
 def _tokenize(query: str) -> list[str]:
     tokens, pos = [], 0
     for m in _TOKEN_RE.finditer(query):
+        # finditer silently skips characters BETWEEN matches (e.g. a stray
+        # quote), which would parse the query as something other than typed
+        if m.start() != pos:
+            raise BooleanQueryError(f"unexpected input: {query[pos:m.start()]!r}")
         tokens.append(m.group(1))
         pos = m.end()
     if query[pos:].strip():

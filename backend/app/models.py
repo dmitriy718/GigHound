@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import (JSON, Boolean, DateTime, Float, ForeignKey, Integer,
-                        String, Text, UniqueConstraint)
+from sqlalchemy import (JSON, Boolean, DateTime, Float, ForeignKey, Index,
+                        Integer, String, Text, UniqueConstraint, text)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -272,6 +272,16 @@ class SearchProfile(Base):
 class ProposalQueueItem(Base):
     """AI-drafted proposals awaiting mandatory human review."""
     __tablename__ = "proposal_queue"
+    __table_args__ = (
+        # one live generated proposal per job — rejected/failed rows may pile
+        # up, and follow_up/buyer_request rows share job_id legitimately.
+        # Guards the select-then-insert race in generation_gates_pass.
+        Index("uq_proposal_queue_live_job", "job_id", unique=True,
+              sqlite_where=text("status NOT IN ('rejected','failed') "
+                                "AND request_type = 'job'"),
+              postgresql_where=text("status NOT IN ('rejected','failed') "
+                                    "AND request_type = 'job'")),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = _user_fk()

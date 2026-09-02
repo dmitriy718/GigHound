@@ -100,7 +100,14 @@ def score_keyword_match(text: str, primary: list, secondary: list, negative: lis
     if primary:
         per = 15.0 / len(primary)
         for kw in primary:
-            if kw.term.lower() in t:  # exact (case-insensitive) match, weighted
+            term = kw.term.lower()
+            # short terms ("C", "R", "go") substring-match nearly every post
+            # — require word boundaries for them (same rule as negatives)
+            if len(term) < 4:
+                hit = _term_re(term).search(t) is not None
+            else:
+                hit = term in t  # exact (case-insensitive) match, weighted
+            if hit:
                 points += per * kw.weight
     if secondary:
         per = 10.0 / len(secondary)
@@ -240,7 +247,10 @@ def compute_quality_score(job, keywords=None, market_rate: float | None = None) 
         secondary = [k for k in keywords if k.kind == "secondary"]
         negative = [k for k in keywords if k.kind == "negative"]
 
-    budget_usd = to_usd(job.budget_max or job.budget_min, job.currency)
+    # explicit None checks: a legitimate budget_max of 0 must not fall
+    # through to budget_min
+    budget_ref = job.budget_max if job.budget_max is not None else job.budget_min
+    budget_usd = to_usd(budget_ref, job.currency)
     complexity = estimate_complexity(text)
     est_hours = estimate_hours(complexity, text)
     rate = market_rate or DEFAULT_MARKET_RATE

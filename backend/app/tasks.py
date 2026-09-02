@@ -87,6 +87,15 @@ celery_app.conf.beat_schedule = {
 }
 celery_app.conf.timezone = "UTC"
 
+# The beat-scheduled tick wrappers are idempotent by design (their cores
+# dedupe/re-check before acting), so a transient broker/DB blip gets bounded
+# retries with backoff instead of dropping the tick until the next schedule.
+# NOT applied to generate_proposal_task: its core records failures as
+# generation_failed rows retried (bounded) by generation_retry_tick — Celery
+# autoretry on top would create a second, unbounded retry path.
+_TICK_RETRY = dict(autoretry_for=(Exception,), retry_backoff=True,
+                   retry_backoff_max=600, max_retries=3, retry_jitter=True)
+
 GENERATION_RETRY_WINDOW = timedelta(hours=24)
 GENERATION_MAX_RETRIES = 2
 AUTO_ARCHIVE_STALE = timedelta(days=14)
@@ -101,7 +110,7 @@ STEALTH_CLAIM_TIMEOUT = timedelta(minutes=15)
 STEALTH_MAX_RECLAIMS = 3
 
 
-@celery_app.task(name="app.tasks.fiverr_buyer_request_tick")
+@celery_app.task(name="app.tasks.fiverr_buyer_request_tick", **_TICK_RETRY)
 def fiverr_buyer_request_tick() -> dict:
     """Enqueue a buyer-request fetch for the stealth worker (circuit-gated).
 
@@ -149,7 +158,7 @@ def fiverr_buyer_request_tick_core() -> dict:
         db.close()
 
 
-@celery_app.task(name="app.tasks.gig_analytics_tick")
+@celery_app.task(name="app.tasks.gig_analytics_tick", **_TICK_RETRY)
 def gig_analytics_tick() -> dict:
     """Weekly: enqueue per-platform metrics scrapes (circuit-gated), per user."""
     return gig_analytics_tick_core()
@@ -209,7 +218,7 @@ def generate_proposal_core(job_id: int) -> dict:
         db.close()
 
 
-@celery_app.task(name="app.tasks.discovery_tick")
+@celery_app.task(name="app.tasks.discovery_tick", **_TICK_RETRY)
 def discovery_tick() -> dict:
     """Beat entrypoint — fan-out dispatcher (see discovery_tick_core)."""
     return discovery_tick_core()
@@ -268,7 +277,7 @@ def discover_profile_core(user_id: int, profile_id: int) -> dict:
         db.close()
 
 
-@celery_app.task(name="app.tasks.outcome_sync_tick")
+@celery_app.task(name="app.tasks.outcome_sync_tick", **_TICK_RETRY)
 def outcome_sync_tick() -> dict:
     """Beat entrypoint — fan-out dispatcher (see outcome_sync_tick_core)."""
     return outcome_sync_tick_core()
@@ -318,7 +327,7 @@ def outcome_sync_user_core(user_id: int) -> dict:
         db.close()
 
 
-@celery_app.task(name="app.tasks.upwork_outcome_tick")
+@celery_app.task(name="app.tasks.upwork_outcome_tick", **_TICK_RETRY)
 def upwork_outcome_tick() -> dict:
     """Beat entrypoint — fan-out dispatcher (see upwork_outcome_tick_core)."""
     return upwork_outcome_tick_core()
@@ -371,7 +380,7 @@ def upwork_outcome_user_core(user_id: int) -> dict:
         db.close()
 
 
-@celery_app.task(name="app.tasks.generation_retry_tick")
+@celery_app.task(name="app.tasks.generation_retry_tick", **_TICK_RETRY)
 def generation_retry_tick() -> dict:
     """Re-enqueue generation for recent generation_failed items (max 2 retries;
     the retry count rides in submission_result)."""
@@ -409,7 +418,7 @@ def generation_retry_tick_core() -> dict:
         db.close()
 
 
-@celery_app.task(name="app.tasks.digest_tick")
+@celery_app.task(name="app.tasks.digest_tick", **_TICK_RETRY)
 def digest_tick() -> dict:
     """Hourly: fan out one digest_user_task per due user (see digest_tick_core)."""
     return digest_tick_core()
@@ -459,7 +468,7 @@ def digest_user_core(user_id: int) -> dict:
         db.close()
 
 
-@celery_app.task(name="app.tasks.auto_archive_tick")
+@celery_app.task(name="app.tasks.auto_archive_tick", **_TICK_RETRY)
 def auto_archive_tick() -> dict:
     """Daily: archive stale jobs — apply_deadline passed, or fetched >14 days
     ago — that are still in new/notified."""
@@ -489,7 +498,7 @@ def auto_archive_tick_core() -> dict:
         db.close()
 
 
-@celery_app.task(name="app.tasks.retention_tick")
+@celery_app.task(name="app.tasks.retention_tick", **_TICK_RETRY)
 def retention_tick() -> dict:
     """Daily 04:11 UTC: hard-delete aged tenant data (see retention_tick_core)."""
     return retention_tick_core()
@@ -549,7 +558,7 @@ def retention_tick_core() -> dict:
         db.close()
 
 
-@celery_app.task(name="app.tasks.follow_up_due_tick")
+@celery_app.task(name="app.tasks.follow_up_due_tick", **_TICK_RETRY)
 def follow_up_due_tick() -> dict:
     """Beat entrypoint — fan-out dispatcher (see follow_up_due_tick_core)."""
     return follow_up_due_tick_core()
@@ -597,7 +606,7 @@ def follow_up_due_user_core(user_id: int) -> dict:
         db.close()
 
 
-@celery_app.task(name="app.tasks.stealth_reaper_tick")
+@celery_app.task(name="app.tasks.stealth_reaper_tick", **_TICK_RETRY)
 def stealth_reaper_tick() -> dict:
     """Reset stealth tasks stuck in `claimed` (see stealth_reaper_tick_core)."""
     return stealth_reaper_tick_core()

@@ -87,6 +87,10 @@ worker, and Celery beat. All ports bind to `127.0.0.1`. Requires a `.env`
 them (`depends_on: service_healthy`) and restart `unless-stopped` — first
 boot no longer races Postgres initialization.
 
+**Celery beat is a singleton:** run exactly one `celery -A app.tasks beat`
+instance per deployment (docker-compose runs one). Scaling beat out is not
+HA — every instance enqueues the full schedule, doubling every tick.
+
 **Optional local LLM:** the Ollama service sits behind the `llm` profile —
 `docker compose --profile llm up -d`, then
 `docker compose exec ollama ollama pull qwen3:4b`. Without it (or without
@@ -149,7 +153,7 @@ see `docs/api-contract.md` (Addendum v6) for the exact contract.
 
 ## Digest email (optional)
 
-`SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASSWORD`, `DIGEST_FROM`, `DIGEST_TO`. Without `SMTP_HOST`, digests are generated but only logged.
+`SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASSWORD`, `DIGEST_FROM`, `DIGEST_TO`. Without `SMTP_HOST`, digests are generated but only logged. `SMTP_TLS` (default `true`) issues STARTTLS before sending; set it to `false` for a plain local relay that doesn't support TLS.
 
 ## Frontend
 

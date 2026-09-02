@@ -7,6 +7,7 @@ platform caps (10 offers/day, 1 gig draft/hour).
 Daily offer counter lives in Redis (key resets at UTC midnight).
 """
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -129,6 +130,15 @@ def queue_upwork_catalog_upsert(db: Session, template: GigTemplate) -> tuple[Ste
 
 # ---------------- buyer request monitor ----------------
 
+def _keyword_matches(keyword: str, hay: str) -> bool:
+    # partial_ratio on a 1-2 char tag scores ~100 on any word CONTAINING it
+    # ("ai" ⊂ "available", "email", "detail") — short tags need a
+    # word-boundary match instead, so "ai" still hits "an AI assistant"
+    if len(keyword) < 3:
+        return bool(re.search(r"\b" + re.escape(keyword) + r"\b", hay))
+    return fuzz.partial_ratio(keyword, hay) >= 70
+
+
 def matching_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> list[dict]:
     """Filter raw buyer requests against active gig templates' categories/tags."""
     templates = (db.query(GigTemplate)
@@ -148,7 +158,7 @@ def matching_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> 
     matched = []
     for req in requests:
         hay = f"{req.get('title', '')} {req.get('description', '')} {req.get('category', '')}".lower()
-        if any(fuzz.partial_ratio(k, hay) >= 70 for k in keywords):
+        if any(_keyword_matches(k, hay) for k in keywords):
             matched.append(req)
     return matched
 

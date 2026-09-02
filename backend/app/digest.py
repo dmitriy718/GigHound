@@ -1,7 +1,8 @@
 """Digest generation and optional email delivery.
 
 SMTP is configured via env: SMTP_HOST, SMTP_PORT (587), SMTP_USER,
-SMTP_PASSWORD, DIGEST_FROM, DIGEST_TO. Without SMTP_HOST the digest is
+SMTP_PASSWORD, DIGEST_FROM, DIGEST_TO, SMTP_TLS (default true; set false for
+plain local relays without STARTTLS). Without SMTP_HOST the digest is
 generated but only logged/returned — nothing is sent.
 """
 import logging
@@ -12,7 +13,7 @@ from email.mime.text import MIMEText
 
 from sqlalchemy.orm import Session
 
-from .models import AlertSettings, Job
+from .models import AlertSettings, Job, User
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +46,9 @@ def due_digest_user_ids(db: Session, now: datetime | None = None) -> list[int]:
     in the 07:00 UTC hour). The tick dispatcher fans out one task per id."""
     now = now or datetime.now(timezone.utc)
     rows = (db.query(AlertSettings)
-            .filter(AlertSettings.digest_mode.in_(["hourly", "daily"]))
+            .join(User, AlertSettings.user_id == User.id)
+            .filter(AlertSettings.digest_mode.in_(["hourly", "daily"]),
+                    User.is_active.is_(True))  # deactivated tenants get no digest
             .all())
     return [s.user_id for s in rows
             if not (s.digest_mode == "daily" and now.hour != 7)]
@@ -88,7 +91,9 @@ def send_digest_email(jobs: list, mode: str) -> bool:
     msg["From"] = os.getenv("DIGEST_FROM", "gighound@localhost")
     msg["To"] = os.getenv("DIGEST_TO", "")
     with smtplib.SMTP(host, int(os.getenv("SMTP_PORT", "587"))) as smtp:
-        smtp.starttls()
+        # STARTTLS by default; SMTP_TLS=false for plain local relays
+        if os.getenv("SMTP_TLS", "true").strip().lower() not in ("0", "false", "no"):
+            smtp.starttls()
         if os.getenv("SMTP_USER"):
             smtp.login(os.getenv("SMTP_USER"), os.getenv("SMTP_PASSWORD", ""))
         smtp.send_message(msg)

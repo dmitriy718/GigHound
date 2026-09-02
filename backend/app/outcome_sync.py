@@ -65,8 +65,15 @@ def _client_reply(thread: dict, item: ProposalQueueItem, bidder_id: int | None,
         return None
     last = thread.get("last_message") or {}
     from_user = last.get("from_user")
-    if bidder_id and from_user == bidder_id:
-        return None  # our own message
+    if bidder_id is None:
+        # older rows / manual submissions have no bidder_id — we can't tell
+        # our own messages from the client's, so skip reply detection rather
+        # than risk our own message firing client_replied
+        log.info("outcome sync: item %d has no bidder_id; skipping reply detection",
+                 item.id)
+        return None
+    if from_user is not None and str(from_user) == str(bidder_id):
+        return None  # our own message (coerce: the API may send int or str)
     ts = last.get("time")
     if not ts:
         return None
