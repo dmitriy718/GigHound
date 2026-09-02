@@ -4,6 +4,9 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator
 
+# Canonical platform sets live in app/platforms.py (ALL_PLATFORMS mirrors this
+# Literal; a test keeps them in sync). "indeed" is accepted for forward-compat
+# but served by no subsystem yet.
 Platform = Literal["upwork", "fiverr", "freelancer", "peopleperhour", "guru", "linkedin", "indeed"]
 KeywordKind = Literal["primary", "secondary", "negative"]
 JobType = Literal["fixed", "hourly", "retainer", "contest", "gig"]
@@ -373,6 +376,10 @@ class BulkApproveAction(BaseModel):
 
 class OutcomeAction(BaseModel):
     outcome: Literal["hired", "rejected", "ghosted"]
+
+
+class MarkSubmittedAction(BaseModel):
+    channel: Optional[str] = None
 
 
 class InterviewQuestion(BaseModel):

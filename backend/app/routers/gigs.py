@@ -196,6 +196,10 @@ def trigger_metrics_scrape(db: Session = Depends(get_db), user: User = Depends(g
 
 
 # --- competitor intel ---
+# RESERVED/UNWIRED (P5-1): the scrape_competitors worker handler and these
+# endpoints work, but no backend producer enqueues the task — there is no
+# user-facing competitor-tracking config to drive one, and we don't invent
+# one here. Snapshots can still be posted (worker or manual) and listed.
 
 @router.get("/competitors", response_model=list[CompetitorSnapshotOut])
 def list_competitor_snapshots(platform: str, category: str | None = None,

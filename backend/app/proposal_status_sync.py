@@ -21,6 +21,8 @@ from sqlalchemy.orm import Session
 
 from .models import (Job, PlatformAccount, ProposalQueueItem, StealthTask,
                      User)
+# canonical set lives in app.platforms
+from .platforms import BROWSER_SYNC_PLATFORMS
 from .stealth import SCRAPE_PROPOSAL_STATUS, enqueue_stealth_task
 from .templates import record_outcome
 from .ws_manager import alerts
@@ -28,9 +30,6 @@ from .ws_manager import alerts
 log = logging.getLogger(__name__)
 
 _WATCHED_STATUSES = ("submitted", "queued_for_browser")
-
-# browser platforms with a scrape_proposal_status page config in the worker
-BROWSER_SYNC_PLATFORMS = ("upwork", "fiverr", "peopleperhour", "guru")
 
 # canonical platform_status → outcome (via record_outcome); everything else
 # (pending/viewed/interviewing) leaves the outcome alone

@@ -7,6 +7,7 @@ import {
   getPortfolioItems,
   getProposals,
   markProposalOutcome,
+  markProposalSubmitted,
   rejectProposal,
   retryProposalGeneration,
   revertProposal,
@@ -65,14 +66,13 @@ const STATUS_LABELS: Partial<Record<ProposalStatus, string>> = {
   submitted_unverified: 'submitted — verify on platform',
 };
 
-// Platforms with no compliant submission channel — submit is manual (copy the text)
-const MANUAL_SUBMIT_PLATFORMS: Platform[] = [
-  'fiverr',
-  'linkedin',
-  'indeed',
-  'peopleperhour',
-  'guru',
-];
+// Platforms with an automated dispatch: upwork (browser-worker queue via the
+// submit endpoint) and freelancer (bid API). Fiverr buyer requests
+// auto-dispatch on approve; everything else is submitted by hand on the
+// platform and marked submitted here. The same goes for approved/failed
+// leftovers of a fiverr dispatch (no account enrolled, or the worker's
+// allow-submit gate left the final click to a human).
+const AUTOMATED_SUBMIT_PLATFORMS: Platform[] = ['upwork', 'freelancer'];
 
 const OUTCOME_COLORS: Record<ProposalOutcome, string> = {
   pending: 'var(--text-dim)',
@@ -264,7 +264,7 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
       replaceItem(await action());
       setError(null);
     } catch (e) {
-      // e.g. 501 for platforms without a compliant submission channel
+      // e.g. 400 for platforms without an automated submission channel
       setRowError((prev) => ({ ...prev, [id]: (e as Error).message }));
     } finally {
       setBusyId(null);
@@ -301,6 +301,11 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
 
   const submit = (item: ProposalQueueItem) => {
     void run(item.id, () => submitProposal(item.id));
+  };
+
+  // by-hand submission on platforms with no automated channel
+  const markSubmitted = (item: ProposalQueueItem) => {
+    void run(item.id, () => markProposalSubmitted(item.id));
   };
 
   const markOutcome = (item: ProposalQueueItem, outcome: Exclude<ProposalOutcome, 'pending'>) => {
@@ -1042,15 +1047,7 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                       </>
                     )}
                     {item.status === 'approved' &&
-                      (MANUAL_SUBMIT_PLATFORMS.includes(item.platform) ? (
-                        <button
-                          className="btn"
-                          disabled
-                          title="No submission channel — copy the text manually"
-                        >
-                          Submit to platform
-                        </button>
-                      ) : item.platform === 'upwork' ? (
+                      (item.platform === 'upwork' ? (
                         <button
                           className="btn"
                           disabled={busyId === item.id}
@@ -1059,7 +1056,7 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                         >
                           {busyId === item.id ? 'Queueing…' : 'Queue for browser worker'}
                         </button>
-                      ) : (
+                      ) : item.platform === 'freelancer' ? (
                         <button
                           className="btn"
                           disabled={busyId === item.id}
@@ -1067,7 +1064,27 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                         >
                           {busyId === item.id ? 'Submitting…' : 'Submit to platform'}
                         </button>
+                      ) : (
+                        <button
+                          className="btn"
+                          disabled={busyId === item.id}
+                          title="No automated channel — submit on the platform yourself, then confirm here"
+                          onClick={() => markSubmitted(item)}
+                        >
+                          {busyId === item.id ? 'Marking…' : 'Mark as submitted'}
+                        </button>
                       ))}
+                    {item.status === 'failed' &&
+                      !AUTOMATED_SUBMIT_PLATFORMS.includes(item.platform) && (
+                        <button
+                          className="btn"
+                          disabled={busyId === item.id}
+                          title="Submit on the platform yourself, then confirm here"
+                          onClick={() => markSubmitted(item)}
+                        >
+                          {busyId === item.id ? 'Marking…' : 'Mark as submitted'}
+                        </button>
+                      )}
                     {item.status === 'submitted' && (
                       <>
                         <span className="muted" style={{ fontSize: 12, alignSelf: 'center' }}>

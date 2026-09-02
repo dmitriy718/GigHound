@@ -309,6 +309,12 @@ export const rejectProposal = (id: number, body: ProposalRejectAction) =>
   });
 export const submitProposal = (id: number) =>
   request<ProposalQueueItem>(`/api/proposals/${id}/submit`, { method: 'POST' });
+// Record a BY-HAND submission on platforms with no automated channel
+export const markProposalSubmitted = (id: number, channel?: string) =>
+  request<ProposalQueueItem>(`/api/proposals/${id}/mark-submitted`, {
+    method: 'POST',
+    body: JSON.stringify(channel ? { channel } : {}),
+  });
 
 // ---- Proposals v3 (learning loop) ----
 

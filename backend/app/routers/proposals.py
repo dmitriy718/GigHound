@@ -13,12 +13,12 @@ from sqlalchemy.orm import Session
 from ..auth import (get_current_user, get_owned, platform_account_settings,
                     platform_enabled, scoped)
 from ..database import get_db
-from ..models import AuditLog, Job, ProposalQueueItem, Template, User
+from ..models import AuditLog, Job, PlatformAccount, ProposalQueueItem, Template, User
 from ..ratelimit import check_llm_gen_rate
-from ..schemas import (BulkApproveAction, InterviewPrepOut, JobOut, OutcomeAction,
-                       ProposalQueueOut, ProposalRejectAction,
+from ..schemas import (BulkApproveAction, InterviewPrepOut, JobOut, MarkSubmittedAction,
+                       OutcomeAction, ProposalQueueOut, ProposalRejectAction,
                        ProposalReviewAction, TemplateOut)
-from ..stealth import SUBMIT_UPWORK_PROPOSAL, enqueue_stealth_task
+from ..stealth import SUBMIT_FIVERR_OFFER, SUBMIT_UPWORK_PROPOSAL, enqueue_stealth_task
 
 router = APIRouter(prefix="/api/proposals", tags=["proposals"])
 log = logging.getLogger(__name__)
@@ -31,6 +31,49 @@ def _with_job(item: ProposalQueueItem, job: Job | None) -> ProposalQueueOut:
     out.humanized_text = item.humanized_text or None
     out.job = JobOut.model_validate(job) if job else None
     return out
+
+
+def _dispatch_fiverr_offer(db: Session, item: ProposalQueueItem, user: User) -> None:
+    """Hand an APPROVED fiverr buyer_request offer to the stealth worker
+    (submit_fiverr_offer) — the same queued_for_browser contract as the upwork
+    path; gigs.py _apply_submission_outcome flips the item when the worker
+    posts its verdict.
+
+    Skips (item stays approved) when the tenant has no active fiverr account
+    (the task would be doomed) or the circuit is open (mirrors the upwork
+    guard: the skipped_circuit_open row stays visible in the UI)."""
+    account = (db.query(PlatformAccount)
+               .filter(PlatformAccount.user_id == user.id,
+                       PlatformAccount.platform == "fiverr",
+                       PlatformAccount.enabled.is_(True),
+                       PlatformAccount.mode != "disabled")
+               .first())
+    if account is None:
+        item.submission_result = {
+            **(item.submission_result or {}),
+            "dispatch_note": ("no fiverr account enrolled — add one on the "
+                              "Accounts page and the offer can be dispatched"),
+        }
+        db.add(AuditLog(user_id=user.id, action_type="buyer_request_dispatch_skipped",
+                        platform="fiverr", detail={
+                            "proposal_id": item.id, "reason": "no_fiverr_account",
+                        }))
+        db.commit()
+        return
+    job = db.get(Job, item.job_id)
+    task = enqueue_stealth_task(db, user.id, "fiverr", SUBMIT_FIVERR_OFFER, {
+        "job_external_id": job.external_id if job else "",
+        "job_url": (job.url if job else "") or None,
+        "proposal_text": item.proposal_text,
+        "humanized_text": item.humanized_text or item.proposal_text,
+        "typing_plan": item.typing_plan or [],
+        "bid_amount": item.bid_amount,
+        "proposal_queue_item_id": item.id,
+    })
+    if task is None or task.status == "skipped_circuit_open":
+        return  # leave approved — the item can be dispatched later
+    item.status = "queued_for_browser"
+    db.commit()
 
 
 @router.get("", response_model=dict)
@@ -141,6 +184,11 @@ def approve_proposal(item_id: int, body: ProposalReviewAction, db: Session = Dep
     }))
     db.commit()
     db.refresh(item)
+    if item.platform == "fiverr" and item.request_type == "buyer_request":
+        # approved buyer-request offers dispatch straight to the stealth
+        # worker (there is no manual submit step for them)
+        _dispatch_fiverr_offer(db, item, user)
+        db.refresh(item)
     return _with_job(item, db.get(Job, item.job_id))
 
 
@@ -171,6 +219,34 @@ def mark_outcome(item_id: int, body: OutcomeAction, db: Session = Depends(get_db
         raise HTTPException(404, "proposal not found")
     from ..templates import record_outcome
     record_outcome(db, item, body.outcome)
+    db.refresh(item)
+    return _with_job(item, db.get(Job, item.job_id))
+
+
+@router.post("/{item_id}/mark-submitted", response_model=ProposalQueueOut)
+def mark_submitted(item_id: int, body: MarkSubmittedAction | None = None,
+                   db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Record that the user submitted this proposal BY HAND on the platform.
+
+    For platforms with no automated submission channel: the user copies the
+    approved text, submits it themselves, and marks it here so outcome
+    tracking (hired/rejected/ghosted) works like any other proposal."""
+    item = get_owned(db, ProposalQueueItem, item_id, user)
+    if not item:
+        raise HTTPException(404, "proposal not found")
+    if item.status not in ("approved", "failed"):
+        raise HTTPException(
+            409, f"cannot mark a proposal in status '{item.status}' as submitted")
+    channel = (body.channel if body else None) or "manual"
+    item.status = "submitted"
+    item.submission_result = {**(item.submission_result or {}),
+                              "channel": channel, "manual": True}
+    db.add(AuditLog(user_id=user.id, action_type="proposal_marked_submitted",
+                    platform=item.platform, detail={
+                        "proposal_id": item.id, "job_id": item.job_id,
+                        "channel": channel,
+                    }))
+    db.commit()
     db.refresh(item)
     return _with_job(item, db.get(Job, item.job_id))
 
@@ -293,6 +369,13 @@ def bulk_approve(body: BulkApproveAction, db: Session = Depends(get_db), user: U
         }))
         approved.append(pid)
     db.commit()
+    # approved fiverr buyer-request offers dispatch to the stealth worker,
+    # same as the single-approve path
+    for pid in approved:
+        item = db.get(ProposalQueueItem, pid)
+        if (item is not None and item.platform == "fiverr"
+                and item.request_type == "buyer_request"):
+            _dispatch_fiverr_offer(db, item, user)
     return {"approved": approved, "skipped": skipped}
 
 
@@ -428,8 +511,8 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
     """Dispatch an APPROVED proposal through the platform's compliant channel.
 
     freelancer.com → official bid API. upwork → agency-manager queue
-    (browser handoff). Other platforms → rejected here; they belong to the
-    stealth-browser worker which is out of this service's scope.
+    (browser handoff). Other platforms have no automated channel — submit by
+    hand and use the mark-submitted endpoint.
     """
     item = get_owned(db, ProposalQueueItem, item_id, user)
     if not item:
@@ -537,9 +620,9 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
                 raise HTTPException(409, reason)
         else:
             raise HTTPException(
-                501,
-                f"submission for '{item.platform}' requires the stealth-browser worker; "
-                "leave this item approved and it will be picked up there",
+                400,
+                f"submission for '{item.platform}' isn't automated — submit on "
+                "the platform and use 'Mark as submitted'",
             )
     except HTTPException:
         # pre-dispatch failure (missing bidder config, unsupported platform,

@@ -45,7 +45,10 @@ def handle_scrape_gig_metrics(task, ctx: HandlerContext) -> dict:
 
 def handle_scrape_competitors(task, ctx: HandlerContext) -> dict:
     """Scrape a category/search page for the top competitor gigs and post a
-    snapshot. Payload: {"category": str, "query"?: str, "my_price"?: float}."""
+    snapshot. Payload: {"category": str, "query"?: str, "my_price"?: float}.
+
+    RESERVED/UNWIRED (P5-1): no backend producer enqueues this task type —
+    kept for a future competitor-tracking config surface."""
     cfg = platform_config(task.platform)
     category = task.payload.get("category", "")
     query = task.payload.get("query") or category
