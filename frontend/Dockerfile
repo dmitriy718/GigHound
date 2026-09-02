@@ -10,7 +10,7 @@
 #   docker build --build-arg VITE_API_URL=https://api.example.com frontend/
 # node stays at major-only pinning: the 22.x line is LTS-stable (no breaking
 # minor releases), and npm ci is already locked by package-lock.json.
-FROM node:22-slim AS build
+FROM node:26-slim AS build
 WORKDIR /web
 ARG VITE_API_URL=""
 ENV VITE_API_URL=${VITE_API_URL}
