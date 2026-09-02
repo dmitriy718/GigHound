@@ -99,8 +99,13 @@ services:
       dockerfile: backend/Dockerfile
     env_file: .env
     environment: *backend-env
-    command: celery -A app.tasks beat --loglevel=info
+    command: celery -A app.tasks beat --loglevel=info --schedule /home/gighound/celerybeat-schedule
     restart: unless-stopped
+    # Persist the beat schedule DB (last-run state) across container recreates
+    # so digest/discovery jobs don't re-fire. /home/gighound is created by
+    # useradd in the image, so the named volume inherits gighound ownership.
+    volumes:
+      - celerybeat-data:/home/gighound
     # the image-level HEALTHCHECK probes the API; celery serves no HTTP
     healthcheck:
       disable: true
@@ -141,3 +146,4 @@ services:
 volumes:
   pgdata:
   ollama:
+  celerybeat-data:

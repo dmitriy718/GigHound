@@ -8,7 +8,7 @@
 # origin) because nginx.conf proxies /api/ and /ws/ to the backend service.
 # Override only when the API lives on a different origin:
 #   docker build --build-arg VITE_API_URL=https://api.example.com frontend/
-FROM node:20-slim AS build
+FROM node:22-slim AS build
 WORKDIR /web
 ARG VITE_API_URL=""
 ENV VITE_API_URL=${VITE_API_URL}
