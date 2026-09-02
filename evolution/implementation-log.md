@@ -810,3 +810,59 @@ uv-compiled hashed `requirements.lock` for backend (50 pkgs) + worker (16); Dock
 install `--require-hashes`. New CI jobs: alembic upgrade-head smoke on real Postgres,
 docker-build check (all 3 images), router-prefix ↔ api-contract.md drift test.
 Full stack rebuilt + booted on the pinned images: all containers healthy.
+
+
+---
+
+## 2026-09-02 — Phase 5 implemented: product completion (5/5)
+
+Basis: plan Phase 5. Implemented in 2 clusters; master `0641c33`..`91c7f17`.
+Suites: backend 309→328, worker 113, tsc + build clean.
+
+**Cluster T — dead handoffs resolved + platform registry (P5-1, P5-2).** Approving a fiverr
+buyer_request item now auto-dispatches `submit_fiverr_offer` through the stealth contract
+(payload matches the manual-assist handler; per-tenant breaker honored; no fiverr account →
+stays `approved` with audit note). New `POST /api/proposals/{id}/mark-submitted`
+(approved/failed → submitted, channel + audit row) replaces the misleading 501 with an honest
+400 + a manual escape hatch in the UI. `scrape_competitors` marked reserved/unwired (no
+user-facing config surface exists — deliberately not invented). New canonical registry
+`backend/app/platforms.py` (worker/oauth/stealth/discovery/browser-sync/all; `indeed`
+documented as accepted-but-unserved); scattered literals swapped to imports; worker-set
+equality test.
+
+**Cluster U — celery robustness + correctness tail (P5-3, P5-4).** autoretry+backoff on all
+11 beat ticks (`generate_proposal_task` excluded — own bounded retry path); HALF_OPEN admits
+exactly one trial (Redis NX token + per-process fallback); beat-singleton documented.
+Correctness tail: hourly/fiverr bids capped at client max; short tags word-boundary matched
+("ai" ≠ "available"); own messages can't fire `client_replied`; digest filters inactive users,
+`SMTP_TLS` opt-out; ingest threshold comment corrected (code was right); short primary terms
+word-boundary; `budget_max=0` respected; atomic template increments + Redis-locked rate
+samples; boolquery rejects mid-query garbage; partial unique index
+`uq_proposal_queue_live_job` (migration `e4a91b6c2d08`) closes the duplicate-generation race.
+
+**Incidental wins during these phases:** CI unblocked by user — green on master including the
+new alembic-smoke/docker-build/contract-drift jobs; the new worker pip-audit gate caught
+`python-dotenv` PYSEC-2026-2270 on its first run (fixed same-day, gate proven).
+
+---
+
+## Final five-pillar scorecard (P5-5)
+
+Scored against the verified state at master `91c7f17` (backend 328, worker 113, CI green,
+full stack live). Evidence basis: review-round-2 reports + per-phase verification above.
+
+| Pillar | Score | Evidence |
+|---|---|---|
+| **Scalability** | 9/10 | Multi-tenant with per-tenant breakers/caps/pacing; reaper + retention bound queue growth; hashed reproducible builds; alembic CI smoke; one-beat documented; idempotent ticks with autoretry. −1: single worker per session volume (no horizontal worker HA yet). |
+| **Sellability** | 9/10 | 0 known CVEs everywhere (pip+npm), pinned images, BSD-clean stack (valkey), token revocation, audit trail, per-tenant isolation, honest docs (api-contract + drift test), demo gated out of prod. −1: no billing/SSO (AD-7 deferred, documented). |
+| **Runability** | 10/10 | bootstrap → compose up on a fresh clone; pinned images + hashed locks; migrate service orders schema; healthchecks + restart policies on every service; deterministic suites (328+113) isolated from live state; CI validates migrations and image builds on every push. |
+| **Ease of use** | 8/10 | Per-view re-score (see Phase 3 log): all core views 8/10 — pager, drafts that survive 401s, truthful versions, retry paths, live status updates, confirms on destructive actions, working OAuth. −2: no frontend test suite yet; accessibility basics only. |
+| **Advantage (securing gigs)** | 8/10 | Ban-risk 3→7/10 (per-account proxies, coherent persistent fingerprints, stealth shim, humanized cadence, circadian gate); submission truthfulness (verified submits, submitted_unverified, no fabricated zeros); closed loop: dispatch → verified outcome → win-rate learning. −2: live-platform selectors still need first-real-session validation; per-tenant timezone alignment future work. |
+
+**Weighted overall: 8.8/10** — from "simple aid" to a defensible multi-tenant SaaS whose
+automation is designed to keep tenant accounts alive while doing verifiably honest work.
+
+**Standing follow-ups (honest register):** live-platform selector validation (needs real
+accounts — designated maintenance point in worker/platforms.py); per-tenant timezone
+alignment; horizontal worker scaling story; billing/SSO (AD-7); frontend test suite;
+dependabot PR triage (it opened several on day one, incl. node 22→26 — review deliberately).
