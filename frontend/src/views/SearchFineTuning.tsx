@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   createFilter,
   deleteFilter,
@@ -37,6 +37,8 @@ export default function SearchFineTuning() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ matched: Job[]; excluded_count: number } | null>(null);
+  // snapshot taken when the form opens — backdrop close is blocked while dirty
+  const initialDraft = useRef<SearchFilterPayload>(emptyPayload);
 
   useEffect(() => {
     getFilters()
@@ -52,13 +54,16 @@ export default function SearchFineTuning() {
 
   const selectFilter = (f: SearchFilter) => {
     const { id, created_at: _created, ...rest } = f;
-    setDraft({ ...emptyPayload, ...rest });
+    const next = { ...emptyPayload, ...rest };
+    initialDraft.current = next;
+    setDraft(next);
     setDraftId(id);
     setPreview(null);
     setShowForm(true);
   };
 
   const newFilter = () => {
+    initialDraft.current = emptyPayload;
     setDraft(emptyPayload);
     setDraftId(null);
     setPreview(null);
@@ -91,6 +96,9 @@ export default function SearchFineTuning() {
 
   const remove = async () => {
     if (draftId == null) return;
+    if (!window.confirm(`Delete filter "${draft.name}"? Search profiles using it lose their gating.`)) {
+      return;
+    }
     try {
       await deleteFilter(draftId);
       setFilters((prev) => prev.filter((f) => f.id !== draftId));
@@ -188,6 +196,7 @@ export default function SearchFineTuning() {
         <Modal
           title={draftId != null ? 'Edit filter' : 'New filter'}
           onClose={closeForm}
+          dirty={JSON.stringify(draft) !== JSON.stringify(initialDraft.current)}
         >
 
           <div className="form-row">

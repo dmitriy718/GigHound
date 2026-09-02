@@ -262,7 +262,13 @@ function GigsTab() {
 
       <div className="panel">
         <h2 style={{ marginTop: 0 }}>Register gig</h2>
-        <div className="form-row">
+        <form
+          className="form-row"
+          onSubmit={(e) => {
+            e.preventDefault(); // lets the browser validate type="url" first
+            register();
+          }}
+        >
           <div className="field" style={{ marginBottom: 0 }}>
             <label>Platform</label>
             <select
@@ -315,12 +321,12 @@ function GigsTab() {
           </div>
           <button
             className="btn"
+            type="submit"
             disabled={!form.title.trim() || !form.url.trim()}
-            onClick={register}
           >
             Register
           </button>
-        </div>
+        </form>
       </div>
     </div>
   );
@@ -468,6 +474,8 @@ function TemplatesTab() {
   };
 
   const remove = (t: GigTemplate) => {
+    const editing = editor.id === t.id ? ' You are editing it right now.' : '';
+    if (!window.confirm(`Delete gig template "${t.name}"?${editing}`)) return;
     deleteGigTemplate(t.id)
       .then(() => {
         if (editor.id === t.id) setEditor(emptyEditor());

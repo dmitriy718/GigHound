@@ -81,14 +81,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getToken();
   try {
     res = await fetch(API_URL + path, {
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
       // a hung connection must not spin a loading state forever;
       // a caller-supplied signal (spread below) wins over the timeout
       signal: AbortSignal.timeout(30_000),
       ...init,
+      // merged AFTER ...init so a caller-supplied header never drops
+      // Authorization; Content-Type only on requests with a body (GETs
+      // without it skip the CORS preflight)
+      headers: {
+        ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...((init?.headers ?? {}) as Record<string, string>),
+      },
     });
   } catch (e) {
     throw new ApiError(0, `Cannot reach backend at ${API_URL}`);

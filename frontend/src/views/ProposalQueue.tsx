@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   approveProposal,
   bulkApproveProposals,
@@ -136,6 +136,15 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
   const [toast, setToast] = useState<string | null>(null);
   // proposals the socket told us got a client reply (badges even before the reload lands)
   const [repliedIds, setRepliedIds] = useState<Set<number>>(new Set());
+  // toast timer: a newer toast clears the older timer; cleared on unmount
+  const toastTimer = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    },
+    [],
+  );
 
   // P3-3: sessionStorage mirror so a mid-session 401 doesn't destroy unsaved edits
   const { clearDrafts } = useDrafts(user?.id, proposals, edits, setEdits, editsFrom, isPristine);
@@ -149,7 +158,8 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
 
   const showToast = (text: string) => {
     setToast(text);
-    window.setTimeout(() => setToast(null), 8000);
+    if (toastTimer.current) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 8000);
   };
 
   const load = () => {
@@ -432,9 +442,10 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
           </select>
         </div>
         <div className="field" style={{ marginBottom: 0 }}>
-          <label>Bid advice</label>
+          <label>Bid advice (this page)</label>
           <select
             value={adviceFilter}
+            title="Filters only the 50 loaded rows — other pages may have more matches"
             onChange={(e) => setAdviceFilter(e.target.value as BidAdvice['recommendation'] | '')}
           >
             <option value="">All</option>

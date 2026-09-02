@@ -141,7 +141,7 @@ see `docs/api-contract.md` (Addendum v6) for the exact contract.
 |---|---|---|
 | `FREELANCER_CLIENT_ID` | — | Freelancer OAuth app id. When unset, `GET /api/accounts/{id}/oauth/freelancer/start` returns **501** and users enroll tokens manually instead. |
 | `FREELANCER_CLIENT_SECRET` | — | Freelancer OAuth app secret (used by the token exchange/refresh). |
-| `FREELANCER_REDIRECT_URI` | `http://localhost:5173/oauth/freelancer/callback` | OAuth callback used in the authorize URL and the code exchange; must match the Freelancer app config. |
+| `FREELANCER_REDIRECT_URI` | `http://localhost:8000/oauth/freelancer/callback` | OAuth callback used in the authorize URL and the code exchange; must match the deployed origin (the SPA handles the path) and the Freelancer app config. |
 
 ## Digest email (optional)
 

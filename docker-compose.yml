@@ -112,6 +112,21 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # Optional split-tier web tier: nginx serves the SPA and proxies /api/ +
+  # /ws/ to the backend (see frontend/nginx.conf). The default all-in-one
+  # path (the backend serves the SPA itself) is unchanged. Opt-in:
+  #   docker compose --profile split-frontend up -d
+  # then browse http://localhost:8080.
+  frontend:
+    build:
+      context: ./frontend
+    profiles: ["split-frontend"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      - backend
+
   # Optional local LLM for proposal drafting. Opt-in:
   #   docker compose --profile llm up -d
   # then pull a model:  docker compose exec ollama ollama pull qwen3:4b

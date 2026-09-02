@@ -77,6 +77,17 @@ interface RateCardEntry { id: number; skill_category: string; hourly_rate: numbe
 
 ## REST endpoints
 
+All endpoints below except `/api/auth/register` and `/api/auth/login` require
+`Authorization: Bearer <jwt>` (12h expiry). Error envelope is FastAPI's
+`{detail: ...}`; the SPA drops the session on any **401** outside `/api/auth/*`.
+
+### Auth
+- `POST /api/auth/register` body `{email, password, display_name}` → **201** `{access_token, token_type, user}` — **409** email taken, **403** registration disabled, **429** rate-limited (5/hour/IP)
+- `POST /api/auth/login` body `{email, password}` → `{access_token, token_type, user}` — **401** bad credentials (unknown emails get a dummy verify, same timing), **403** account disabled, **429** rate-limited (5 failures/5min per email+IP, 20 per IP)
+- `GET /api/auth/me` → `User` (`{id, email, display_name, is_active, created_at}`)
+- `POST /api/auth/logout` → `{status: "ok"}` — revokes the token's jti until its exp (fail-open when Redis is down)
+- `POST /api/auth/password` / `DELETE /api/auth/account` — see Addendum v8
+
 ### Keyword intelligence
 - `GET /api/keyword-groups` → `KeywordGroup[]`
 - `POST /api/keyword-groups` body `{name, service_type, keywords: Keyword[]}` → `KeywordGroup`
@@ -104,8 +115,24 @@ interface RateCardEntry { id: number; skill_category: string; hourly_rate: numbe
 - `PUT /api/alerts/settings` body = `AlertSettings` → `AlertSettings`
 - `GET /api/alerts/digest-preview` → `{jobs: Job[]}` (what the next digest would contain)
 
+### Adapters (`/api/adapters` — discovery → ingest bridge + gated write actions)
+Write actions take an APPROVED review-queue item id and send exactly the queued text/bid — caller-supplied content is never accepted (**409** unless `approved`). A disabled PlatformAccount → **409** on any of these.
+- `POST /api/adapters/freelancer/search` body `{query, limit, location, remote_only, sandbox, auto_ingest}` → `{found, ingest, jobs[]}` — **502** on upstream failure
+- `POST /api/adapters/freelancer/bid` body `{proposal_queue_item_id}` → `{bid, bids_remaining}` — **400** when no `bidder_id`, **429** monthly quota depleted
+- `GET /api/adapters/freelancer/quota` → `{monthly_quota, bids_remaining}`
+- `POST /api/adapters/upwork/search` — same body/response as freelancer search
+- `POST /api/adapters/upwork/proposals` body `{proposal_queue_item_id}` → `{queued}` — enqueues the stealth submission; **400** when no `on_behalf_of`, **409** circuit open
+- `GET/POST /api/adapters/upwork/agency/members`, `DELETE /api/adapters/upwork/agency/members/{username}` — agency member roster
+- `POST /api/adapters/linkedin/search` — same body/response as freelancer search (provider selected via `LINKEDIN_PROVIDER`)
+
 ### WebSocket
-- `WS /ws/alerts` — server pushes JSON messages:
+- Auth handshake: `POST /api/alerts/ws-ticket` → `{ticket}` — a one-time, 30s
+  ticket (keeps the JWT out of WS query strings / access logs). **503** when
+  the Redis ticket store is down; the client then falls back to the legacy
+  path. Connect `WS /ws/alerts?ticket=<ticket>` — single-use, verified before
+  `accept()`. Legacy fallback: `WS /ws/alerts?token=<jwt>`. Auth failure →
+  close code **4401** (the SPA drops the session, same as a 401).
+- Server pushes JSON messages:
   - `{type: 'job_alert', job: Job}` — high-match job
   - `{type: 'hot_job', job: Job}` — urgency alert
   - `{type: 'proposal_status_changed', proposal_id: number, status: string}` —
@@ -116,6 +143,7 @@ interface RateCardEntry { id: number; skill_category: string; hourly_rate: numbe
 ### Profile management
 - `GET /api/profiles/templates?platform=upwork` → `ProfileTemplate[]`
 - `POST /api/profiles/templates` body `{platform, name, pitch_template}` → `ProfileTemplate`
+- `POST /api/profiles/templates/generate` body `{platform, notes?, temperature?, max_tokens?, timeout?}` → `{text, model, provider, latency_ms, offline, warning?}` — LLM-drafted pitch template (deterministic offline fallback); never auto-saves, save via the CRUD endpoints
 - `PUT /api/profiles/templates/{id}` / `DELETE /api/profiles/templates/{id}`
 - `GET /api/profiles/portfolio` → `PortfolioItem[]`
 - `POST /api/profiles/portfolio` body `{title, description, url, tags}` → `PortfolioItem`
@@ -172,7 +200,7 @@ interface ProposalReviewAction { reviewer: string; proposal_text?: string; bid_a
 ## New endpoints
 
 ### Proposal review queue (human-in-the-loop boundary)
-- `GET /api/proposals?status=pending_review&limit=50&offset=0` → `{items: ProposalQueueItem[], total: number}` — always the paginated envelope (limit default 50, max 200; `total` is the full filtered count)
+- `GET /api/proposals?status=pending_review&request_type=job&limit=50&offset=0` → `{items: ProposalQueueItem[], total: number}` — always the paginated envelope (limit default 50, max 200; `total` is the full filtered count; `request_type` filters `job`/`buyer_request`/`follow_up`)
 - `GET /api/proposals/{id}` → `ProposalQueueItem`
 - `POST /api/proposals/{id}/approve` body `ProposalReviewAction` → item (reviewer may edit text/bid before approving; 409 unless pending_review; optional `template_id` reuses a tenant-owned template instead of minting one — 404 if unknown/foreign; `save_as_template` defaults true, set false to skip minting)
 - `POST /api/proposals/{id}/reject` body `{reviewer}` → item
@@ -210,6 +238,7 @@ keyword_match 25 (primary exact weighted 15 + secondary fuzzy 10) · budget_real
 - `POST /api/proposals/{id}/outcome` body `{outcome: 'hired'|'rejected'|'ghosted'}` → item (updates template win_rate)
 - `POST /api/proposals/{id}/revert` body `{version_index}` → item (restores text/bid from `versions`)
 - `GET /api/proposals/templates/suggest?platform=upwork&skills=react,typescript` → `Template[]` (top-3 by win rate + skill overlap; Template = {id, title, platform, text, bid, tags[], uses, wins, losses, win_rate, created_at})
+- `POST /api/proposals/templates/generate` body `{platform, skills[], tone?, save?, temperature?, max_tokens?, timeout?}` → `{text, model, provider, latency_ms, offline, warning?, saved?}` — LLM-drafts a reusable Template (offline fallback when the provider is down); `save=true` persists it to the library
 - Approving now auto-saves the proposal as a Template (learning loop).
 
 ### Gigs (`/api/gigs`)
@@ -223,7 +252,7 @@ keyword_match 25 (primary exact weighted 15 + secondary fuzzy 10) · budget_real
 - `GET /api/gigs/metrics?gig_id=` → metric series `{week, impressions, clicks, orders, revenue, suggestions[]}`; `POST /api/gigs/metrics` (stealth worker posts scrapes); `POST /api/gigs/metrics/scrape` (enqueue weekly scrape)
 - `GET/POST /api/gigs/competitors?platform=&category=` — competitor snapshots `{gigs[], insights[]}`
 - `GET /api/gigs/buyer-requests` → `{offers_remaining_today, daily_limit: 10, count}`; `POST /api/gigs/buyer-requests/process` body `{requests[]}` (stealth worker posts scrapes; matching offers auto-queued as request_type='buyer_request', always pending_review)
-- `GET /api/gigs/stealth-tasks?platform=&status=pending` — browser worker poll; `POST /api/gigs/stealth-tasks/{id}/complete` body `{success, result}` (3+ failures trip the circuit breaker)
+- `GET /api/gigs/stealth-tasks?platform=&status=pending` — browser worker poll; `POST /api/gigs/stealth-tasks/{id}/claim` body `{worker_id}` → task — atomic claim (**404** unknown, **409** already claimed/done); `POST /api/gigs/stealth-tasks/{id}/complete` body `{success, result, worker_id}` — completion REQUIRES the claiming `worker_id` (`claimed_by` binding: **409** when another worker completes, or when the task isn't `claimed`) (3+ failures in the last hour trip the circuit breaker)
 - `GET/POST /api/gigs/circuit/{platform}` — read/open/close the per-platform circuit breaker
 
 ## Generation pipeline (server-side, for UI display)
@@ -329,6 +358,11 @@ are excluded from its own `client_history`.
   Generated from the item's stored analysis + matched portfolio (LLM with deterministic
   offline fallback). Cached on the item (`submission_result.interview_prep`) after the
   first call — repeated GETs are free.
+- `POST /api/proposals/{id}/retry-generation` → `ProposalQueueItem` — re-runs generation
+  for a `generation_failed` item: resets the auto-retry budget
+  (`submission_result.generation_retries`) and enqueues the job's generation task, which
+  regenerates THIS row in place. **409** unless `generation_failed`; **503** when the
+  task broker is down (the auto-retry beat still picks it up).
 
 ## Server-side behavior (informational)
 - Client history, when it exists, is injected into the proposal-generation prompt as

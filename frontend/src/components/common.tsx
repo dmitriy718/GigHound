@@ -1,4 +1,4 @@
-import { Component, useState } from 'react';
+import { Component, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { ScoreBreakdown } from '../types';
 
@@ -59,12 +59,21 @@ interface ModalProps {
   title: string;
   onClose: () => void;
   children: ReactNode;
+  dirty?: boolean; // backdrop click won't discard a dirty form (Escape still closes)
 }
 
-export function Modal({ title, onClose, children }: ModalProps) {
+export function Modal({ title, onClose, children, dirty = false }: ModalProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   return (
     <>
-      <div className="modal-backdrop" onClick={onClose} />
+      <div className="modal-backdrop" onClick={() => { if (!dirty) onClose(); }} />
       <div className="modal" role="dialog" aria-modal="true" aria-label={title}>
         <div className="spread" style={{ marginBottom: 14 }}>
           <h2 style={{ margin: 0 }}>{title}</h2>

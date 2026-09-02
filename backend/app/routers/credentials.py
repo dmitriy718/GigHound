@@ -44,7 +44,11 @@ _STEALTH_PLATFORMS = ("fiverr", "peopleperhour", "guru", "upwork")
 _OAUTH_KEYS = {"access_token", "refresh_token"}
 _STEALTH_KEYS = {"storage_state_json", "username", "password"}
 
-_DEFAULT_REDIRECT_URI = "http://localhost:5173/oauth/freelancer/callback"
+# Absolute URI (the provider requires one). Defaults to the all-in-one
+# serving origin — the SPA handles this path and completes the flow itself.
+# On any other deployment it MUST match the deployed origin and the redirect
+# URI registered in the Freelancer app config.
+_DEFAULT_REDIRECT_URI = "http://localhost:8000/oauth/freelancer/callback"
 
 
 def _freelancer_oauth_config() -> tuple[str, str, str]:
