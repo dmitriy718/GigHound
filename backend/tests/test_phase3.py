@@ -1,6 +1,8 @@
 """Phase 3 tests: client intelligence (identity, history, adapter mappings),
 follow-up drafting, interview prep, and bid-market intelligence (bid_advice
 bands + won-bid rate learning)."""
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -473,3 +475,130 @@ def test_record_outcome_hired_stores_winning_bid(db, user):
     db.commit()
     record_outcome(db, item2, "rejected")
     assert len(winning_bid_samples(db, user.id, "react")) == 1
+
+
+# ---------------- P3-3: version history preserves the pre-edit draft ----------------
+
+def test_approve_versions_previous_text(client):
+    c, Session = client
+    token = _register(c)
+    uid = _user_id(Session)
+    db = Session()
+    try:
+        _, item = _seed_submitted_item(db, uid, ext="ver-1", status="pending_review",
+                                       proposal_text="The original AI draft.")
+        item.versions = []
+        db.commit()
+        item_id = item.id
+    finally:
+        db.close()
+
+    # first edit-approve versions the PREVIOUS text (v1 = the AI draft)
+    r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
+               json={"reviewer": "P3", "proposal_text": "Edited by the reviewer."})
+    assert r.status_code == 200, r.text
+    versions = r.json()["versions"]
+    assert len(versions) == 1
+    assert versions[0]["text"] == "The original AI draft."
+    assert versions[0]["by"] == "P3"
+
+    # revert to v1 restores the AI draft and re-enters the review boundary
+    r = c.post(f"/api/proposals/{item_id}/revert", headers=_auth(token),
+               json={"version_index": 0})
+    assert r.status_code == 200, r.text
+    assert r.json()["proposal_text"] == "The original AI draft."
+    assert r.json()["status"] == "pending_review"
+
+    # a subsequent edit-approve versions the text live at that moment
+    r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
+               json={"reviewer": "P3", "proposal_text": "Second round of edits."})
+    assert r.status_code == 200, r.text
+    versions = r.json()["versions"]
+    assert len(versions) == 2
+    assert versions[-1]["text"] == "The original AI draft."
+
+
+# ---------------- P3-4: request_type filter, generation retry, auto-archive ----------------
+
+def test_proposals_list_filters_request_type(client):
+    c, Session = client
+    token = _register(c)
+    uid = _user_id(Session)
+    db = Session()
+    try:
+        _seed_submitted_item(db, uid, ext="rt-1", status="pending_review")
+        _, br = _seed_submitted_item(db, uid, ext="rt-2", status="pending_review",
+                                     request_type="buyer_request")
+        br_id = br.id
+    finally:
+        db.close()
+
+    r = c.get("/api/proposals?request_type=buyer_request", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 1
+    assert [i["id"] for i in body["items"]] == [br_id]
+    # unfiltered list still returns everything
+    assert c.get("/api/proposals", headers=_auth(token)).json()["total"] == 2
+
+
+def test_retry_generation_requeues_failed_item(client, no_broker):
+    c, Session = client
+    token = _register(c)
+    uid = _user_id(Session)
+    db = Session()
+    try:
+        job, failed = _seed_submitted_item(
+            db, uid, ext="rg-1", status="generation_failed",
+            submission_result={"error": "llm timeout", "generation_retries": 2})
+        _, pending = _seed_submitted_item(db, uid, ext="rg-2", status="pending_review")
+        job_id, failed_id, pending_id = job.id, failed.id, pending.id
+    finally:
+        db.close()
+
+    # only generation_failed is retryable
+    assert c.post(f"/api/proposals/{pending_id}/retry-generation",
+                  headers=_auth(token)).status_code == 409
+    assert c.post("/api/proposals/999999/retry-generation",
+                  headers=_auth(token)).status_code == 404
+
+    r = c.post(f"/api/proposals/{failed_id}/retry-generation", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    # retry budget reset; the job's generation task re-enqueued — its core
+    # regenerates THIS row, so the status stays until the task lands
+    assert r.json()["submission_result"]["generation_retries"] == 0
+    assert r.json()["status"] == "generation_failed"
+    assert no_broker == [job_id]
+
+
+def test_auto_archive_spares_jobs_with_live_queue_items(db, user, monkeypatch):
+    Session = sessionmaker(bind=db.get_bind())
+    monkeypatch.setattr("app.tasks.SessionLocal", Session)
+    stale = datetime.now(timezone.utc) - timedelta(days=15)
+
+    def _job(ext):
+        return Job(user_id=user.id, external_id=ext, platform="upwork", title="old",
+                   status="new", fetched_at=stale)
+
+    live = _job("arc-live")
+    unverified = _job("arc-unverified")
+    terminal = _job("arc-term")
+    plain = _job("arc-none")
+    db.add_all([live, unverified, terminal, plain])
+    db.commit()
+    db.add(ProposalQueueItem(user_id=user.id, job_id=live.id, platform="upwork",
+                             proposal_text="t", status="pending_review"))
+    db.add(ProposalQueueItem(user_id=user.id, job_id=unverified.id, platform="upwork",
+                             proposal_text="t", status="submitted_unverified"))
+    db.add(ProposalQueueItem(user_id=user.id, job_id=terminal.id, platform="upwork",
+                             proposal_text="t", status="submitted"))
+    db.commit()
+
+    from app.tasks import auto_archive_tick_core
+    result = auto_archive_tick_core()
+    assert result["archived"] == 2
+    db.expire_all()
+    assert live.status == "new"  # live queue item shields the job
+    assert unverified.status == "new"  # unverified still needs human attention
+    assert terminal.status == "archived"  # terminal items don't shield
+    assert plain.status == "archived"

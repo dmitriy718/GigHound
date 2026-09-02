@@ -18,9 +18,12 @@ interface Props {
   onNavigate: (view: ViewKey) => void;
 }
 
+const PAGE_SIZE = 50;
+
 export default function JobFeed({ messages, status: socketStatus, onNavigate }: Props) {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
   const [status, setStatus] = useState<JobStatus | ''>('new');
   const [platform, setPlatform] = useState<Platform | ''>('');
   const [minScore, setMinScore] = useState(0);
@@ -49,7 +52,8 @@ export default function JobFeed({ messages, status: socketStatus, onNavigate }: 
       status: status || undefined,
       platform: platform || undefined,
       min_score: debouncedMinScore > 0 ? debouncedMinScore : undefined,
-      limit: 50,
+      limit: PAGE_SIZE,
+      offset,
     })
       .then((res) => {
         if (seq !== loadSeq.current) return; // a newer request superseded this one
@@ -63,7 +67,10 @@ export default function JobFeed({ messages, status: socketStatus, onNavigate }: 
       });
   };
 
-  useEffect(load, [status, platform, debouncedMinScore]);
+  useEffect(load, [status, platform, debouncedMinScore, offset]);
+
+  // a filter change starts over from the first page
+  useEffect(() => setOffset(0), [status, platform, debouncedMinScore]);
 
   // reconnect = events were missed while the socket was down — reload once
   useReconnectRefetch(socketStatus, load);
@@ -249,6 +256,28 @@ export default function JobFeed({ messages, status: socketStatus, onNavigate }: 
           </div>
         ))}
       </div>
+
+      {total > 0 && (
+        <div className="filters-bar" style={{ marginTop: 12 }}>
+          <button
+            className="btn secondary small"
+            disabled={offset === 0}
+            onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+          >
+            ← Prev
+          </button>
+          <span className="muted" style={{ fontSize: 12, alignSelf: 'center' }}>
+            {offset + 1}–{Math.min(offset + PAGE_SIZE, total)} of {total}
+          </span>
+          <button
+            className="btn secondary small"
+            disabled={offset + PAGE_SIZE >= total}
+            onClick={() => setOffset(offset + PAGE_SIZE)}
+          >
+            Next →
+          </button>
+        </div>
+      )}
 
       {selected && (
         <>
