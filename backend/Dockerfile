@@ -14,7 +14,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---- Stage 2: backend runtime (serves API + the dist bundle) ----
-FROM python:3.12.14-slim
+FROM python:3.14.7-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     GIGHOUND_IN_DOCKER=1 \
