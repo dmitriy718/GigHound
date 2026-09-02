@@ -297,8 +297,15 @@ def test_client_history_aggregation_and_null(client):
                                title="Unrelated", client_info={"client_id": "cli-99"})
         db.add_all([past_job, other_client_job])
         db.commit()
-        for outcome in ("hired", "ghosted", "pending"):
-            db.add(ProposalQueueItem(user_id=uid, job_id=past_job.id, platform="upwork",
+        for i, outcome in enumerate(("hired", "ghosted", "pending")):
+            # one live proposal per job (partial unique index) — the client's
+            # history spreads across that client's past jobs
+            j = Job(user_id=uid, external_id=f"ch-1-{i}", platform="upwork",
+                    title="Old job",
+                    client_info={"client_id": "cli-77", "country": "United States"})
+            db.add(j)
+            db.flush()
+            db.add(ProposalQueueItem(user_id=uid, job_id=j.id, platform="upwork",
                                      proposal_text="t", status="submitted", outcome=outcome))
         db.add(ProposalQueueItem(user_id=uid, job_id=other_client_job.id, platform="upwork",
                                  proposal_text="t", status="submitted", outcome="rejected"))
@@ -469,7 +476,11 @@ def test_record_outcome_hired_stores_winning_bid(db, user):
     assert row.value["samples"][0]["bid_amount"] == 900.0
 
     # non-hired outcomes record nothing
-    item2 = ProposalQueueItem(user_id=user.id, job_id=job.id, platform="upwork",
+    job2 = Job(user_id=user.id, external_id="ro-2", platform="upwork", title="React app 2",
+               skills=["React"])
+    db.add(job2)
+    db.commit()
+    item2 = ProposalQueueItem(user_id=user.id, job_id=job2.id, platform="upwork",
                               proposal_text="t", status="submitted", bid_amount=700.0)
     db.add(item2)
     db.commit()

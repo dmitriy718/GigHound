@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 
 from rapidfuzz import fuzz
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .auth import platform_enabled
@@ -232,12 +233,40 @@ async def regenerate_failed_item(db: Session, item: ProposalQueueItem,
     return await generate_and_queue(db, job, ctx=ctx, item=item)
 
 
+def _commit_generation_item(db: Session, job: Job,
+                            item: ProposalQueueItem) -> tuple[ProposalQueueItem | None, bool]:
+    """Commit a generated queue item, tolerating a lost insert race.
+
+    generation_gates_pass is select-then-insert: two concurrent generations
+    for the same job can both pass. The partial unique index
+    (uq_proposal_queue_live_job) makes the loser fail here instead of
+    double-inserting. Returns (row, committed): on a lost race, committed is
+    False and row is the concurrently-inserted winner (the loser must skip
+    its own broadcast — the winner already sent one).
+    """
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        log.info("generation for job %d raced a concurrent insert; "
+                 "keeping the existing queue item", job.id)
+        return ((db.query(ProposalQueueItem)
+                 .filter(ProposalQueueItem.job_id == job.id,
+                         ProposalQueueItem.request_type == "job",
+                         ProposalQueueItem.status.notin_(["rejected", "failed"]))
+                 .order_by(ProposalQueueItem.created_at.desc())
+                 .first()), False)
+    db.refresh(item)
+    return item, True
+
+
 async def generate_and_queue(db: Session, job: Job, ctx: PipelineContext | None = None,
-                             item: ProposalQueueItem | None = None) -> ProposalQueueItem:
+                             item: ProposalQueueItem | None = None) -> ProposalQueueItem | None:
     """The LLM path: tuning → few-shot → generate → persist → WS notify.
 
     Runs in the generate_proposal_task Celery task (off the request path).
     With `item` set, regenerates that row in place instead of inserting one.
+    Returns None only when a lost insert race left no row to report.
     """
     from . import proposal_gen
     from .models import AuditLog
@@ -257,8 +286,11 @@ async def generate_and_queue(db: Session, job: Job, ctx: PipelineContext | None 
                                      status="generation_failed", needs_review=True)
             db.add(item)
         item.submission_result = {**(item.submission_result or {}), "error": str(exc)}
-        db.commit()
-        db.refresh(item)
+        item, committed = _commit_generation_item(db, job, item)
+        if item is None:  # raced row already cleaned up — nothing to report
+            return None
+        if not committed:  # lost race — the winner already broadcast
+            return item
         await alerts.broadcast(job.user_id, {
             "type": "generation_failed", "proposal_id": item.id,
             "error": str(exc), "job_id": job.id,
@@ -292,8 +324,11 @@ async def generate_and_queue(db: Session, job: Job, ctx: PipelineContext | None 
         "latency_ms": gen["latency_ms"], "humanized": bool(gen["humanized_text"]),
         "confidence": gen["confidence"],
     }))
-    db.commit()
-    db.refresh(item)
+    item, committed = _commit_generation_item(db, job, item)
+    if item is None:  # raced row already cleaned up — nothing to report
+        return None
+    if not committed:  # lost race — the winner already broadcast
+        return item
     await alerts.broadcast(job.user_id, {
         "type": "proposal_queued",
         "proposal_id": item.id,

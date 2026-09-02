@@ -652,11 +652,12 @@ def test_generation_retry_tick(db, user, monkeypatch):
                         lambda job_id: enqueued.append(job_id))
 
     job = Job(user_id=user.id, external_id="rt-1", platform="upwork", title="J")
-    db.add(job)
+    job2 = Job(user_id=user.id, external_id="rt-2", platform="upwork", title="J2")
+    db.add_all([job, job2])
     db.commit()
     fresh_fail = ProposalQueueItem(user_id=user.id, job_id=job.id, platform="upwork",
                                    status="generation_failed", submission_result={})
-    exhausted = ProposalQueueItem(user_id=user.id, job_id=job.id, platform="upwork",
+    exhausted = ProposalQueueItem(user_id=user.id, job_id=job2.id, platform="upwork",
                                   status="generation_failed",
                                   submission_result={"generation_retries": 2})
     db.add_all([fresh_fail, exhausted])
@@ -706,13 +707,17 @@ def test_analytics_funnel(client):
     now = datetime.now(timezone.utc)
     db = Session()
     try:
-        job = Job(user_id=uid, external_id="an-1", platform="upwork", title="J")
-        db.add(job)
-        db.commit()
+        seq = iter(range(10))
 
         def _item(status, outcome="pending", bid=None, replied=False, reason=None):
+            # one live generated proposal per job (partial unique index) —
+            # each funnel row parks on its own job
+            j = Job(user_id=uid, external_id=f"an-{next(seq)}",
+                    platform="upwork", title="J")
+            db.add(j)
+            db.flush()
             it = ProposalQueueItem(
-                user_id=uid, job_id=job.id, platform="upwork", proposal_text="t",
+                user_id=uid, job_id=j.id, platform="upwork", proposal_text="t",
                 status=status, outcome=outcome, bid_amount=bid,
                 rejection_reason=reason,
                 client_replied_at=now if replied else None)

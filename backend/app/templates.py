@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timezone
 
 from rapidfuzz import fuzz
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from .models import Job, ProposalQueueItem, RejectionFeedback, Template
@@ -84,10 +85,16 @@ def record_outcome(db: Session, proposal: ProposalQueueItem, outcome: str) -> No
                        Template.source_proposal_id == proposal.id)
                .first())
     if tpl:
+        # SQL atomic increments: concurrent outcome syncs must not lose
+        # updates to a read-modify-write race
         if outcome == "hired":
-            tpl.wins += 1
+            db.execute(update(Template).where(Template.id == tpl.id)
+                       .values(wins=Template.wins + 1))
         elif outcome in ("rejected", "ghosted"):
-            tpl.losses += 1
+            db.execute(update(Template).where(Template.id == tpl.id)
+                       .values(losses=Template.losses + 1))
+        db.flush()
+        db.refresh(tpl)  # pick up the atomic increments for win_rate
         total = tpl.wins + tpl.losses
         tpl.win_rate = round(100 * tpl.wins / total, 1) if total else 0.0
     if outcome == "hired" and proposal.bid_amount:

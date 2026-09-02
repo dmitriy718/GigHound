@@ -362,11 +362,22 @@ def calculate_bid(db: Session, job: Job, analysis: dict,
     rate = pick_rate(db, job.user_id, job, entries=entries)
     if job.job_type == "hourly":
         if rate and rate.hourly_rate:
-            return rate.hourly_rate, None, f"rate card: {rate.skill_category} @ ${rate.hourly_rate:g}/hr"
+            bid = float(rate.hourly_rate)
+            rationale = f"rate card: {rate.skill_category} @ ${rate.hourly_rate:g}/hr"
+            if job.budget_usd_max and bid > job.budget_usd_max:
+                # never bid above the client's stated max (same cap as the
+                # fixed-price branch below) — come in just under it
+                bid = job.budget_usd_max * 0.98
+                rationale += f"; capped at client max ${job.budget_usd_max:g}/hr"
+            return round(bid, 2), None, rationale
         return None, None, "no rate card entry matched; set manually"
     if job.platform == "fiverr":
-        base = (rate.fixed_min if rate and rate.fixed_min else None) or job.budget_usd_min or 50
-        return float(base), 3, "fiverr custom offer: basic tier price"
+        base = float((rate.fixed_min if rate and rate.fixed_min else None)
+                     or job.budget_usd_min or 50)
+        if job.budget_usd_max and base > job.budget_usd_max:
+            # same client-max cap as the fixed-price branch below
+            base = job.budget_usd_max * 0.98
+        return round(base, 2), 3, "fiverr custom offer: basic tier price"
     # fixed price: estimated hours × hourly × complexity multiplier (1.0–1.5)
     text = f"{job.title}\n{job.description}"
     complexity = estimate_complexity(text)
