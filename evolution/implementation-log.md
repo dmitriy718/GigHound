@@ -5,6 +5,28 @@ and verification results. Reports/audits live in their own files (see README.md)
 
 ---
 
+## 2026-09-03 — Dependabot backlog triage: 20 PRs consolidated into one verified wave (d6f7d4e)
+
+Dependabot opened 20 PRs on day one (the standing follow-up from the final
+scorecard). All 20 failed CI on `pip-audit` — not from their own content but
+because they branched before the worker python-dotenv CVE fix (ec9c123) and
+pip-audit audits the floating spec. Genuine content failures were only:
+worker httpx 0.28 (one test byte-matched JSON whitespace; httpx 0.28 switched
+`json=` to compact separators — test now parses the body) and the frontend
+toolchain majors (react 19 / vite 8 / plugin-react 6 are mutually dependent,
+so each PR failed ERESOLVE alone). Landed as one consolidated commit instead
+of 20 serial merges: react/react-dom 19.2 + types, vite 8.2, plugin-react 6.1,
+typescript 7.0; uvicorn 0.52, httpx 0.28, celery 5.6, alembic 1.19,
+pytest-asyncio 1.4; worker httpx 0.28 + pytest 9; Docker bases python
+3.14.7-slim + node 26-slim with CI python/node bumped to match (CI == Docker
+== local, which was already on 3.14.7/26); actions checkout v7.0.1 /
+setup-python v7.0.0 / setup-node v7.0.0 (SHA-pinned). Hashed locks regenerated
+for python 3.14. Verified locally before landing: backend 328/328, worker
+113/113, tsc -b + vite build clean, npm audit + pip-audit clean, all three
+docker images build. All 20 PRs closed as superseded.
+
+---
+
 ## 2026-08-29 — Final audit gaps: digest fan-out, worker .dockerignore, Fiverr/PPH/Guru outcome sync
 
 **1. Digest beat fan-in → fan-out (Scalability).** `run_due_digests` looped all
@@ -864,5 +886,5 @@ automation is designed to keep tenant accounts alive while doing verifiably hone
 
 **Standing follow-ups (honest register):** live-platform selector validation (needs real
 accounts — designated maintenance point in worker/platforms.py); per-tenant timezone
-alignment; horizontal worker scaling story; billing/SSO (AD-7); frontend test suite;
-dependabot PR triage (it opened several on day one, incl. node 22→26 — review deliberately).
+alignment; horizontal worker scaling story; billing/SSO (AD-7); frontend test suite.
+~~dependabot PR triage~~ — done 2026-09-03 (20 PRs consolidated in d6f7d4e, see log).
