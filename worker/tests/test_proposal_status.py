@@ -1,6 +1,8 @@
 """scrape_proposal_status handler tests: canonical status mapping, page
 extraction → backend posting, and the client post. Browser and backend are
 fakes — no Playwright, no network beyond httpx.MockTransport."""
+import json
+
 import httpx
 import pytest
 
@@ -235,4 +237,6 @@ def test_client_post_proposal_status():
                                             "has_unread_reply": False}])
     assert resp["outcomes"] == 1
     assert sent["path"] == "/api/gigs/proposal-status"
-    assert b'"task_id": 5' in sent["body"]
+    # httpx 0.28 serializes json= with compact separators — parse instead of
+    # byte-matching so the test doesn't depend on serializer whitespace.
+    assert json.loads(sent["body"])["task_id"] == 5
