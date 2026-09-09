@@ -2,7 +2,7 @@ fastapi==0.141.*
 uvicorn[standard]==0.52.*
 sqlalchemy==2.0.*
 psycopg2-binary==2.9.*
-redis==5.0.*
+redis==8.1.*
 pydantic==2.*
 python-dotenv==1.*
 rapidfuzz==3.*
