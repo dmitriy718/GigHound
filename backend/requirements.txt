@@ -9,6 +9,6 @@ rapidfuzz==3.*
 httpx==0.28.*
 cryptography==50.*
 celery==5.6.*
-bcrypt>=4.2,<6
+bcrypt>=5.0.0,<6
 PyJWT==2.*
 alembic==1.19.*
