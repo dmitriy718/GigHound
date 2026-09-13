@@ -56,6 +56,40 @@ def list_jobs(
     return {"jobs": [JobOut.model_validate(j) for j in jobs], "total": total}
 
 
+@router.get("/discovery-status", response_model=dict)
+def discovery_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Tenant-scoped observations, not a network health probe or credential export."""
+    from ..auth import platform_enabled
+    from ..models import AuditLog, SearchProfile
+    from ..platforms import DISCOVERY_PLATFORMS
+    from ..discovery import platforms_for_profile
+    profiles = scoped(db, SearchProfile, user).all()
+    selected = {platform for profile in profiles for platform in platforms_for_profile(db, profile)}
+    latest = scoped(db, AuditLog, user).filter(AuditLog.action_type.in_(
+        ["discovery_succeeded", "discovery_no_source"])).order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).first()
+    detail = latest.detail if latest and isinstance(latest.detail, dict) else {}
+    searched = detail.get("platforms") if isinstance(detail.get("platforms"), list) else []
+    failed = detail.get("failed_platforms") if isinstance(detail.get("failed_platforms"), list) else []
+    sources = []
+    for platform in DISCOVERY_PLATFORMS:
+        if not platform_enabled(db, user.id, platform):
+            state, message = "paused", "Paused or all accounts disabled"
+        elif platform not in selected:
+            state, message = "not_selected", "Not selected by a saved search profile"
+        elif platform in failed:
+            state, message = "failed", "Failed during the last search; check the connection"
+        elif platform in searched:
+            state, message = "searched", "Searched successfully in the last run"
+        else:
+            state, message = "unverified", "No result for this source in the last run"
+        sources.append({"platform": platform, "state": state, "message": message})
+    newest = scoped(db, Job, user).order_by(Job.fetched_at.desc()).first()
+    return {"profile_count": len(profiles), "sources": sources,
+            "last_run_at": latest.created_at if latest else None,
+            "last_ingested": detail.get("ingested") if type(detail.get("ingested")) is int else None,
+            "latest_job_at": newest.fetched_at if newest else None}
+
+
 @router.get("/{job_id}", response_model=JobOut)
 def get_job(job_id: int, db: Session = Depends(get_db),
             user: User = Depends(get_current_user)):

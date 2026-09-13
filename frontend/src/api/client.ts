@@ -503,3 +503,12 @@ export const reconcileProposalSubmission = (id: number, submitted: boolean, evid
 
 export const returnProposalToReview = (id: number): Promise<ProposalQueueItem> =>
   request(`/api/proposals/${id}/return-to-review`, {method:'POST'});
+
+export interface DiscoveryStatus {
+  profile_count: number;
+  sources: { platform: string; state: string; message: string }[];
+  last_run_at: string | null;
+  last_ingested: number | null;
+  latest_job_at: string | null;
+}
+export const getDiscoveryStatus = () => request<DiscoveryStatus>('/api/jobs/discovery-status');

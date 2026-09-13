@@ -883,3 +883,33 @@ async def test_ws_subscriber_forwards_pubsub_to_local(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await mgr._subscribe_loop()
     assert received == [(9, {"type": "proposal_queued", "proposal_id": 5, "job": {}})]
+
+
+def test_discovery_status_is_scoped_and_reports_observed_results(client):
+    from app.models import AuditLog
+    c, Session = client
+    token = _register(c)
+    other = _register(c, 'status-other@example.com')
+    mine = c.get('/api/auth/me', headers=_auth(token)).json()['id']
+    c.post('/api/search-profiles', headers=_auth(token), json={'name': 'React', 'boolean_query': 'React'})
+    with Session() as db:
+        db.add(AuditLog(user_id=mine, action_type='discovery_succeeded', platform='local',
+            detail={'platforms': ['freelancer'], 'failed_platforms': ['upwork'], 'ingested': 4,
+                    'secret_should_not_escape': 'private-detail'}))
+        db.commit()
+    result = c.get('/api/jobs/discovery-status', headers=_auth(token))
+    assert result.status_code == 200
+    data = result.json()
+    assert data['profile_count'] == 1 and data['last_ingested'] == 4
+    states = {s['platform']: s['state'] for s in data['sources']}
+    assert states['freelancer'] == 'searched' and states['upwork'] == 'failed'
+    assert 'private-detail' not in result.text
+    from app import circuit_breaker
+    with Session() as db:
+        circuit_breaker.transition('freelancer', 'open', 'operator pause', mine, manual_stop=True, db=db)
+        db.commit()
+    paused = c.get('/api/jobs/discovery-status', headers=_auth(token)).json()
+    assert next(s for s in paused['sources'] if s['platform'] == 'freelancer')['state'] == 'paused'
+    isolated = c.get('/api/jobs/discovery-status', headers=_auth(other)).json()
+    assert isolated['last_run_at'] is None and isolated['profile_count'] == 0
+    assert c.get('/api/jobs/discovery-status').status_code == 401

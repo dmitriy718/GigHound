@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { archiveJob, bulkArchiveJobs, getJob, getJobs, unarchiveJob } from '../api/client';
+import { archiveJob, bulkArchiveJobs, getJob, getJobs, unarchiveJob, getDiscoveryStatus, type DiscoveryStatus } from '../api/client';
 import type { ClientHistory, Job, JobStatus, Platform } from '../types';
 import { PLATFORMS } from '../types';
 import {
@@ -21,6 +21,8 @@ interface Props {
 const PAGE_SIZE = 50;
 
 export default function JobFeed({ messages, status: socketStatus, onNavigate }: Props) {
+  const [discovery, setDiscovery] = useState<DiscoveryStatus | null>(null);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
@@ -59,6 +61,9 @@ export default function JobFeed({ messages, status: socketStatus, onNavigate }: 
 
   const load = () => {
     const seq = ++loadSeq.current;
+    getDiscoveryStatus().then((value) => {
+      if (seq === loadSeq.current) { setDiscovery(value); setDiscoveryError(null); }
+    }).catch(() => { if (seq === loadSeq.current) setDiscoveryError('Discovery status unavailable.'); });
     getJobs({
       status: status || undefined,
       platform: platform || undefined,
@@ -173,6 +178,17 @@ export default function JobFeed({ messages, status: socketStatus, onNavigate }: 
     <div>
       <h1>Job Feed</h1>
       <p className="page-sub">{total} jobs total · live updates via WebSocket</p>
+      <section className="info-banner" aria-label="Job discovery status">
+        <strong>Job discovery</strong>
+        {discoveryError ? <p role="alert">{discoveryError}</p> : discovery ? <>
+          <p>{discovery.last_run_at ? `Last search: ${formatDate(discovery.last_run_at)} · ${discovery.last_ingested ?? 'Unknown'} new jobs kept.` : 'No search has completed yet.'}
+            {' '}{discovery.profile_count} saved search profiles.</p>
+          <ul>{discovery.sources.map((source) => <li key={source.platform}><strong>{source.platform}</strong>: {source.message}</li>)}</ul>
+          <p>Freelancer supports public job search before OAuth approval. Fiverr, Guru, PeoplePerHour and Indeed do not use this search feed; use their supported workflows or import a job in Guided applications.</p>
+        </> : <p>Loading discovery status…</p>}
+        <button className="btn secondary" onClick={() => onNavigate('searchProfiles')}>Search now / edit searches</button>{' '}
+        <button className="btn secondary" onClick={() => onNavigate('accounts')}>Manage connections</button>
+      </section>
       <OnboardingChecklist onNavigate={onNavigate} />
       <ErrorBanner error={error} />
       {notice && <div className="info-banner">{notice}</div>}
