@@ -1068,3 +1068,21 @@ def test_indeed_connector_is_not_offered_but_manual_ingest_remains_valid(db):
     assert exc.value.status_code==422
     assert JobIngest(platform='indeed',external_id='manual',title='Manually imported job').platform=='indeed'
     assert 'indeed' not in DISCOVERY_PLATFORMS
+
+
+def test_browser_task_cannot_follow_reused_account_id(db):
+    from fastapi import HTTPException
+    from app.models import PlatformAccount
+    from app.routers.gigs import _require_browser_account
+    account = PlatformAccount(user_id=1, platform='upwork', principal='original', label='Original', mode='hybrid')
+    db.add(account); db.commit()
+    account_id = account.id
+    task = StealthTask(user_id=1, platform='upwork', task_type='scrape_proposal_status', payload={'account_id':account_id})
+    db.add(task); db.commit()
+    assert _require_browser_account(db, task).principal == 'original'
+    db.delete(account); db.commit()
+    replacement = PlatformAccount(id=account_id, user_id=1, platform='upwork', principal='replacement', label='Replacement', mode='hybrid')
+    db.add(replacement); db.commit()
+    with pytest.raises(HTTPException) as stopped:
+        _require_browser_account(db, task)
+    assert stopped.value.status_code == 409

@@ -595,14 +595,18 @@ def _version_and_snapshot_review(mapper, connection, target):
 @event.listens_for(StealthTask, "before_insert")
 def _bind_task_account(mapper, connection, target):
     from sqlalchemy import select
-    if (target.payload or {}).get("account_id") is not None:
-        return  # Preserve explicit selection; claim authorization validates ownership.
-    candidates = connection.execute(select(PlatformAccount.id).where(
+    payload = target.payload or {}
+    statement = select(PlatformAccount.id, PlatformAccount.identity_epoch).where(
         PlatformAccount.user_id == target.user_id, PlatformAccount.platform == target.platform,
         PlatformAccount.enabled.is_(True), PlatformAccount.mode.in_(["stealth", "hybrid"]),
-    ).limit(2)).scalars().all()
+    )
+    if payload.get("account_id") is not None:
+        statement = statement.where(PlatformAccount.id == payload["account_id"])
+    candidates = connection.execute(statement.limit(2)).all()
     if len(candidates) == 1:
-        target.payload = {**(target.payload or {}), "account_id": candidates[0]}
+        account_id, epoch = candidates[0]
+        target.payload = {**payload, "account_id": account_id,
+                          "account_epoch": payload.get("account_epoch", epoch)}
 
 
 class AutomationCircuit(Base):
