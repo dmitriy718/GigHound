@@ -11,6 +11,7 @@ import {
   getGigTemplates,
   getGigs,
   getAccounts,
+  assignGigAccount,
   registerGig,
   seoTitleScore,
   toggleGigTemplate,
@@ -97,6 +98,10 @@ function MetricsChart({ metrics }: { metrics: GigMetric[] }) {
 }
 
 function GigsTab() {
+  const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const [seller, setSeller] = useState('');
+  const [sellerBusy, setSellerBusy] = useState(false);
+  useEffect(() => { getAccounts().then(setAccounts).catch((e: Error) => setError(e.message)); }, []);
   const [gigs, setGigs] = useState<Gig[]>([]);
   const [platform, setPlatform] = useState<Platform | ''>('');
   const [error, setError] = useState<string | null>(null);
@@ -125,6 +130,7 @@ function GigsTab() {
 
   const openMetrics = (gig: Gig) => {
     setSelected(gig);
+    setSeller(gig.account_id == null ? '' : String(gig.account_id));
     setMetrics([]);
     setMetricsError(null);
     getGigMetrics(gig.id)
@@ -134,7 +140,7 @@ function GigsTab() {
 
   const scrape = () => {
     triggerGigScrape()
-      .then((res) => setInfo(`Weekly scrape enqueued (${res.queued_tasks.length} gigs).`))
+      .then((res) => setInfo(`Queued ${res.queued_tasks.length} seller dashboard tasks. ${res.skipped_gig_ids.length} listings skipped: check seller assignment and platform pauses.`))
       .catch((e: Error) => setError(e.message));
   };
 
@@ -241,6 +247,21 @@ function GigsTab() {
         <div className="panel">
           <h2 style={{ marginTop: 0 }}>Metrics — {selected.title}</h2>
           <ErrorBanner error={metricsError} />
+          <label>Metrics seller account
+            <select aria-label="Metrics seller account" value={seller} disabled={sellerBusy} onChange={(e) => setSeller(e.target.value)}>
+              <option value="">Unassigned — manual tracking only</option>
+              {accounts.filter((a) => a.platform === selected.platform && a.enabled && ['stealth', 'hybrid'].includes(a.mode)).map((a) => <option key={a.id} value={a.id}>{a.label || a.principal}</option>)}
+            </select>
+          </label>
+          <button className="btn secondary" disabled={sellerBusy} onClick={async () => {
+            setSellerBusy(true);
+            try {
+              const updated = await assignGigAccount(selected.id, seller ? Number(seller) : null, selected.account_binding_version);
+              setSelected(updated); load(); setMetricsError(null);
+            } catch(e) { setMetricsError((e as Error).message); }
+            finally { setSellerBusy(false); }
+          }}>Save seller assignment</button>
+          <p className="muted">Assign the account that owns this listing before collecting dashboard metrics. Earlier metrics tasks cannot overwrite a changed assignment.</p>
           {metrics.length === 0 && !metricsError && (
             <p className="muted">No metrics yet — trigger a weekly scrape.</p>
           )}

@@ -371,6 +371,7 @@ export const retryProposalGeneration = (id: number) =>
 // ---- Gigs (`/api/gigs`) ----
 
 export interface GigPayload {
+  account_id?: number | null;
   platform: Platform;
   title: string;
   external_id: string;
@@ -387,7 +388,7 @@ export const registerGig = (body: GigPayload) =>
 export const getGigMetrics = (gigId: number) =>
   request<GigMetric[]>(`/api/gigs/metrics?gig_id=${encodeURIComponent(gigId)}`);
 export const triggerGigScrape = () =>
-  request<{ queued_tasks: number[] }>('/api/gigs/metrics/scrape', { method: 'POST' });
+  request<{ queued_tasks: number[]; skipped_gig_ids: number[] }>('/api/gigs/metrics/scrape', { method: 'POST' });
 
 export interface GigTemplatePayload {
   platform: Platform;
@@ -512,3 +513,6 @@ export interface DiscoveryStatus {
   latest_job_at: string | null;
 }
 export const getDiscoveryStatus = () => request<DiscoveryStatus>('/api/jobs/discovery-status');
+
+export const assignGigAccount = (id: number, accountId: number | null, expectedVersion: number) =>
+  request<Gig>(`/api/gigs/${id}/account`, {method: 'PUT', body: JSON.stringify({account_id: accountId, expected_version: expectedVersion})});

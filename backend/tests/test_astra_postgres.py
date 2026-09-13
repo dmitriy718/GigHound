@@ -311,3 +311,34 @@ def test_duplicate_reply_polling_emits_one_notification(pg_sessions,monkeypatch)
         results=list(executor.map(sync,range(2)))
     assert sorted(results)==[0,1]
     assert len(events)==1
+
+
+def test_gig_seller_assignment_compare_and_set(pg_sessions):
+    from threading import Barrier
+    from app.models import Gig
+    from app.routers.gigs import assign_gig_account
+    from app.schemas import GigAccountIn
+    uid, _ = seed(pg_sessions, platform='fiverr')
+    with pg_sessions() as db:
+        first = db.query(PlatformAccount).filter_by(user_id=uid).one()
+        second = PlatformAccount(user_id=uid, platform='fiverr', label='Second', principal='second', mode='stealth', enabled=True)
+        gig = Gig(user_id=uid, platform='fiverr', title='Synthetic race')
+        db.add_all([second, gig]); db.commit()
+        ids, gid = [first.id, second.id], gig.id
+    ready = Barrier(2)
+    def assign(account_id):
+        with pg_sessions() as db:
+            user = db.get(User, uid)
+            ready.wait(timeout=5)
+            try:
+                result = assign_gig_account(gid, GigAccountIn(account_id=account_id, expected_version=0), db, user)
+                return (200, result.account_id)
+            except HTTPException as exc:
+                return (exc.status_code, account_id)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(assign, ids))
+    assert sorted(status for status, _ in results) == [200, 409]
+    with pg_sessions() as db:
+        gig = db.get(Gig, gid)
+        assert gig.account_binding_version == 1
+        assert gig.account_id == next(account_id for status, account_id in results if status == 200)

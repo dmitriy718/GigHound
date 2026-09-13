@@ -312,7 +312,9 @@ def test_register_gig_validates_platform(client):
 
 def test_metrics_scrape_skips_platforms_worker_cant_serve(db, user):
     db.add(Gig(user_id=user.id, platform="linkedin", title="g", url="https://x/l"))
-    db.add(Gig(user_id=user.id, platform="fiverr", title="g2", url="https://x/f"))
+    account = _fiverr_account(db, user.id)
+    db.add(Gig(user_id=user.id, platform="fiverr", title="g2", url="https://x/f",
+               account_id=account.id, account_epoch=account.identity_epoch))
     db.commit()
     tasks = enqueue_metrics_scrape(db, user.id)
     assert [t.platform for t in tasks] == ["fiverr"]
@@ -341,13 +343,14 @@ def test_emitted_task_types_resolve_in_worker_registry(db, user):
     assert db.query(StealthTask).filter_by(task_type="upwork_catalog_upsert").count() == 0
 
     # buyer-request fetch
-    _fiverr_account(db, user.id)
+    account = _fiverr_account(db, user.id)
     fetch = enqueue_buyer_request_fetch(db, user.id)
     assert fetch.task_type == "fetch_buyer_requests"
     assert fetch.task_type in WORKER_HANDLER_KEYS
 
     # metrics scrape
-    db.add(Gig(user_id=user.id, platform="fiverr", title="g", url="https://x/g"))
+    db.add(Gig(user_id=user.id, platform="fiverr", title="g", url="https://x/g",
+               account_id=account.id, account_epoch=account.identity_epoch))
     db.commit()
     scrapes = enqueue_metrics_scrape(db, user.id)
     assert scrapes and all(t.task_type == "scrape_gig_metrics" for t in scrapes)
@@ -383,3 +386,55 @@ def test_gig_creation_requires_owned_explicit_seller_account(client, monkeypatch
         db.get(PlatformAccount, second_id).enabled = False
         db.commit()
     assert c.post(endpoint + f'?account_id={second_id}', headers=_auth(token)).status_code == 409
+
+
+def test_metrics_group_by_seller_and_skip_stale_or_unassigned(db, user):
+    first = PlatformAccount(user_id=user.id, platform='fiverr', principal='first', label='First', mode='stealth', enabled=True)
+    second = PlatformAccount(user_id=user.id, platform='fiverr', principal='second', label='Second', mode='stealth', enabled=True)
+    db.add_all([first, second]); db.commit()
+    listings = [Gig(user_id=user.id, platform='fiverr', title='first', account_id=first.id, account_epoch=first.identity_epoch),
+                Gig(user_id=user.id, platform='fiverr', title='second', account_id=second.id, account_epoch=second.identity_epoch),
+                Gig(user_id=user.id, platform='fiverr', title='legacy'),
+                Gig(user_id=user.id, platform='fiverr', title='recreated', account_id=second.id, account_epoch='old-identity')]
+    db.add_all(listings); db.commit()
+    report = {}
+    tasks = enqueue_metrics_scrape(db, user.id, report=report)
+    assert len(tasks) == 2
+    assert {t.payload['account_id']: [g['id'] for g in t.payload['gigs']] for t in tasks} == {
+        first.id: [listings[0].id], second.id: [listings[1].id]}
+    assert set(report['skipped_gig_ids']) == {listings[2].id, listings[3].id}
+    assert all(t.payload['gigs'][0]['account_binding_version'] == 0 for t in tasks)
+    second.enabled = False; db.commit()
+    assert [t.payload['account_id'] for t in enqueue_metrics_scrape(db, user.id)] == [first.id]
+
+
+def test_gig_assignment_conflict_and_stale_metrics(client, monkeypatch):
+    from app.routers import gigs as routes
+    from app.schemas import GigMetricIn
+    from fastapi import HTTPException
+    c, Session = client
+    token = _register(c)
+    uid = c.get('/api/auth/me', headers=_auth(token)).json()['id']
+    with Session() as db:
+        first = PlatformAccount(user_id=uid, platform='fiverr', principal='first', label='First', mode='stealth', enabled=True)
+        second = PlatformAccount(user_id=uid, platform='fiverr', principal='second', label='Second', mode='stealth', enabled=True)
+        gig = Gig(user_id=uid, platform='fiverr', title='Legacy listing')
+        db.add_all([first, second, gig]); db.commit()
+        first_id, second_id, gig_id = first.id, second.id, gig.id
+    path = f'/api/gigs/{gig_id}/account'
+    r = c.put(path, headers=_auth(token), json={'account_id': first_id, 'expected_version': 0})
+    assert r.status_code == 200 and r.json()['account_binding_version'] == 1
+    assert c.put(path, headers=_auth(token), json={'account_id': second_id, 'expected_version': 0}).status_code == 409
+    with Session() as db:
+        task = enqueue_metrics_scrape(db, uid)[0]
+        task_id = task.id
+    r = c.put(path, headers=_auth(token), json={'account_id': second_id, 'expected_version': 1})
+    assert r.status_code == 200
+    with Session() as db:
+        monkeypatch.setattr(routes, '_worker_result_task', lambda *a: db.get(StealthTask, task_id))
+        with pytest.raises(HTTPException) as exc:
+            routes.ingest_metrics(GigMetricIn(gig_id=gig_id, impressions=10, clicks=1, orders=0, revenue=0), db, None)
+        assert exc.value.status_code == 409
+    other = _register(c, 'foreign-seller@example.com')
+    assert c.put(path, headers=_auth(other), json={'account_id': first_id, 'expected_version': 2}).status_code == 404
+    assert c.put(path, headers=_auth(token), json={'account_id': 999999, 'expected_version': 2}).status_code == 409

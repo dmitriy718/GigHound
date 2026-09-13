@@ -1,5 +1,5 @@
 from ..pagination import PageLimit, PageOffset
-from ..schemas import SeoTitleIn, FaqGenerateIn, GigRegisterIn
+from ..schemas import SeoTitleIn, FaqGenerateIn, GigRegisterIn, GigAccountIn
 """Gig management endpoints: templates, creation triggers, analytics,
 competitor intel, buyer-request inbox, and stealth-task handoff."""
 import json
@@ -160,6 +160,32 @@ def list_gigs(platform: str | None = None, status: str | None = None,
     return q.order_by(Gig.id).offset(offset).limit(limit).all()
 
 
+def _gig_seller(db, user_id, platform, account_id):
+    if account_id is None:
+        return None
+    account = db.query(PlatformAccount).filter_by(id=account_id, user_id=user_id, platform=platform).first()
+    if account is None or not account.enabled or account.mode not in ("stealth", "hybrid"):
+        raise HTTPException(409, "Select an enabled browser account for this platform")
+    return account
+
+
+@router.put("/{gig_id}/account", response_model=GigOut)
+def assign_gig_account(gig_id: int, body: GigAccountIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    gig = get_owned(db, Gig, gig_id, user)
+    if gig is None:
+        raise HTTPException(404, "gig not found")
+    db.refresh(gig, with_for_update=True)
+    if gig.account_binding_version != body.expected_version:
+        raise HTTPException(409, "Seller assignment changed; reload before saving")
+    account = _gig_seller(db, user.id, gig.platform, body.account_id)
+    gig.account_id = account.id if account else None
+    gig.account_epoch = account.identity_epoch if account else None
+    gig.account_binding_version += 1
+    db.commit()
+    db.refresh(gig)
+    return gig
+
+
 @router.post("", response_model=GigOut, status_code=201)
 def register_gig(body: GigRegisterIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     body = body.model_dump()
@@ -175,7 +201,10 @@ def register_gig(body: GigRegisterIn, db: Session = Depends(get_db), user: User 
             raise HTTPException(404, "gig template not found")
         if template.platform != platform:
             raise HTTPException(422, "gig and template platforms must match")
+    account = _gig_seller(db, user.id, platform, body.get("account_id"))
     gig = Gig(
+        account_id=account.id if account else None,
+        account_epoch=account.identity_epoch if account else None,
         user_id=user.id,
         platform=platform, title=body.get("title", ""),
         external_id=body.get("external_id", ""), url=body.get("url", ""),
@@ -210,14 +239,22 @@ def ingest_metrics(body: GigMetricIn, db: Session = Depends(get_db),
         gig = get_owned(db, Gig, body.gig_id, principal)
     if not gig:
         raise HTTPException(404, "gig not found")
+    if principal is None:
+        db.refresh(gig, with_for_update=True)
+        source = next(g for g in task.payload['gigs'] if g.get('id') == gig.id)
+        if (gig.account_id != task.payload.get('account_id') or
+            gig.account_epoch != task.payload.get('account_epoch') or
+            source.get('account_binding_version') != gig.account_binding_version):
+            raise HTTPException(409, "Gig seller assignment changed; collect fresh metrics")
     return record_metrics(db, gig, body.impressions, body.clicks,
                           body.orders, body.revenue, body.week)
 
 
 @router.post("/metrics/scrape", response_model=dict)
 def trigger_metrics_scrape(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    tasks = enqueue_metrics_scrape(db, user.id)
-    return {"queued_tasks": [t.id for t in tasks]}
+    report = {}
+    tasks = enqueue_metrics_scrape(db, user.id, report=report)
+    return {"queued_tasks": [t.id for t in tasks], **report}
 
 
 # --- competitor intel ---

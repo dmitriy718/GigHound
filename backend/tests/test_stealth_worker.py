@@ -338,13 +338,15 @@ def test_worker_posts_results(client):
     db = Session()
     from app.models import Gig
     u = _user(db, "results@example.com")
-    db.add(PlatformAccount(user_id=u.id,platform="fiverr",label="account",mode="stealth"))
-    gig = Gig(user_id=u.id, platform="fiverr", title="g", url="https://www.fiverr.com/g")
+    seller = PlatformAccount(user_id=u.id,platform="fiverr",label="account",mode="stealth")
+    db.add(seller); db.commit()
+    gig = Gig(user_id=u.id, platform="fiverr", title="g", url="https://www.fiverr.com/g",
+              account_id=seller.id, account_epoch=seller.identity_epoch)
     db.add(gig);db.commit()
     def claimed(kind,payload):
         t = _task(db,u.id,task_type=kind,payload=payload,status="claimed",claimed_by="w-1")
         return {"task_id":t.id,"worker_id":"w-1","claim_token":"test-claim"}
-    metric_claim=claimed("scrape_gig_metrics",{"gigs":[{"id":gig.id,"url":gig.url}]})
+    metric_claim=claimed("scrape_gig_metrics",{"gigs":[{"id":gig.id,"url":gig.url,"account_binding_version":gig.account_binding_version}]})
     assert c.post("/api/gigs/metrics",json={"gig_id":gig.id},headers=WORKER_HEADERS).status_code==409
     for _ in range(2):
         r=c.post("/api/gigs/metrics",json={**metric_claim,"gig_id":gig.id,"impressions":10,"clicks":2},headers=WORKER_HEADERS)

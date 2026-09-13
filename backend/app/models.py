@@ -390,6 +390,10 @@ class Gig(Base):
     template_id: Mapped[int | None] = mapped_column(
         ForeignKey("gig_templates.id", ondelete="SET NULL"), nullable=True
     )
+    # Identity snapshots intentionally survive account deletion for explicit reassignment.
+    account_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    account_epoch: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    account_binding_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     external_id: Mapped[str] = mapped_column(String(300), default="")
     title: Mapped[str] = mapped_column(String(300), default="")
     status: Mapped[str] = mapped_column(String(20), default="draft", index=True)

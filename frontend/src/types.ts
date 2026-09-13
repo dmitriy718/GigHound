@@ -460,6 +460,8 @@ export const GIG_STATUSES: GigStatus[] = ['draft', 'active', 'paused'];
 
 export interface Gig {
   id: number;
+  account_id: number | null;
+  account_binding_version: number;
   platform: Platform;
   title: string;
   external_id: string | null;

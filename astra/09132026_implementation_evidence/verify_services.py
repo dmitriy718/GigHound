@@ -36,6 +36,8 @@ engine=create_engine(os.environ['DATABASE_URL'])
 with Session(engine) as db:
     db.add(User(email='migration@example.test',password_hash='synthetic'))
     db.commit()
+    db.execute(text("INSERT INTO gigs(user_id,platform,external_id,title,status,url,created_at) VALUES (1,'fiverr','','legacy listing','active','',CURRENT_TIMESTAMP)"))
+    db.commit()
 """
     subprocess.run([str(root/'backend/.venv/bin/python'),'-c',seed_code],env=migration_env,check=True)
     alembic('upgrade','head')
@@ -48,6 +50,8 @@ with engine.connect() as db:
     rows=db.execute(text('SELECT state,manual_stop,revision FROM automation_circuits')).all()
     assert len(rows)==7 and all(tuple(r)==('open',True,1) for r in rows),rows
     db.execute(text('SELECT platform_account_id FROM proposal_queue LIMIT 1'))
+    gig=db.execute(text('SELECT account_id,account_epoch,account_binding_version FROM gigs')).one()
+    assert tuple(gig)==(None,None,0),gig
 """
     subprocess.run([str(root/'backend/.venv/bin/python'),'-c',verify_code],env=migration_env,check=True)
     alembic('downgrade','base')
