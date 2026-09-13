@@ -327,3 +327,32 @@ async def test_malformed_refresh_does_not_overwrite_credentials(db, user, payloa
         assert CredentialVault(db, user.id).load('freelancer', 'default') == before
     finally:
         await adapter.close()
+
+@pytest.mark.asyncio
+async def test_freelancer_public_search_without_credentials(db, user):
+    project = {k: v for k, v in FL_PROJECT.items() if k != 'owner'}
+    project['owner_id'] = 42
+    calls = []
+    def handler(request):
+        calls.append(request.url.path)
+        assert 'Freelancer-OAuth-V1' not in request.headers
+        assert request.url.params['query'] == 'react'
+        return httpx.Response(200, json={'status': 'success', 'result': {
+            'projects': [project], 'users': {'42': {'id': 42, 'username': 'public-client'}}}})
+    async with _mock_client(handler) as client:
+        adapter = FreelancerAdapter(db, user.id, client=client)
+        jobs = await adapter.search_jobs('react')
+        assert jobs[0].client_info.client_id == '42'
+        with pytest.raises(AdapterAuthError):
+            await adapter.get_threads()
+    assert calls == ['/api/projects/0.1/projects/active/']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', [{}, {'status': 'error'}, {'status': 'success', 'result': {}},
+    {'status': 'success', 'result': {'projects': [None]}}])
+async def test_freelancer_public_search_rejects_invalid_response(db, user, payload):
+    from app.adapters.base import AdapterError
+    async with _mock_client(lambda request: httpx.Response(200, json=payload)) as client:
+        with pytest.raises(AdapterError):
+            await FreelancerAdapter(db, user.id, client=client).search_jobs('react')

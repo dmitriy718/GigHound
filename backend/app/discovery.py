@@ -8,6 +8,7 @@ Redis lock (graceful open when Redis is down); adapter auth errors skip
 that platform for the user — a discovery run never crashes the tick.
 """
 import logging
+import httpx
 
 from sqlalchemy.orm import Session
 
@@ -139,6 +140,9 @@ async def _search_account(db: Session, user: User, platform: str,
         log.warning("discovery: %s search failed for user %d: %s",
                     platform, user.id, exc)
         return None
+    except (httpx.HTTPError, ValueError, KeyError):
+        log.warning("discovery: %s returned an unusable response for user %d", platform, user.id)
+        return None
     finally:
         if adapter is not None:
             await adapter.close()
@@ -155,13 +159,14 @@ async def run_profile_discovery(db: Session, user: User,
     respect_pacing=False (explicit user action beats the pacing lock).
     """
     terms = search_terms_for_profile(db, profile)
-    searched, ingested = [], 0
+    searched, ingested, failed = [], 0, []
     for platform in platforms_for_profile(db, profile):
         if respect_pacing and not _acquire_platform_slot(user.id, platform, profile.id):
             log.info("discovery: %s for user %d skipped (paced)", platform, user.id)
             continue
         postings = await _search_platform(db, user, platform, terms)
         if postings is None:
+            failed.append(platform)
             continue
         searched.append(platform)
         if not postings:
@@ -170,6 +175,8 @@ async def run_profile_discovery(db: Session, user: User,
             IngestJobsIn(jobs=[p.to_ingest() for p in postings]), db, user)
         ingested += result.ingested
     from .models import AuditLog
-    db.add(AuditLog(user_id=user.id,action_type="discovery_succeeded" if searched else "discovery_no_source",platform="local",detail={"profile_id":profile.id,"platforms":searched,"ingested":ingested}))
+    db.add(AuditLog(user_id=user.id,action_type="discovery_succeeded" if searched else "discovery_no_source",platform="local",detail={"profile_id":profile.id,"platforms":searched,"ingested":ingested,"failed_platforms":failed}))
     db.commit()
-    return {"queued": True, "platforms": searched, "ingested": ingested}
+    return {"queued": bool(searched), "platforms": searched, "ingested": ingested,
+            "failed_platforms": failed,
+            "message": "Search completed" if searched else "No source was searched. Check API connections, platform pauses and search settings."}
