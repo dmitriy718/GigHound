@@ -8,7 +8,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import get_args
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
@@ -119,12 +119,22 @@ def toggle_template(tpl_id: int, db: Session = Depends(get_db), user: User = Dep
 # --- gig creation (queues stealth task; DRAFT only for Fiverr) ---
 
 @router.post("/templates/{tpl_id}/create-gig", response_model=dict)
-def create_gig_from_template(tpl_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def create_gig_from_template(tpl_id: int, account_id: int | None = Query(None, ge=1), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     tpl = get_owned(db, GigTemplate, tpl_id, user)
     if not tpl:
         raise HTTPException(404, "gig template not found")
     if tpl.platform == "fiverr":
-        task, err = fiverr_monitor.queue_gig_creation(db, tpl)
+        accounts = db.query(PlatformAccount).filter(
+            PlatformAccount.user_id == user.id, PlatformAccount.platform == tpl.platform,
+            PlatformAccount.enabled.is_(True), PlatformAccount.mode.in_(["stealth", "hybrid"]))
+        if account_id is not None:
+            accounts = accounts.filter(PlatformAccount.id == account_id)
+        candidates = accounts.limit(2).all()
+        if not candidates:
+            raise HTTPException(409, "Connect an enabled Fiverr browser account before creating a draft")
+        if len(candidates) != 1:
+            raise HTTPException(409, "Choose the Fiverr account for this draft")
+        task, err = fiverr_monitor.queue_gig_creation(db, tpl, account=candidates[0])
     elif tpl.platform == "upwork":
         task, err = fiverr_monitor.queue_upwork_catalog_upsert(db, tpl)
     else:

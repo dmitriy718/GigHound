@@ -408,9 +408,9 @@ export const deleteGigTemplate = (id: number) =>
   request<void>(`/api/gigs/templates/${id}`, { method: 'DELETE' });
 export const toggleGigTemplate = (id: number) =>
   request<GigTemplate>(`/api/gigs/templates/${id}/toggle`, { method: 'POST' });
-export const createGigFromTemplate = (id: number) =>
+export const createGigFromTemplate = (id: number, accountId?: number) =>
   request<{ stealth_task_id: number; status: string; note: string }>(
-    `/api/gigs/templates/${id}/create-gig`,
+    `/api/gigs/templates/${id}/create-gig${accountId ? `?account_id=${accountId}` : ''}`,
     { method: 'POST' },
   );
 

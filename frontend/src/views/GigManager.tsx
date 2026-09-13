@@ -10,6 +10,7 @@ import {
   getGigMetrics,
   getGigTemplates,
   getGigs,
+  getAccounts,
   registerGig,
   seoTitleScore,
   toggleGigTemplate,
@@ -25,6 +26,7 @@ import type {
   GigTemplate,
   GigTemplateJson,
   Platform,
+  PlatformAccount,
 } from '../types';
 import { GIG_STATUSES, PLATFORMS } from '../types';
 import { ErrorBanner, ErrorBoundary, formatDate, TagInput } from '../components/common';
@@ -397,6 +399,8 @@ const editorFromTemplate = (t: GigTemplate): EditorState => {
 };
 
 function TemplatesTab() {
+  const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const [draftAccountId, setDraftAccountId] = useState('');
   const [templates, setTemplates] = useState<GigTemplate[]>([]);
   const [platformFilter, setPlatformFilter] = useState<Platform | ''>('');
   const [taxonomy, setTaxonomy] = useState<Record<string, string[]>>({});
@@ -423,6 +427,10 @@ function TemplatesTab() {
       .then((t) => setTaxonomy(t.categories))
       .catch(() => setTaxonomy({}));
   }, []);
+
+  useEffect(() => { getAccounts().then(setAccounts).catch((e: Error) => setError(e.message)); }, []);
+  useEffect(() => setDraftAccountId(''), [editor.platform, editor.id]);
+  const draftAccounts = accounts.filter((a) => a.platform === editor.platform && a.enabled && ['stealth', 'hybrid'].includes(a.mode));
 
   const patch = (p: Partial<EditorState>) => setEditor((prev) => ({ ...prev, ...p }));
   const patchTier = (tier: TierName, p: Partial<GigPricingTier>) =>
@@ -497,7 +505,7 @@ function TemplatesTab() {
     if (editor.id == null) return;
     setCreateResult(null);
     setErrors([]);
-    createGigFromTemplate(editor.id)
+    createGigFromTemplate(editor.id, draftAccountId ? Number(draftAccountId) : undefined)
       .then((res) => setCreateResult(`Stealth task #${res.stealth_task_id} queued — ${res.note}`))
       .catch((e: unknown) => {
         // 429 when circuit open or rate-limited (1 draft/hour/platform) — show server text
@@ -789,11 +797,17 @@ function TemplatesTab() {
           <button className="btn" disabled={busy || !editor.name.trim()} onClick={save}>
             {busy ? 'Saving…' : editor.id != null ? 'Save changes' : 'Create template'}
           </button>
-          {editor.id != null && (
-            <button className="btn secondary" onClick={createGig}>
+          {editor.id != null && (<>
+            <label>Draft seller account
+              <select aria-label="Draft seller account" value={draftAccountId} onChange={(e) => setDraftAccountId(e.target.value)}>
+                <option value="">{draftAccounts.length === 1 ? `Use ${draftAccounts[0].label || draftAccounts[0].principal}` : 'Choose an account'}</option>
+                {draftAccounts.map((a) => <option key={a.id} value={a.id}>{a.label || a.principal}</option>)}
+              </select>
+            </label>
+            <button className="btn secondary" onClick={createGig} disabled={editor.platform === 'fiverr' && (!draftAccounts.length || (draftAccounts.length > 1 && !draftAccountId))}>
               Create Gig from Template
             </button>
-          )}
+          </>)}
         </div>
       </div>
     </div>

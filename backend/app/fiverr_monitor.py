@@ -76,7 +76,7 @@ def offers_remaining_today(user_id: int) -> int:
 
 # ---------------- gig creation ----------------
 
-def queue_gig_creation(db: Session, template: GigTemplate) -> tuple[StealthTask | None, str]:
+def queue_gig_creation(db: Session, template: GigTemplate, *, account=None) -> tuple[StealthTask | None, str]:
     """Queue a create_gig_draft stealth task (DRAFT only — never auto-publish).
 
     Returns (task, error). Enforces circuit breaker + 1 draft/hour cap.
@@ -89,11 +89,15 @@ def queue_gig_creation(db: Session, template: GigTemplate) -> tuple[StealthTask 
     allowed, reason = circuit_breaker.check(template.platform, template.user_id, db=db)
     if not allowed:
         return None, reason
+    if account is not None and (account.user_id != template.user_id or account.platform != template.platform
+                                or not account.enabled or account.mode not in ("stealth", "hybrid")):
+        return None, "selected browser account is unavailable"
+    # Preserve the conservative tenant cap while adding explicit account identity.
     count = _counter(f"gigdraft:{template.platform}:{template.user_id}", 3600)
     if count is None:
         return None, "gig draft rate limit cannot be enforced (Redis down) — try again"
     if count > GIG_DRAFTS_PER_HOUR:
-        return None, f"gig draft rate limit: {GIG_DRAFTS_PER_HOUR}/hour per account"
+        return None, f"gig draft rate limit: {GIG_DRAFTS_PER_HOUR}/hour per user"
 
     task = StealthTask(
         user_id=template.user_id,
@@ -103,6 +107,7 @@ def queue_gig_creation(db: Session, template: GigTemplate) -> tuple[StealthTask 
             "template_id": template.id,
             "template": template.template_json,
             "save_as_draft": True,  # hard rule: never auto-publish
+            **({"account_id": account.id, "account_epoch": account.identity_epoch} if account is not None else {}),
             "gallery": template.template_json.get("gallery", []),
         },
     )

@@ -356,3 +356,30 @@ def test_emitted_task_types_resolve_in_worker_registry(db, user):
     # nothing legacy was emitted anywhere
     emitted = {t.task_type for t in db.query(StealthTask).all()}
     assert emitted <= WORKER_HANDLER_KEYS
+
+
+def test_gig_creation_requires_owned_explicit_seller_account(client, monkeypatch):
+    from app.models import PlatformAccount
+    c, Session = client
+    token = _register(c)
+    uid = c.get('/api/auth/me', headers=_auth(token)).json()['id']
+    with Session() as db:
+        tpl = GigTemplate(user_id=uid, platform='fiverr', name='Seller draft', template_json={})
+        a = PlatformAccount(user_id=uid, platform='fiverr', label='First', principal='first', mode='stealth', enabled=True)
+        b = PlatformAccount(user_id=uid, platform='fiverr', label='Second', principal='second', mode='stealth', enabled=True)
+        db.add_all([tpl, a, b]); db.commit()
+        tpl_id, second_id, epoch = tpl.id, b.id, b.identity_epoch
+    monkeypatch.setattr('app.fiverr_monitor._counter', lambda *args: 1)
+    endpoint = f'/api/gigs/templates/{tpl_id}/create-gig'
+    assert c.post(endpoint, headers=_auth(token)).status_code == 409
+    assert c.post(endpoint + '?account_id=999999', headers=_auth(token)).status_code == 409
+    result = c.post(endpoint + f'?account_id={second_id}', headers=_auth(token))
+    assert result.status_code == 200, result.text
+    with Session() as db:
+        task = db.get(StealthTask, result.json()['stealth_task_id'])
+        assert task.payload['account_id'] == second_id
+        assert task.payload['account_epoch'] == epoch
+        assert task.payload['save_as_draft'] is True
+        db.get(PlatformAccount, second_id).enabled = False
+        db.commit()
+    assert c.post(endpoint + f'?account_id={second_id}', headers=_auth(token)).status_code == 409
