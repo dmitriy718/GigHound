@@ -473,6 +473,8 @@ class GigTemplateOut(GigTemplateIn):
 
 class GigOut(BoundedModel):
     id: int
+    account_id: int | None = None
+    account_binding_version: int = 0
     platform: str
     template_id: Optional[int]
     external_id: str
@@ -573,8 +575,14 @@ class FaqGenerateIn(BoundedModel):
     count: int = Field(default=4, ge=1, le=20)
 
 
+class GigAccountIn(BoundedModel):
+    account_id: int | None = Field(default=None, ge=1)
+    expected_version: int = Field(ge=0)
+
+
 class GigRegisterIn(BoundedModel):
     platform: Platform
+    account_id: int | None = Field(default=None, ge=1)
     title: str = Field(default="", max_length=300)
     external_id: str = Field(default="", max_length=300)
     url: str = Field(default="", max_length=1000)

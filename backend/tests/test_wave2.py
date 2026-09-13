@@ -653,7 +653,10 @@ def test_gig_analytics_tick_isolates_failing_user(db, user, monkeypatch):
                  password_hash=hash_password("password123"))
     db.add(other)
     db.commit()
-    db.add(Gig(user_id=other.id, platform="fiverr", title="g", url="https://x/g"))
+    seller = PlatformAccount(user_id=other.id, platform="fiverr", label="Seller", principal="default", mode="stealth", enabled=True)
+    db.add(seller); db.commit()
+    db.add(Gig(user_id=other.id, platform="fiverr", title="g", url="https://x/g",
+               account_id=seller.id, account_epoch=seller.identity_epoch))
     db.commit()
 
     def flaky(db_, user_id):

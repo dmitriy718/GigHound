@@ -140,54 +140,35 @@ def store_competitor_snapshot(
     return snap
 
 
-def enqueue_metrics_scrape(db: Session, user_id: int) -> list[StealthTask]:
-    """Weekly task: one stealth scrape per platform with active gigs."""
-    platforms = [
-        p
-        for (p,) in db.query(Gig.platform)
-        .filter(Gig.user_id == user_id)
-        .distinct()
-        .all()
-    ]
-    tasks = []
-    for platform in platforms:
-        if platform not in WORKER_PLATFORMS:
-            # the worker can't scrape this platform — don't mint stealth
-            # tasks that would pend forever
-            log.info(
-                "metrics scrape skipped for %s: not served by the worker", platform
-            )
+def enqueue_metrics_scrape(db: Session, user_id: int, *, report: dict | None = None) -> list[StealthTask]:
+    """Only explicitly assigned listings; one task per current seller identity."""
+    from .models import PlatformAccount
+    accounts = {a.id: a for a in db.query(PlatformAccount).filter(
+        PlatformAccount.user_id == user_id, PlatformAccount.enabled.is_(True),
+        PlatformAccount.mode.in_(["stealth", "hybrid"])).all()}
+    groups, skipped = {}, []
+    for gig in db.query(Gig).filter(Gig.user_id == user_id, Gig.status.in_(["draft", "active"])).all():
+        account = accounts.get(gig.account_id)
+        if (gig.platform not in WORKER_PLATFORMS or not account or
+            account.platform != gig.platform or account.identity_epoch != gig.account_epoch):
+            skipped.append(gig.id)
             continue
+        groups.setdefault((gig.platform, account.id, account.identity_epoch), []).append(gig)
+    tasks = []
+    for (platform, account_id, epoch), gigs in groups.items():
         allowed, reason = circuit_breaker.check(platform, user_id, db=db)
-        task = StealthTask(
-            user_id=user_id,
-            platform=platform,
-            task_type=SCRAPE_GIG_METRICS,
-            payload={
-                "gigs": [
-                    {"id": g.id, "url": g.url, "title": g.title}
-                    for g in db.query(Gig)
-                    .filter(Gig.user_id == user_id, Gig.platform == platform)
-                    .all()
-                ]
-            },
-            status="pending" if allowed else "skipped_circuit_open",
-            result={} if allowed else {"reason": reason},
-        )
+        if not allowed:
+            skipped.extend(g.id for g in gigs)
+            continue
+        task = StealthTask(user_id=user_id, platform=platform, task_type=SCRAPE_GIG_METRICS,
+            payload={"account_id": account_id, "account_epoch": epoch,
+                     "gigs": [{"id": g.id, "url": g.url, "title": g.title,
+                               "account_binding_version": g.account_binding_version} for g in gigs]})
         db.add(task)
-        if allowed:
-            tasks.append(task)
-        else:
-            log.warning("metrics scrape skipped for %s: %s", platform, reason)
+        tasks.append(task)
+    db.add(AuditLog(user_id=user_id, action_type="gig_metrics_scrape_queued",
+                   detail={"platforms": [t.platform for t in tasks], "skipped_gig_ids": skipped}))
     db.commit()
-    for t in tasks:
-        db.refresh(t)
-    db.add(
-        AuditLog(
-            user_id=user_id,
-            action_type="gig_metrics_scrape_queued",
-            detail={"platforms": [t.platform for t in tasks]},
-        )
-    )
-    db.commit()
+    if report is not None:
+        report["skipped_gig_ids"] = skipped
     return tasks

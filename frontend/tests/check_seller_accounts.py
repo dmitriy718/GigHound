@@ -38,5 +38,17 @@ with sync_playwright() as p:
     with page.expect_request(lambda req: f'/templates/{tpl_id}/create-gig' in req.url) as observed:
         create.click()
     assert f'account_id={ids[1]}' in observed.value.url
+    listing = api.post(origin + '/api/gigs', headers=headers, data={
+        'platform': 'fiverr', 'title': 'Synthetic metrics listing', 'url': 'https://example.test/listing'})
+    assert listing.ok and listing.json()['account_id'] is None
+    page.get_by_role('button', name='Gigs', exact=True).click()
+    page.get_by_role('cell', name='Synthetic metrics listing', exact=True).click()
+    page.get_by_label('Metrics seller account', exact=True).select_option(str(ids[1]))
+    with page.expect_response(lambda response: f"/gigs/{listing.json()['id']}/account" in response.url) as saved:
+        page.get_by_role('button', name='Save seller assignment', exact=True).click()
+    assert saved.value.ok and saved.value.json()['account_id'] == ids[1]
+    page.reload()
+    page.get_by_role('cell', name='Synthetic metrics listing', exact=True).click()
+    expect(page.get_by_label('Metrics seller account', exact=True)).to_have_value(str(ids[1]))
     browser.close()
-print('PASS: ambiguous seller selection blocked; explicitly chosen second account transmitted')
+print('PASS: ambiguous seller selection blocked; second draft account transmitted; explicit metrics seller assignment survives reload')
