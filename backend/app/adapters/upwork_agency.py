@@ -90,8 +90,8 @@ class UpworkAgencyAdapter(PlatformAdapter):
 
     async def _access_token(self) -> str:
         creds = self.vault.load(self.platform, self.account_principal)
-        if not creds:
-            raise AdapterAuthError("upwork: no agency_manager credentials in vault")
+        if not creds or not isinstance(creds.get("access_token"), str) or not creds["access_token"].strip():
+            raise AdapterAuthError("upwork: API discovery requires an access token; browser username/password credentials do not provide API access")
         if not creds.get("expires_at"):
             return creds["access_token"]
         expires_at = datetime.fromisoformat(creds["expires_at"])

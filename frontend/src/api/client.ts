@@ -455,7 +455,7 @@ export const validateBooleanQuery = (query: string) =>
     { method: 'POST', body: JSON.stringify({ query }) },
   );
 export const runSearchProfileNow = (id: number) =>
-  request<{ queued: boolean; platforms: string[] }>(`/api/search-profiles/${id}/run-now`, {
+  request<{ queued: boolean; platforms: string[]; ingested: number; failed_platforms: string[]; message: string }>(`/api/search-profiles/${id}/run-now`, {
     method: 'POST',
   });
 

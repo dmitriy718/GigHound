@@ -23,7 +23,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from ..schemas import ClientInfo
-from .base import AdapterAuthError, PlatformAdapter, QuotaDepletedError
+from .base import AdapterAuthError, AdapterError, PlatformAdapter, QuotaDepletedError
 from .ratelimit import request_with_retry
 from .schema import JobPosting
 from .vault import CredentialVault, StateStore
@@ -174,8 +174,29 @@ class FreelancerAdapter(PlatformAdapter):
             params["max_avg_price"] = max_budget
         if job_types:
             params["project_types[]"] = [t.upper() for t in job_types if t in _JOB_TYPE_MAP]
-        result = await self._api("GET", "/projects/0.1/projects/active/", params=params)
-        return [self._normalize_project(p) for p in result.get("projects", [])]
+        # Only this public, read-only endpoint can run without enrollment.
+        # Never retry a rejected authenticated request anonymously.
+        if self.vault.load(self.platform, self.credential_principal):
+            result = await self._api("GET", "/projects/0.1/projects/active/", params=params)
+        else:
+            response = await self._request(
+                "GET", f"{self.base}/projects/0.1/projects/active/", params=params)
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("status") != "success":
+                raise AdapterError("freelancer: public search failed")
+            result = payload.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("projects"), list):
+            raise AdapterError("freelancer: invalid search response")
+        users = result.get("users") or {}
+        if not isinstance(users, dict):
+            raise AdapterError("freelancer: invalid search users")
+        jobs = []
+        for project in result["projects"]:
+            if not isinstance(project, dict) or project.get("id") is None:
+                raise AdapterError("freelancer: invalid search project")
+            owner = project.get("owner") or users.get(str(project.get("owner_id")))
+            jobs.append(self._normalize_project({**project, "owner": owner or {}}))
+        return jobs
 
     async def get_job_details(self, external_id: str) -> JobPosting:
         result = await self._api("GET", f"/projects/0.1/projects/{external_id}/")

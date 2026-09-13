@@ -94,7 +94,7 @@ async def run_search_profile_now(profile_id: int, db: Session = Depends(get_db),
         raise HTTPException(404, "search profile not found")
     from ..discovery import run_profile_discovery
     result = await run_profile_discovery(db, user, profile, respect_pacing=False)
-    return {"queued": result["queued"], "platforms": result["platforms"]}
+    return result
 
 
 def _validate_boolean(query: str):

@@ -154,11 +154,10 @@ export default function SearchProfiles() {
       const res = await runSearchProfileNow(p.id);
       setNotice(
         res.queued
-          ? `Search "${p.name}" queued for: ${res.platforms.join(', ') || 'no platforms'}`
-          : `Search "${p.name}" was not queued.`,
+          ? `Search "${p.name}" completed on ${res.platforms.join(', ')}: ${res.ingested} jobs ingested.${res.failed_platforms.length ? ` Sources unavailable: ${res.failed_platforms.join(', ')}.` : ''}`
+          : res.message,
       );
-      setError(null);
-      window.setTimeout(() => setNotice(null), 5000);
+      setError(res.queued ? null : res.message);
     } catch (e) {
       setError((e as Error).message);
     } finally {

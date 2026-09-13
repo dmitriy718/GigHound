@@ -227,7 +227,7 @@ def test_run_now_endpoint(client, monkeypatch):
     monkeypatch.setattr("app.discovery.run_profile_discovery", _fake_discovery)
     r = c.post(f"/api/search-profiles/{profile_id}/run-now", headers=_auth(token))
     assert r.status_code == 200, r.text
-    assert r.json() == {"queued": True, "platforms": ["freelancer"]}
+    assert r.json() == {"queued": True, "platforms": ["freelancer"], "ingested": 3}
     # tenant scoping
     other = _register(c, "phase2-other@example.com")
     assert c.post(f"/api/search-profiles/{profile_id}/run-now",
