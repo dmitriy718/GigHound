@@ -175,7 +175,7 @@ def main():
         python = os.environ.get(
             "GIGHOUND_UI_TEST_PYTHON", str(local) if local.exists() else sys.executable
         )
-        for test in ["check_workbench.py", "check_alerts.py", "check_review.py", "check_drafts.py", "check_writing.py", "check_guided.py"]:
+        for test in ["check_workbench.py", "check_alerts.py", "check_review.py", "check_drafts.py", "check_writing.py", "check_guided.py", "check_seller_accounts.py"]:
             subprocess.run(
                 [python, str(ROOT / "frontend/tests" / test)],
                 cwd=ROOT,
