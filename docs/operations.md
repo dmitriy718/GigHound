@@ -86,9 +86,9 @@ Account deletion and credential writes serialize on the owner row. Enrollment/OA
 
 ## Account selection and review recovery (September 13 continuation)
 
-Apply migrations through `a28f935ec724` before starting this application version. Proposal review now records a selected account in `platform_account_id`; when several enabled accounts exist, choose one in the proposal or buyer-request editor. Approval through the API accepts `platform_account_id`. Bulk approval does not guess an account. Changing account settings/credentials still invalidates material approval, and selecting a different account clears inherited bidder/member defaults. Existing approved snapshots retain their original account identity until renewed review.
+Apply migrations through `b39fa46fd835` before starting this application version. Proposal review now records a selected account in `platform_account_id`; when several enabled accounts exist, choose one in the proposal or buyer-request editor. Approval through the API accepts `platform_account_id`. Bulk approval does not guess an account. Changing account settings/credentials still invalidates material approval, and selecting a different account clears inherited bidder/member defaults. Existing approved snapshots retain their original account identity until renewed review.
 
-Freelancer and Upwork search requests accept `account_id`. Freelancer quota and Upwork local agency roster endpoints accept the same query parameter; the Accounts editor supplies its edited account. Local rosters are separated by principal, with the historical `agency_manager` roster retained in its original key. The Accounts editor can explicitly assign an unassigned legacy roster once to the reviewed account. Browser proposal status polling and Fiverr buyer monitoring now group work by account. Seller gig creation/metrics binding and historical unbound proposals still need completion; multi-account production qualification remains open.
+Freelancer and Upwork search requests accept `account_id`. Freelancer quota and Upwork local agency roster endpoints accept the same query parameter; the Accounts editor supplies its edited account. Local rosters are separated by principal, with the historical `agency_manager` roster retained in its original key. The Accounts editor can explicitly assign an unassigned legacy roster once to the reviewed account. Browser proposal status polling and Fiverr buyer monitoring now group work by account. Fiverr draft creation selects an explicit seller account. Tracked listings retain seller identity and assignment version; metrics are grouped by seller and stale uploads are rejected. Assign legacy listings explicitly in Gig Manager → listing metrics → Metrics seller account. Historical unbound proposals and live multi-account production qualification remain open.
 
 Each platform account now has an internal identity epoch. Deleting/recreating an account—even with the same numeric ID—does not make an old enrollment/OAuth transaction valid for the new account. OAuth flows started before the identity migration must be restarted. This fence complements credential-version checks; it does not revoke an already issued token at the external provider.
 
@@ -107,3 +107,20 @@ The existing hosted generation configuration is `LLM_PROVIDER=openai`, `LLM_API_
 
 
 The supplied Compose worker identity flow was qualified locally using `astra/09132026_implementation_evidence/verify_worker_identity.py`. It builds the actual image and exercises registered authentication and the fenced task protocol against synthetic owned services. It does not certify hostile-page isolation, provider access, or production networking. Build contexts exclude environment files and worker sessions; the worker does not inherit the root environment file.
+
+
+## Verified local backups
+
+For the supplied local Compose stack, run:
+
+```sh
+backend/.venv/bin/python scripts/backup_local.py
+```
+
+This resolves the running database/backend services, uses PostgreSQL tools from the exact database image, encrypts the dump together with its matching vault key, restores it into a fresh disposable container, checks schema and row counts, decrypts restored credential records, refuses a second restore onto the nonempty target, and removes the disposable container/volume. It never starts app workers against the restored database. A private JSON receipt records the archive hash and verified counts. Only a completed drill writes a success receipt.
+
+Artifacts are saved under `~/.local/state/gighound/backups/`. The separate encryption recovery key is `~/.local/state/gighound/backup-recovery.key`, created owner-only on first use. Copy encrypted `.enc` files and their `.json` receipts off this computer. Retain the recovery key separately in secure storage. Losing both this computer and its only copy of the key makes the encrypted backups unusable. Keep the key out of Git, issues, logs and chat.
+
+The owner's local installation has `gighound-backup.timer` enabled for 03:15 local time plus up to 15 minutes of jitter. Missed timers run when the user service manager next becomes available. Inspect it with `systemctl --user list-timers gighound-backup.timer`; check the last result with `systemctl --user status gighound-backup.service`. The timer's unit files are local machine configuration, not part of the application image. The service requires the local Docker stack to be running.
+
+The helper retains the existing 256 MiB dump limit and does not automatically prune archives or upload them offsite. Offsite custody, capacity/retention policy and failure alerting remain production operations requirements. Restoration of a real backup was proven locally; this is not evidence of remote disaster recovery or arbitrary database scale.

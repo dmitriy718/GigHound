@@ -62,7 +62,7 @@ def private_write(path, content):
         file.write(content)
 
 
-def backup(path):
+def backup(path, *, dump_command=None):
     env = pg_environment(os.environ["DATABASE_URL"])
     vault = os.environ["GIGHOUND_VAULT_KEY"].encode()
     Fernet(vault)  # reject an unusable key before starting a database backup
@@ -71,7 +71,7 @@ def backup(path):
     # Custom-format dumps can be inspected/restored using standard PostgreSQL tooling.
     with tempfile.TemporaryFile() as dump_file:
         subprocess.run(
-            ["pg_dump", "--format=custom", "--no-owner", "--no-acl"],
+            dump_command or ["pg_dump", "--format=custom", "--no-owner", "--no-acl"],
             env=env,
             check=True,
             stdout=dump_file,
@@ -118,7 +118,7 @@ def unpack(path):
     return result
 
 
-def restore(path, confirm_db, key_output):
+def restore(path, confirm_db, key_output, *, restore_command=None):
     import psycopg2
 
     env = pg_environment(os.environ["DATABASE_URL"])
@@ -142,23 +142,35 @@ def restore(path, confirm_db, key_output):
             )
             if cursor.fetchone()[0]:
                 raise ValueError("restore requires an empty target database")
-    subprocess.run(
-        [
-            "pg_restore",
-            "--single-transaction",
-            "--exit-on-error",
-            "--no-owner",
-            "--no-acl",
-            "--dbname",
-            env["PGDATABASE"],
-        ],
-        input=payload["database.dump"],
-        env=env,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    # Fail on an unwritable key destination before restoring any database data.
     private_write(key_output, payload["vault.key"])
+    key_stat = Path(key_output).stat()
+    try:
+        subprocess.run(
+            restore_command or [
+                "pg_restore",
+                "--single-transaction",
+                "--exit-on-error",
+                "--no-owner",
+                "--no-acl",
+                "--dbname",
+                env["PGDATABASE"],
+            ],
+            input=payload["database.dump"],
+            env=env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except BaseException:
+        # Remove only the file this invocation created, never a replacement.
+        try:
+            current = Path(key_output).lstat()
+            if (current.st_dev, current.st_ino) == (key_stat.st_dev, key_stat.st_ino):
+                Path(key_output).unlink()
+        except FileNotFoundError:
+            pass
+        raise
     return {"restored_database": confirm_db, "vault_key_file": str(key_output)}
 
 
