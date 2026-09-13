@@ -15,7 +15,7 @@ from app.adapters.vault import CredentialVault
 from app.boolquery import BooleanQueryError, parse_boolean_query
 from app.database import Base, get_db
 from app.main import app
-from app.models import AuditLog, Job, ProposalQueueItem, User
+from app.models import AuditLog, Job, ProposalQueueItem, User, PlatformAccount
 from app.schemas import JobIngest
 
 
@@ -84,6 +84,9 @@ def _make_item(Session, user_id, platform="upwork", status="pending_review",
     _item_seq += 1
     db = Session()
     try:
+        if not db.query(PlatformAccount).filter_by(user_id=user_id, platform=platform).first():
+            db.add(PlatformAccount(user_id=user_id, platform=platform, label="Synthetic account", principal="default", mode="hybrid", enabled=True))
+            db.flush()
         job = Job(user_id=user_id, external_id=str(10000 + _item_seq),
                   platform=platform, title=f"Job {_item_seq}")
         db.add(job)
@@ -121,14 +124,14 @@ def test_bulk_approve_writes_audit_templates_versions(client):
     already = _make_item(Session, uid, status="approved")
 
     r = c.post("/api/proposals/bulk-approve", headers=_auth(token),
-               json={"ids": [ok, flagged, already], "reviewer": "operator"})
+               json={"expected_revisions": {ok: 1, flagged: 1, already: 1}, "ids": [ok, flagged, already], "reviewer": "operator"})
     assert r.status_code == 200
     assert r.json() == {"approved": [ok], "skipped": [flagged, already]}
 
     db = Session()
     try:
         item = db.get(ProposalQueueItem, ok)
-        assert item.status == "approved" and item.reviewed_by == "operator"
+        assert item.status == "approved" and item.reviewed_by == f"user:{uid}"
         assert item.template_id is not None
         assert item.versions[-1]["by"] == "operator"
         assert item.versions[-1]["text"] == "queued proposal text"
@@ -149,7 +152,7 @@ def test_bulk_approve_requires_reviewer(client):
     c, Session = client
     token = _register(c)
     r = c.post("/api/proposals/bulk-approve", headers=_auth(token),
-               json={"ids": [1], "reviewer": ""})
+               json={"expected_revisions": {1: 1}, "ids": [1], "reviewer": ""})
     assert r.status_code == 400
 
 
@@ -241,7 +244,7 @@ def test_approve_rejects_empty_proposal_text(client):
 
     for blank in ("", "   \n\t "):
         r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-                   json={"reviewer": "operator", "proposal_text": blank})
+                   json={"expected_revision": 1, "reviewer": "operator", "proposal_text": blank})
         assert r.status_code == 422, r.text
 
     db = Session()
@@ -254,7 +257,7 @@ def test_approve_rejects_empty_proposal_text(client):
 
     # a normal approve still works
     r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-               json={"reviewer": "operator"})
+               json={"expected_revision": 1, "reviewer": "operator"})
     assert r.status_code == 200
     assert r.json()["status"] == "approved"
 
@@ -296,6 +299,7 @@ def test_freelancer_bid_requires_approved_queue_item(client, monkeypatch):
     c, Session = client
     _FakeFreelancerAdapter.calls = []
     monkeypatch.setattr("app.routers.adapters.FreelancerAdapter", _FakeFreelancerAdapter)
+    monkeypatch.setattr("app.adapters.freelancer.FreelancerAdapter", _FakeFreelancerAdapter)
     token = _register(c)
     uid = _user_id(Session)
     pending = _make_item(Session, uid, platform="freelancer",
@@ -323,17 +327,21 @@ def test_freelancer_bid_requires_approved_queue_item(client, monkeypatch):
                json={"proposal_queue_item_id": pending})
     assert r.status_code == 200, r.text
     assert r.json()["bid"] == {"id": 999}
+    assert c.post("/api/adapters/freelancer/bid", headers=_auth(token),
+                  json={"proposal_queue_item_id": pending}).status_code == 409
+    assert len(_FakeFreelancerAdapter.calls) == 1
     call = _FakeFreelancerAdapter.calls[0]
     assert call["proposal"] == "queued proposal text"
     assert call["amount"] == 500.0
-    logs = _audit_rows(Session, "bid_placed")
-    assert len(logs) == 1 and logs[0].detail["proposal_queue_item_id"] == pending
+    logs = _audit_rows(Session, "proposal_submitted")
+    assert len(logs) == 1 and logs[0].detail["proposal_id"] == pending
 
 
 def test_freelancer_bid_rejects_other_users_item(client, monkeypatch):
     c, Session = client
     _FakeFreelancerAdapter.calls = []
     monkeypatch.setattr("app.routers.adapters.FreelancerAdapter", _FakeFreelancerAdapter)
+    monkeypatch.setattr("app.adapters.freelancer.FreelancerAdapter", _FakeFreelancerAdapter)
     alice = _register(c, "alice@example.com")
     bob = _register(c, "bob@example.com")
     alice_uid = _user_id(Session, "alice@example.com")
@@ -349,6 +357,7 @@ def test_upwork_proposals_requires_approved_queue_item(client, monkeypatch):
     c, Session = client
     _FakeUpworkAdapter.calls = []
     monkeypatch.setattr("app.routers.adapters.UpworkAgencyAdapter", _FakeUpworkAdapter)
+    monkeypatch.setattr("app.adapters.upwork_agency.UpworkAgencyAdapter", _FakeUpworkAdapter)
     token = _register(c)
     uid = _user_id(Session)
     item_id = _make_item(Session, uid, status="approved", reviewed_by="operator",
@@ -362,7 +371,7 @@ def test_upwork_proposals_requires_approved_queue_item(client, monkeypatch):
     assert call["approved_by"] == "operator"
     assert call["on_behalf_of"] == "jane"
     logs = _audit_rows(Session, "proposal_queued")
-    assert len(logs) == 1 and logs[0].detail["proposal_queue_item_id"] == item_id
+    assert len(logs) == 1 and logs[0].detail["proposal_id"] == item_id
 
     # the item waits for the browser worker (same contract as /submit)
     db = Session()
@@ -383,6 +392,7 @@ def test_upwork_submit_paths_409_when_circuit_open(client, monkeypatch):
     c, Session = client
     _FakeUpworkAdapter.calls = []
     monkeypatch.setattr("app.routers.adapters.UpworkAgencyAdapter", _FakeUpworkAdapter)
+    monkeypatch.setattr("app.adapters.upwork_agency.UpworkAgencyAdapter", _FakeUpworkAdapter)
     monkeypatch.setattr("app.adapters.upwork_agency.UpworkAgencyAdapter", _FakeUpworkAdapter)
     token = _register(c)
     uid = _user_id(Session)
@@ -439,7 +449,7 @@ def test_submit_success_writes_audit_and_closes_adapter(client, monkeypatch):
     # upwork waits for the external browser worker — not "submitted" yet
     assert r.json()["status"] == "queued_for_browser"
     assert closed == [True]  # upwork branch now closes its HTTP client
-    logs = _audit_rows(Session, "proposal_submitted")
+    logs = _audit_rows(Session, "proposal_queued")
     assert len(logs) == 1
     assert logs[0].platform == "upwork"
     assert logs[0].detail["proposal_id"] == item_id

@@ -20,7 +20,7 @@ class JobPosting(BaseModel):
     title: str
     description: str = ""
     url: str = ""
-    job_type: Optional[Literal["fixed", "hourly", "retainer", "contest"]] = None
+    job_type: Optional[Literal["fixed", "hourly", "retainer", "contest", "annual"]] = None
     budget_min: Optional[float] = None
     budget_max: Optional[float] = None
     currency: str = "USD"

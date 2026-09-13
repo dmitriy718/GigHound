@@ -373,13 +373,14 @@ async def test_outcome_sync_transitions_and_broadcasts(db, user, monkeypatch):
     db.add(AdapterCredential(user_id=user.id, platform="freelancer",
                              principal="default", blob="enc"))
     job = Job(user_id=user.id, external_id="555", platform="freelancer",
-              title="Dashboard job")
+              title="Dashboard job", client_info={"client_id":"999"})
     db.add(job)
     db.commit()
     item = ProposalQueueItem(
         user_id=user.id, job_id=job.id, platform="freelancer",
         proposal_text="text", status="submitted", outcome="pending",
         reviewed_by="op", reviewed_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        submitted_at=datetime.now(timezone.utc) - timedelta(hours=1),
         submission_result={"response": {"id": 77}, "bidder_id": 4242})
     db.add(item)
     db.commit()
@@ -438,13 +439,13 @@ def test_approve_reuses_suggested_template(client):
         db.close()
 
     r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-               json={"reviewer": "op"})
+               json={"expected_revision": 1, "reviewer": "op"})
     assert r.status_code == 200, r.text
     db = Session()
     try:
         assert db.query(Template).filter(Template.user_id == uid).count() == 1  # no mint
         # uses counted at selection only (N7) — approval no longer increments
-        assert db.get(Template, tpl_id).uses == 4
+        assert db.get(Template, tpl_id).uses == 5
         assert db.get(ProposalQueueItem, item_id).template_id == tpl_id
     finally:
         db.close()
@@ -474,9 +475,9 @@ def test_approve_mints_only_when_flag_on(client):
     opted_out_id = _make_item("optout")
     # minting is controlled per approval (N2): default True, opt out explicitly
     assert c.post(f"/api/proposals/{minted_id}/approve", headers=_auth(token),
-                  json={"reviewer": "op"}).status_code == 200
+                  json={"expected_revision": 1, "reviewer": "op"}).status_code == 200
     assert c.post(f"/api/proposals/{opted_out_id}/approve", headers=_auth(token),
-                  json={"reviewer": "op", "save_as_template": False}).status_code == 200
+                  json={"expected_revision": 1, "reviewer": "op", "save_as_template": False}).status_code == 200
     db = Session()
     try:
         templates = db.query(Template).filter(Template.user_id == uid).all()
@@ -489,17 +490,17 @@ def test_approve_mints_only_when_flag_on(client):
         db.close()
 
 
-def test_top_templates_counts_uses_at_selection(db, user):
+def test_top_templates_suggestions_do_not_count_uses(db, user):
     from app.templates import top_templates
 
     db.add(Template(user_id=user.id, title="A", platform="upwork", text="t",
                     tags=["react"], uses=0, win_rate=80.0))
     db.commit()
     top = top_templates(db, user.id, "upwork", ["react"])
-    assert top[0].uses == 1
+    assert top[0].uses == 0
     top_templates(db, user.id, "upwork", ["react"])
     db.expire_all()
-    assert db.query(Template).one().uses == 2
+    assert db.query(Template).one().uses == 0
 
 
 # ---------------- 2.7 safe automations ----------------
@@ -621,9 +622,12 @@ def test_digest_user_core_sends_and_isolates_failures(db, user, monkeypatch):
                status="new", quality_score=80.0))
     db.commit()
 
+    import json
+    monkeypatch.setenv("SMTP_HOST", "fake.example.test")
+    monkeypatch.setenv("GIGHOUND_VERIFIED_DIGEST_RECIPIENTS", json.dumps({str(user.id): user.email}))
     sent = []
     monkeypatch.setattr("app.digest.send_digest_email",
-                        lambda jobs, mode: sent.append((mode, len(jobs))) or True)
+                        lambda jobs, mode, **kwargs: sent.append((mode, len(jobs))) or True)
     from app.tasks import digest_user_core
     assert digest_user_core(user.id) == {"sent": 1}
     assert sent == [("hourly", 1)]
@@ -634,10 +638,13 @@ def test_digest_user_core_sends_and_isolates_failures(db, user, monkeypatch):
     assert digest_user_core(user.id) == {"sent": 0}
 
     # SMTP failure is contained to this user's task (no raise)
-    def _boom(jobs, mode):
+    def _boom(jobs, mode, **kwargs):
         raise OSError("smtp down")
 
     db.query(Job).filter(Job.user_id == user.id).update({"status": "new"})
+    db.commit()
+    from app.models import AuthTransaction
+    db.query(AuthTransaction).filter_by(kind="digest_attempt").delete()
     db.commit()
     monkeypatch.setattr("app.digest.send_digest_email", _boom)
     result = digest_user_core(user.id)

@@ -1,13 +1,16 @@
 import { useEffect, useState } from 'react';
 import {
   approveProposal,
+  getAccounts,
   getBuyerRequests,
   getProposals,
   rejectProposal,
 } from '../api/client';
-import type { ProposalQueueItem, RejectionReason, User } from '../types';
+import type { PlatformAccount, ProposalQueueItem, RejectionReason, User } from '../types';
 import { REJECTION_REASONS } from '../types';
 import { useNewAlertMessages, useReconnectRefetch, type AlertMessage, type SocketStatus } from '../hooks/useAlertsSocket';
+import { DraftConflict } from '../components/DraftConflict';
+import ApplicationTone from '../components/ApplicationTone';
 import { useDrafts } from '../hooks/useDrafts';
 import { ErrorBanner, formatDate } from '../components/common';
 
@@ -18,11 +21,15 @@ interface Props {
 }
 
 interface OfferEdits {
+  platform_account_id: string;
+  base_revision: number;
   proposal_text: string;
   bid_amount: string;
 }
 
 const editsFrom = (item: ProposalQueueItem): OfferEdits => ({
+  base_revision: item.revision,
+  platform_account_id: item.platform_account_id != null ? String(item.platform_account_id) : "",
   proposal_text: item.humanized_text || item.proposal_text,
   bid_amount: item.bid_amount != null ? String(item.bid_amount) : '',
 });
@@ -30,11 +37,14 @@ const editsFrom = (item: ProposalQueueItem): OfferEdits => ({
 // an edit entry holding no real changes — approve/reject resets to this
 const isPristine = (item: ProposalQueueItem, e: OfferEdits): boolean => {
   const base = editsFrom(item);
-  return e.proposal_text === base.proposal_text && e.bid_amount === base.bid_amount;
+  return (e.platform_account_id ?? "") === base.platform_account_id && e.proposal_text === base.proposal_text && e.bid_amount === base.bid_amount;
 };
 
 export default function BuyerRequestInbox({ messages, status: socketStatus, user }: Props) {
-  const [offers, setOffers] = useState<{ offers_remaining_today: number; daily_limit: number } | null>(null);
+  const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const [accountError, setAccountError] = useState<string | null>(null);
+  useEffect(() => { getAccounts().then(setAccounts).catch((e: Error) => setAccountError(e.message)); }, []);
+  const [offers, setOffers] = useState<{ offers_remaining_today: number | null; daily_limit: number } | null>(null);
   const [items, setItems] = useState<ProposalQueueItem[]>([]);
   const [edits, setEdits] = useState<Record<number, OfferEdits>>({});
   const [rejectReasons, setRejectReasons] = useState<Record<number, RejectionReason>>({});
@@ -94,9 +104,15 @@ export default function BuyerRequestInbox({ messages, status: socketStatus, user
   const approve = (item: ProposalQueueItem) => {
     if (!requireReviewer(item.id)) return;
     const draft = edits[item.id] ?? editsFrom(item);
+    if (draft.base_revision !== item.revision) {
+      setRowError(prev => ({ ...prev, [item.id]: "This draft is stale. Use the saved-version comparison to resolve it before approving." }));
+      return;
+    }
     setBusyId(item.id);
     setRowError((prev) => ({ ...prev, [item.id]: '' }));
     approveProposal(item.id, {
+      expected_revision: draft.base_revision,
+      ...(draft.platform_account_id ? { platform_account_id: Number(draft.platform_account_id) } : {}),
       reviewer: reviewer.trim(),
       proposal_text: draft.proposal_text,
       ...(draft.bid_amount !== '' ? { bid_amount: Number(draft.bid_amount) } : {}),
@@ -149,7 +165,7 @@ export default function BuyerRequestInbox({ messages, status: socketStatus, user
       <div className="filters-bar">
         {offers && (
           <span className="pill" style={{ alignSelf: 'center', fontSize: 13, padding: '6px 12px' }}>
-            {offers.offers_remaining_today}/{offers.daily_limit} offers remaining
+            {offers.daily_limit > 0 ? `${offers.offers_remaining_today}/${offers.daily_limit} write attempts remaining` : "No configured write-attempt cap"}
           </span>
         )}
         <div className="field" style={{ marginBottom: 0 }}>
@@ -196,8 +212,24 @@ export default function BuyerRequestInbox({ messages, status: socketStatus, user
                 </span>
               </div>
 
+              {item.status === 'pending_review' && draft.base_revision !== item.revision &&
+                <DraftConflict item={item}
+                  onDiscard={() => { clearDrafts([item.id]); setEdits(prev => ({ ...prev, [item.id]: editsFrom(item) })); setRowError(prev => ({ ...prev, [item.id]: '' })); }}
+                  onKeep={() => { setEdits(prev => ({ ...prev, [item.id]: { ...draft, base_revision: item.revision } })); setRowError(prev => ({ ...prev, [item.id]: '' })); }} />}
+              <div className="field">
+                <label htmlFor={`offer-account-${item.id}`}>Submission account</label>
+                {accountError && <p role="alert">Accounts could not be loaded: {accountError}</p>}
+                <select id={`offer-account-${item.id}`} value={draft.platform_account_id ?? ''}
+                  disabled={item.status !== 'pending_review'}
+                  onChange={(e) => patchEdit(item.id, { platform_account_id: e.target.value })}>
+                  <option value="">Use the only enabled account (choose if there are several)</option>
+                  {accounts.filter((a) => a.platform === item.platform && a.enabled && a.mode !== 'disabled').map((a) =>
+                    <option key={a.id} value={a.id}>{a.label || a.principal} · {a.principal}</option>)}
+                </select>
+              </div>
               <div className="field" style={{ marginTop: 10 }}>
                 <label>Offer text</label>
+                <ApplicationTone jobId={item.job_id}/>
                 <textarea
                   rows={6}
                   value={draft.proposal_text}

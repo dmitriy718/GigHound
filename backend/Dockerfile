@@ -4,9 +4,8 @@
 #   docker build -f backend/Dockerfile .
 
 # ---- Stage 1: build the frontend bundle ----
-# node stays at major-only pinning: the 26.x line is LTS-stable (no breaking
-# minor releases), and npm ci is already locked by package-lock.json.
-FROM node:26-slim AS frontend
+# npm ci uses the committed package lock; image tags must be requalified on updates.
+FROM node:26-slim@sha256:c0753125a3789977aefe869cbebccf70e3cfd7ea84ca48547458f02e4f1d7146 AS frontend
 WORKDIR /web
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
@@ -14,7 +13,7 @@ COPY frontend/ ./
 RUN npm run build
 
 # ---- Stage 2: backend runtime (serves API + the dist bundle) ----
-FROM python:3.14.7-slim
+FROM python:3.14.7-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     GIGHOUND_IN_DOCKER=1 \

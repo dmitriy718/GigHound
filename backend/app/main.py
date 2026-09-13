@@ -38,6 +38,10 @@ app.add_middleware(
 )
 
 
+from .request_bounds import RequestBounds
+app.add_middleware(RequestBounds)
+
+
 @app.middleware("http")
 async def security_headers(request, call_next):
     """Baseline response hardening. The CSP allows the built SPA to function:
@@ -68,11 +72,39 @@ app.include_router(orchestration.router)
 app.include_router(credentials.router)
 app.include_router(gigs.router)
 app.include_router(analytics.router)
+from . import workbench
+app.include_router(workbench.router)
+from . import teamwork
+app.include_router(teamwork.router)
 
 
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/ready")
+def readiness():
+    from fastapi.responses import JSONResponse
+    from sqlalchemy import text
+    from .database import SessionLocal
+    from .cache import cache
+    checks = {"database": False, "broker": False}
+    try:
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
+            db.execute(text("SELECT job_id FROM generation_work LIMIT 1"))
+            db.execute(text("SELECT revision FROM automation_circuits LIMIT 1"))
+            checks["database"] = True
+    except Exception:
+        pass
+    try:
+        client = cache._client()
+        checks["broker"] = bool(client and client.ping())
+    except Exception:
+        pass
+    ready = all(checks.values())
+    return JSONResponse({"status": "ready" if ready else "unavailable", "checks": checks}, status_code=200 if ready else 503)
 
 
 # --- Frontend SPA (Phase 4.1) ---

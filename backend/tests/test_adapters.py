@@ -89,7 +89,7 @@ async def test_freelancer_search_normalization(db, user):
     _seed_freelancer_creds(db, user.id)
 
     def handler(request: httpx.Request):
-        assert request.headers["Authorization"] == "Bearer OLD_TOKEN"
+        assert request.headers["Freelancer-OAuth-V1"] == "OLD_TOKEN"
         assert request.url.path == "/api/projects/0.1/projects/active/"
         return httpx.Response(200, json={"status": "success", "result": {"projects": [FL_PROJECT]}})
 
@@ -112,17 +112,17 @@ async def test_freelancer_token_refresh(db, user):
 
     def handler(request: httpx.Request):
         calls.append(request.url.path)
-        if request.url.path == "/api/oauth/token":
+        if request.url.path == "/oauth/token":
             return httpx.Response(200, json={
                 "access_token": "NEW_TOKEN", "refresh_token": "NEW_REFRESH", "expires_in": 3600,
             })
-        assert request.headers["Authorization"] == "Bearer NEW_TOKEN"
+        assert request.headers["Freelancer-OAuth-V1"] == "NEW_TOKEN"
         return httpx.Response(200, json={"status": "success", "result": {"projects": []}})
 
     async with _mock_client(handler) as client:
         adapter = FreelancerAdapter(db, user.id, client=client)
         await adapter.search_jobs("react")
-    assert "/api/oauth/token" in calls
+    assert "/oauth/token" in calls
     assert CredentialVault(db, user.id).load("freelancer", "default")["access_token"] == "NEW_TOKEN"
 
 
@@ -275,7 +275,7 @@ async def test_linkedin_theirstack_normalization(db, monkeypatch):
     assert len(jobs) == 1
     j = jobs[0]
     assert j.source_platform == "linkedin" and j.external_id == "555"
-    assert j.job_type == "hourly" and j.work_arrangement == "remote"
+    assert j.job_type == "annual" and j.work_arrangement == "remote"
     assert j.budget_min == 90000 and j.skills == ["python", "django"]
     assert j.raw_data["id"] == 555
 

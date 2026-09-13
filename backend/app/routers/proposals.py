@@ -1,3 +1,4 @@
+from ..schemas import TemplateGenerateIn
 """Proposal review queue — the human-in-the-loop compliance boundary.
 
 Proposals are drafted by the orchestrator and park here as pending_review.
@@ -9,8 +10,9 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import update
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
-from ..auth import (get_current_user, get_owned, platform_account_settings,
+from ..auth import (get_current_user, get_owned,
                     platform_enabled, scoped)
 from ..database import get_db
 from ..models import AuditLog, Job, PlatformAccount, ProposalQueueItem, Template, User
@@ -18,10 +20,42 @@ from ..ratelimit import check_llm_gen_rate
 from ..schemas import (BulkApproveAction, InterviewPrepOut, JobOut, MarkSubmittedAction,
                        OutcomeAction, ProposalQueueOut, ProposalRejectAction,
                        ProposalReviewAction, TemplateOut)
+from ..schemas import SubmissionReconcileIn
 from ..stealth import SUBMIT_FIVERR_OFFER, SUBMIT_UPWORK_PROPOSAL, enqueue_stealth_task
 
 router = APIRouter(prefix="/api/proposals", tags=["proposals"])
 log = logging.getLogger(__name__)
+
+
+from pydantic import BaseModel, Field
+
+
+class TonePreviewIn(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+
+@router.post("/{item_id}/tone-preview")
+async def preview_application_tone(item_id: int, body: TonePreviewIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    from .. import proposal_gen
+    item = get_owned(db, ProposalQueueItem, item_id, user)
+    if item is None:
+        raise HTTPException(404, "proposal not found")
+    if item.status != "pending_review" or item.revision != body.expected_revision:
+        raise HTTPException(409, "Reload and review the current pending proposal before rewriting.")
+    check_llm_gen_rate(user)
+    job = get_owned(db, Job, item.job_id, user)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    # Return a new reviewable preview; never overwrite a saved or approved version.
+    result = (await proposal_gen.generate_follow_up(db, item, job) if item.request_type == "follow_up"
+              else await proposal_gen.generate(db, job))
+    if not result.get("used_llm"):
+        raise HTTPException(503, "AI rewriting is unavailable. Your existing draft has been preserved; you can edit it manually.")
+    db.refresh(item)
+    if item.status != "pending_review" or item.revision != body.expected_revision:
+        raise HTTPException(409, "The proposal changed during generation. Reload before using a new draft.")
+    return {"text": result["humanized_text"], "revision": body.expected_revision,
+            "warning": result.get("leak_warning")}
 
 
 def _with_job(item: ProposalQueueItem, job: Job | None) -> ProposalQueueOut:
@@ -42,9 +76,12 @@ def _dispatch_fiverr_offer(db: Session, item: ProposalQueueItem, user: User) -> 
     Skips (item stays approved) when the tenant has no active fiverr account
     (the task would be doomed) or the circuit is open (mirrors the upwork
     guard: the skipped_circuit_open row stays visible in the UI)."""
+    from ..approval import require_snapshot
+    approved = require_snapshot(db, item)
     account = (db.query(PlatformAccount)
                .filter(PlatformAccount.user_id == user.id,
                        PlatformAccount.platform == "fiverr",
+                       PlatformAccount.id == approved.get("account_id"),
                        PlatformAccount.enabled.is_(True),
                        PlatformAccount.mode != "disabled")
                .first())
@@ -60,17 +97,31 @@ def _dispatch_fiverr_offer(db: Session, item: ProposalQueueItem, user: User) -> 
                         }))
         db.commit()
         return
+    from ..approval import require_snapshot
+    require_snapshot(db, item)
+    claimed = db.execute(update(ProposalQueueItem).where(
+        ProposalQueueItem.id == item.id, ProposalQueueItem.user_id == user.id,
+        ProposalQueueItem.status == "approved",
+    ).values(status="submitting")).rowcount
+    if not claimed:
+        db.rollback()
+        return
+    db.refresh(item)
+    require_snapshot(db, item)
     job = db.get(Job, item.job_id)
     task = enqueue_stealth_task(db, user.id, "fiverr", SUBMIT_FIVERR_OFFER, {
         "job_external_id": job.external_id if job else "",
         "job_url": (job.url if job else "") or None,
         "proposal_text": item.proposal_text,
-        "humanized_text": item.humanized_text or item.proposal_text,
+        "humanized_text": item.proposal_text,
         "typing_plan": item.typing_plan or [],
         "bid_amount": item.bid_amount,
         "proposal_queue_item_id": item.id,
-    })
+        "account_id": approved.get("account_id"),
+    }, commit=False)
     if task is None or task.status == "skipped_circuit_open":
+        item.status = "approved"
+        db.commit()
         return  # leave approved — the item can be dispatched later
     item.status = "queued_for_browser"
     db.commit()
@@ -82,8 +133,11 @@ def list_proposals(status: str | None = Query(None),
                    limit: int = Query(50, ge=1, le=200),
                    offset: int = Query(0, ge=0),
                    db: Session = Depends(get_db),
-                   user: User = Depends(get_current_user)):
+                   user: User = Depends(get_current_user),
+                   job_id: int | None = Query(None, ge=1)):
     q = scoped(db, ProposalQueueItem, user)
+    if job_id is not None:
+        q = q.filter(ProposalQueueItem.job_id == job_id)
     if status:
         q = q.filter(ProposalQueueItem.status == status)
     if request_type:
@@ -140,17 +194,28 @@ def get_proposal(item_id: int, db: Session = Depends(get_db), user: User = Depen
     return _with_job(item, get_owned(db, Job, item.job_id, user))
 
 
+def _locked_proposal(db: Session, item_id: int, user: User) -> ProposalQueueItem | None:
+    """Serialize review edits on PostgreSQL until their audit record commits."""
+    return (db.query(ProposalQueueItem)
+            .filter(ProposalQueueItem.id == item_id, ProposalQueueItem.user_id == user.id)
+            .populate_existing().with_for_update().first())
+
+
 @router.post("/{item_id}/approve", response_model=ProposalQueueOut)
 def approve_proposal(item_id: int, body: ProposalReviewAction, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    item = get_owned(db, ProposalQueueItem, item_id, user)
+    item = _locked_proposal(db, item_id, user)
     if not item:
         raise HTTPException(404, "proposal not found")
+    if item.revision != body.expected_revision:
+        raise HTTPException(409, "proposal changed in another session; reload and review the latest version")
     if item.status != "pending_review":
         raise HTTPException(409, f"cannot approve a proposal in status '{item.status}'")
     if not body.reviewer:
         raise HTTPException(400, "reviewer identity is required")
     if body.proposal_text is not None and not body.proposal_text.strip():
         raise HTTPException(422, "proposal_text must not be empty")
+    from ..approval import select_review_account
+    select_review_account(db, item, body.platform_account_id)
     edited = False
     if body.proposal_text is not None and body.proposal_text != item.proposal_text:
         # version the PREVIOUS text before overwriting — the pre-edit draft
@@ -160,6 +225,8 @@ def approve_proposal(item_id: int, body: ProposalReviewAction, db: Session = Dep
                          "by": body.reviewer, "at": datetime.now(timezone.utc).isoformat()})
         item.versions = versions
         item.proposal_text = body.proposal_text
+        item.humanized_text = ""
+        item.typing_plan = []
         edited = True
     if body.bid_amount is not None:
         item.bid_amount = body.bid_amount
@@ -173,7 +240,7 @@ def approve_proposal(item_id: int, body: ProposalReviewAction, db: Session = Dep
         item.template_id = tpl.id
     item.save_as_template = body.save_as_template
     item.status = "approved"
-    item.reviewed_by = body.reviewer
+    item.reviewed_by = f"user:{user.id}"
     item.reviewed_at = datetime.now(timezone.utc)
     from ..templates import template_for_approval
     tpl = template_for_approval(db, item)
@@ -194,7 +261,7 @@ def approve_proposal(item_id: int, body: ProposalReviewAction, db: Session = Dep
 
 @router.post("/{item_id}/reject", response_model=ProposalQueueOut)
 def reject_proposal(item_id: int, body: ProposalRejectAction, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    item = get_owned(db, ProposalQueueItem, item_id, user)
+    item = _locked_proposal(db, item_id, user)
     if not item:
         raise HTTPException(404, "proposal not found")
     if item.status != "pending_review":
@@ -202,10 +269,10 @@ def reject_proposal(item_id: int, body: ProposalRejectAction, db: Session = Depe
     item.status = "rejected"
     item.rejection_reason = body.reason
     item.rejection_notes = body.notes
-    item.reviewed_by = body.reviewer
+    item.reviewed_by = f"user:{user.id}"
     item.reviewed_at = datetime.now(timezone.utc)
     from ..templates import record_rejection
-    record_rejection(db, item, body.reason, body.notes)
+    record_rejection(db, item, body.reason, body.notes, commit=False)
     db.commit()
     db.refresh(item)
     return _with_job(item, db.get(Job, item.job_id))
@@ -218,7 +285,48 @@ def mark_outcome(item_id: int, body: OutcomeAction, db: Session = Depends(get_db
     if not item:
         raise HTTPException(404, "proposal not found")
     from ..templates import record_outcome
+    if item.status != "submitted":
+        raise HTTPException(409, "only confirmed submitted proposals can have outcomes")
     record_outcome(db, item, body.outcome)
+    db.refresh(item)
+    return _with_job(item, db.get(Job, item.job_id))
+
+
+@router.post("/{item_id}/reconcile", response_model=ProposalQueueOut)
+def reconcile_submission(item_id: int, body: SubmissionReconcileIn,
+                         db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Resolve uncertain/failed work only after a human checks the platform."""
+    item = get_owned(db, ProposalQueueItem, item_id, user)
+    if not item:
+        raise HTTPException(404, "proposal not found")
+    if not body.evidence.strip() or len(body.evidence.strip()) < 10:
+        raise HTTPException(422, "describe what you checked on the platform")
+    previous = item.status
+    now = datetime.now(timezone.utc)
+    result = {**(item.submission_result or {}), "reconciliation": {
+        "submitted": body.submitted, "evidence": body.evidence.strip(),
+        "user_id": user.id, "at": now.isoformat()}}
+    values = {"status": "submitted" if body.submitted else "pending_review",
+              "submission_result": result}
+    if body.submitted:
+        values["submitted_at"] = now
+    if not body.submitted:
+        values.update(reviewed_by=None, reviewed_at=None)
+    try:
+        changed = db.execute(update(ProposalQueueItem).where(
+            ProposalQueueItem.id == item.id, ProposalQueueItem.user_id == user.id,
+            ProposalQueueItem.status.in_(["failed", "submitted_unverified"]),
+            ProposalQueueItem.status == previous,
+        ).values(**values)).rowcount
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "another active proposal already exists for this job; resolve it before returning this proposal to review")
+    if not changed:
+        db.rollback()
+        raise HTTPException(409, "proposal no longer requires reconciliation")
+    db.add(AuditLog(user_id=user.id, action_type="submission_reconciled", platform=item.platform,
+                    detail={"proposal_id": item.id, "previous_status": previous, **result["reconciliation"]}))
+    db.commit()
     db.refresh(item)
     return _with_job(item, db.get(Job, item.job_id))
 
@@ -231,7 +339,7 @@ def mark_submitted(item_id: int, body: MarkSubmittedAction | None = None,
     For platforms with no automated submission channel: the user copies the
     approved text, submits it themselves, and marks it here so outcome
     tracking (hired/rejected/ghosted) works like any other proposal."""
-    item = get_owned(db, ProposalQueueItem, item_id, user)
+    item = _locked_proposal(db, item_id, user)
     if not item:
         raise HTTPException(404, "proposal not found")
     if item.status not in ("approved", "failed"):
@@ -261,7 +369,7 @@ async def draft_follow_up(item_id: int, db: Session = Depends(get_db), user: Use
     item = get_owned(db, ProposalQueueItem, item_id, user)
     if not item:
         raise HTTPException(404, "proposal not found")
-    if item.status not in ("submitted", "queued_for_browser"):
+    if item.status != "submitted":
         raise HTTPException(
             409, f"follow-ups require a submitted proposal (status is '{item.status}')")
     if item.outcome != "pending":
@@ -349,13 +457,18 @@ def bulk_approve(body: BulkApproveAction, db: Session = Depends(get_db), user: U
         raise HTTPException(400, "reviewer identity is required")
     from ..templates import template_for_approval
     approved, skipped = [], []
-    for pid in body.ids:
-        item = get_owned(db, ProposalQueueItem, pid, user)
+    for pid in sorted(set(body.ids)):
+        item = _locked_proposal(db, pid, user)
         if not item or item.status != "pending_review" or item.needs_review:
             skipped.append(pid)
             continue
+        if body.expected_revisions.get(pid) != item.revision:
+            db.rollback()
+            raise HTTPException(409, "selected proposal changed; reload and review the latest versions")
+        from ..approval import select_review_account
+        select_review_account(db, item)
         item.status = "approved"
-        item.reviewed_by = body.reviewer
+        item.reviewed_by = f"user:{user.id}"
         item.reviewed_at = datetime.now(timezone.utc)
         versions = list(item.versions or [])
         versions.append({"text": item.proposal_text, "bid": item.bid_amount,
@@ -382,13 +495,15 @@ def bulk_approve(body: BulkApproveAction, db: Session = Depends(get_db), user: U
 @router.post("/{item_id}/revert", response_model=ProposalQueueOut)
 def revert_version(item_id: int, body: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Revert to a previous version (by index into `versions`)."""
-    item = get_owned(db, ProposalQueueItem, item_id, user)
+    item = _locked_proposal(db, item_id, user)
     if not item:
         raise HTTPException(404, "proposal not found")
     if item.status not in ("pending_review", "approved"):
         raise HTTPException(409, f"cannot revert a proposal in status '{item.status}'")
     versions = item.versions or []
     idx = body.get("version_index", 0)
+    if type(idx) is not int:
+        raise HTTPException(422, "version_index must be an integer")
     if not (0 <= idx < len(versions)):
         raise HTTPException(400, f"version_index out of range (0-{len(versions)-1})")
     v = versions[idx]
@@ -396,6 +511,8 @@ def revert_version(item_id: int, body: dict, db: Session = Depends(get_db), user
     new_text = v.get("text", item.proposal_text)
     if new_text != item.proposal_text:
         item.proposal_text = new_text
+        item.humanized_text = ""
+        item.typing_plan = []
         changed = True
     if v.get("bid") is not None and v["bid"] != item.bid_amount:
         item.bid_amount = v["bid"]
@@ -432,6 +549,10 @@ def retry_generation(item_id: int, db: Session = Depends(get_db), user: User = D
         "proposal_id": item.id, "job_id": item.job_id,
     }))
     db.commit()
+    from ..work_queue import reset_generation
+    job = db.get(Job, item.job_id)
+    if job is None or not reset_generation(db, job):
+        raise HTTPException(409, "generation is already running or the job is missing")
     from ..tasks import generate_proposal_task
     try:
         generate_proposal_task.delay(item.job_id)
@@ -453,7 +574,8 @@ def suggest_templates(platform: str, skills: str = "", db: Session = Depends(get
 
 
 @router.post("/templates/generate", response_model=dict)
-async def generate_proposal_template(body: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+async def generate_proposal_template(body: TemplateGenerateIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    body = body.model_dump()
     """Generate a reusable proposal Template via the configured text provider
     (Ollama by default). Pass save=true to persist it to the library."""
     from ..models import Template
@@ -485,11 +607,9 @@ async def generate_proposal_template(body: dict, db: Session = Depends(get_db), 
                                           result["provider"], result["latency_ms"])
     except LLMUnavailable as exc:
         offline, warning = True, str(exc)
-        text = (f"Quick note on \"{{job_title}}\" — this is squarely a "
-                f"{', '.join(skills) or 'my core stack'} job, and I've shipped similar work.\n\n"
-                f"Relevant: {{portfolio_piece}}.\n\n"
-                f"One question before I lock an estimate: what's the must-have deliverable "
-                f"for the first milestone?")
+        text = ("Quick note on \"{job_title}\".\n\n"
+                "Relevant evidence for review: {portfolio_piece}.\n\n"
+                "Before agreeing an estimate, what is the must-have deliverable and acceptance criterion for the first milestone?")
         model, provider, latency = "offline-fallback", "none", 0
 
     saved = None
@@ -508,7 +628,7 @@ async def generate_proposal_template(body: dict, db: Session = Depends(get_db), 
 
 @router.post("/{item_id}/submit", response_model=ProposalQueueOut)
 async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Dispatch an APPROVED proposal through the platform's compliant channel.
+    """Dispatch an APPROVED proposal through the platform's configured channel.
 
     freelancer.com → official bid API. upwork → agency-manager queue
     (browser handoff). Other platforms have no automated channel — submit by
@@ -517,12 +637,23 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
     item = get_owned(db, ProposalQueueItem, item_id, user)
     if not item:
         raise HTTPException(404, "proposal not found")
+    if item.request_type == "follow_up":
+        raise HTTPException(409, "follow-ups must be sent in the existing platform conversation")
     if not platform_enabled(db, user.id, item.platform):
         raise HTTPException(
             409, f"platform '{item.platform}' is disabled — enable it on the Accounts page")
     job = db.get(Job, item.job_id)
     if not job:
         raise HTTPException(404, "job not found")
+    deadline = job.apply_deadline
+    if deadline and deadline.replace(tzinfo=deadline.tzinfo or timezone.utc) <= datetime.now(timezone.utc):
+        raise HTTPException(409, "application deadline has passed")
+    if job.status == "archived":
+        raise HTTPException(409, "archived jobs cannot be submitted")
+    from ..approval import require_snapshot
+    approved = require_snapshot(db, item)
+    if item.platform in ("freelancer", "upwork") and not approved.get("account_id"):
+        raise HTTPException(400, "enroll an enabled account on the Accounts page and review this proposal again")
     # atomic claim approved → submitting BEFORE any external call, so a
     # concurrent/duplicate submit (double-click, client retry) loses the race
     # here instead of placing a second real-money bid — same conditional-update
@@ -537,23 +668,33 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
     if res.rowcount == 0:
         raise HTTPException(409, "proposal is not approved (already submitted or in flight)")
 
+    # The approved row may have changed while this request waited for its claim.
+    db.refresh(item)
+    try:
+        require_snapshot(db, item)
+    except HTTPException:
+        item.status = "pending_review"
+        item.reviewed_by = None
+        item.reviewed_at = None
+        db.commit()
+        raise
+    external_write_attempted = False
     channel = ""
     response_id = None
     try:
         if item.platform == "freelancer":
             from ..adapters.freelancer import FreelancerAdapter
 
-            bidder_id = int(item.submission_result.get("bidder_id") or 0)
-            if not bidder_id:
-                bidder_id = int(platform_account_settings(db, user.id, "freelancer")
-                                .get("bidder_id") or 0)
+            bidder_id = int(approved.get("bidder_id") or 0)
             if not bidder_id:
                 raise HTTPException(
                     400, "no Freelancer bidder id: set 'bidder_id' in the freelancer "
                     "account's settings on the Accounts page"
                 )
-            adapter = FreelancerAdapter(db, user.id)
+            account = db.get(PlatformAccount, approved.get("account_id")) if approved.get("account_id") else None
+            adapter = FreelancerAdapter(db, user.id, principal=account.principal if account else "default")
             try:
+                external_write_attempted = True
                 result = await adapter.place_bid(
                     project_id=int(job.external_id),
                     bidder_id=bidder_id,
@@ -572,16 +713,15 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
         elif item.platform == "upwork":
             from ..adapters.upwork_agency import UpworkAgencyAdapter
 
-            on_behalf_of = (item.submission_result.get("on_behalf_of")
-                            or platform_account_settings(db, user.id, "upwork")
-                            .get("on_behalf_of", ""))
+            on_behalf_of = approved.get("agency_member") or ""
             if not on_behalf_of:
                 raise HTTPException(
                     400, "no Upwork agency member: set 'on_behalf_of' in the upwork "
                     "account's settings on the Accounts page"
                 )
             connects_required = item.submission_result.get("connects_required", 0)
-            adapter = UpworkAgencyAdapter(db, user.id)
+            account = db.get(PlatformAccount, approved.get("account_id")) if approved.get("account_id") else None
+            adapter = UpworkAgencyAdapter(db, user.id, principal=account.principal if account else "agency_manager")
             try:
                 record = adapter.submit_proposal(
                     job_external_id=job.external_id,
@@ -589,12 +729,13 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
                     on_behalf_of=on_behalf_of,
                     connects_required=connects_required,
                     approved_by=item.reviewed_by,
+                    persist=False,
                 )
             finally:
                 await adapter.close()
             channel = "upwork_agency_queue"
             response_id = record.get("id")
-            item.submission_result = {"channel": channel, "record": record}
+            item.submission_result = {"channel": channel, "record": record, "on_behalf_of": on_behalf_of, "connects_required": connects_required}
             # handoff to the stealth-browser worker (AD-4): it executes the
             # agency BM submission and completes this task, which flips the
             # item out of queued_for_browser.
@@ -602,13 +743,15 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
                 "job_external_id": job.external_id,
                 "job_url": job.url,
                 "proposal_text": item.proposal_text,
-                "humanized_text": item.humanized_text or item.proposal_text,
+                "humanized_text": item.proposal_text,
                 "typing_plan": item.typing_plan or [],
                 "on_behalf_of": on_behalf_of,
+                "agency_id": (account.settings or {}).get("agency_id", "") if account else "",
                 "connects_required": connects_required,
                 "bid_amount": item.bid_amount,
                 "proposal_queue_item_id": item.id,
-            })
+                "account_id": account.id,
+            }, commit=False)
             if stealth_task is None or stealth_task.status == "skipped_circuit_open":
                 # circuit open: the task will never run — leave the item
                 # approved instead of stranding it in queued_for_browser
@@ -616,7 +759,7 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
                           if stealth_task is not None else "")
                 if not reason:
                     from .. import circuit_breaker
-                    reason = circuit_breaker.check("upwork", user.id)[1] or "upwork circuit is open"
+                    reason = circuit_breaker.check("upwork", user.id, db=db)[1] or "upwork circuit is open"
                 raise HTTPException(409, reason)
         else:
             raise HTTPException(
@@ -631,22 +774,37 @@ async def submit_proposal(item_id: int, db: Session = Depends(get_db), user: Use
         item.status = "approved"
         db.commit()
         raise
-    except Exception as exc:  # noqa: BLE001
-        item.status = "failed"
-        item.submission_result = {"error": str(exc)}
+    except Exception:  # noqa: BLE001
+        item.status = "submitted_unverified" if external_write_attempted else "failed"
+        item.submission_result = {"error": "Submission outcome could not be confirmed. Check the platform before retrying." if external_write_attempted else "Submission failed before dispatch."}
         db.commit()
         # adapter/library exception strings leak upstream internals — the
-        # detail stays in the server log and the item's submission_result
+        # detail stays in the server log
         log.exception("proposal submission failed for item %d", item.id)
         raise HTTPException(502, "submission failed")
 
     # Upwork submissions wait for the external browser worker to confirm;
     # only Freelancer bids are truly "submitted" at this point.
     item.status = "submitted" if item.platform == "freelancer" else "queued_for_browser"
-    db.add(AuditLog(user_id=user.id, action_type="proposal_submitted", platform=item.platform, detail={
+    db.add(AuditLog(user_id=user.id, action_type="proposal_submitted" if item.platform == "freelancer" else "proposal_queued", platform=item.platform, detail={
         "proposal_id": item.id, "job_id": job.id, "channel": channel,
         "platform_response_id": response_id, "approved_by": item.reviewed_by,
     }))
     db.commit()
     db.refresh(item)
     return _with_job(item, db.get(Job, item.job_id))
+
+
+@router.post("/{item_id}/return-to-review", response_model=ProposalQueueOut)
+def return_to_review(item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    item = _locked_proposal(db,item_id,user)
+    if item is None:
+        raise HTTPException(404,"proposal not found")
+    if item.status != "approved":
+        raise HTTPException(409,"only an unsent approved proposal can return directly to review")
+    item.status="pending_review"
+    item.reviewed_at=None
+    item.reviewed_by=None
+    db.add(AuditLog(user_id=user.id,action_type="approval_invalidated",platform=item.platform,detail={"proposal_id":item.id}))
+    db.commit();db.refresh(item)
+    return _with_job(item,db.get(Job,item.job_id))

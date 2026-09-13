@@ -1,133 +1,116 @@
-"""Per-platform circuit breaker for automation tasks.
+"""SQL-backed per-platform automation stops and bounded trial admission.
 
-States: CLOSED (normal) → OPEN (halted, all automation skipped) → HALF_OPEN
-(one trial task). Backed by Redis when available, in-process otherwise.
-Opened manually (via API) or automatically after repeated stealth-task
-failures / platform warnings.
-
-Two scopes per platform: the platform-global key `circuit:{platform}`
-(manual kill switch — blocks every tenant) and per-tenant keys
-`circuit:{platform}:{user_id}` (auto-tripped by one tenant's failures — the
-other tenants keep running). A per-tenant check honors BOTH.
+Missing records mean a new scope; existing tenants are paused by the migration.
+Database errors block admission. Redis state never grants dispatch permission.
 """
+from contextlib import contextmanager
 import logging
 import time
-
-import redis
-
-from .cache import cache
+from sqlalchemy import update
+from sqlalchemy.exc import SQLAlchemyError
+from .database import SessionLocal
+from .models import AutomationCircuit
+from .cache import cache  # retained for callers/tests of the shared cache module
 
 log = logging.getLogger(__name__)
-
-CLOSED, OPEN, HALF_OPEN = "closed", "open", "half_open"
-
-_local: dict[str, dict] = {}
-DEFAULT_COOLDOWN_SEC = 1800  # 30 min before half-open trial
-TRIAL_TOKEN_TTL = 60  # seconds; a crashed trial frees the slot after this
-
-# in-process fallback trial tokens (key → acquired-at) — bounds trials per
-# process when Redis is down; expires on the same TTL as the Redis token
-_local_trials: dict[str, float] = {}
+CLOSED, OPEN, HALF_OPEN = 'closed', 'open', 'half_open'
+DEFAULT_COOLDOWN_SEC = 1800
+TRIAL_TOKEN_TTL = 60
+# Compatibility only: clearing these has no effect on durable permission.
+_local: dict = {}
+_local_trials: dict = {}
 
 
-def _key(platform: str, user_id: int | None = None) -> str:
-    return f"circuit:{platform}" if user_id is None else f"circuit:{platform}:{user_id}"
+def _key(platform, user_id=None):
+    return f'circuit:{platform}' if user_id is None else f'circuit:{platform}:{user_id}'
 
 
-def _trial_key(platform: str, user_id: int | None = None) -> str:
-    base = f"circuit:trial:{platform}"
-    return base if user_id is None else f"{base}:{user_id}"
+@contextmanager
+def _session(db=None):
+    if db is not None:
+        yield db
+    else:
+        with SessionLocal() as session:
+            yield session
+            session.commit()
 
 
-def _acquire_trial(platform: str, user_id: int | None = None) -> bool:
-    """Half-open admission: ONE trial task at a time (Redis SET NX, else a
-    per-process flag). Released by any transition out of half-open, or after
-    TRIAL_TOKEN_TTL if the trial never reports back."""
-    key = _trial_key(platform, user_id)
-    if cache._r is not None:
-        try:
-            return bool(cache._r.set(key, "1", nx=True, ex=TRIAL_TOKEN_TTL))
-        except redis.RedisError as exc:
-            log.warning("Redis trial token failed (%s); using local bound", exc)
-    acquired_at = _local_trials.get(key)
-    if acquired_at is not None and time.time() - acquired_at < TRIAL_TOKEN_TTL:
+def _insert(db, values, *, replace=False):
+    if db.bind.dialect.name == 'postgresql':
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+    statement = insert(AutomationCircuit).values(**values)
+    if replace:
+        statement = statement.on_conflict_do_update(index_elements=['key'], set_={**{k:v for k,v in values.items() if k not in ('key','revision')}, 'revision':AutomationCircuit.revision+1})
+    else:
+        statement = statement.on_conflict_do_nothing(index_elements=['key'])
+    db.execute(statement)
+
+
+def get_state(platform, user_id=None, *, db=None):
+    try:
+        with _session(db) as session:
+            row = session.query(AutomationCircuit).filter_by(key=_key(platform,user_id)).populate_existing().one_or_none()
+            if row is None:
+                return {'state':CLOSED,'opened_at':None,'reason':'','manual_stop':False,'revision':0}
+            return {k:getattr(row,k) for k in ('state','opened_at','reason','manual_stop','revision')}
+    except SQLAlchemyError:
+        log.exception('Circuit storage unavailable; automation paused')
+        return {'state':OPEN,'opened_at':None,'reason':'circuit storage unavailable','manual_stop':True}
+
+
+def transition(platform, state, reason='', user_id=None, *, manual_stop=False, db=None):
+    if state not in (CLOSED, OPEN, HALF_OPEN):
+        raise ValueError('invalid circuit state')
+    with _session(db) as session:
+        _insert(session, dict(key=_key(platform,user_id), user_id=user_id, revision=1, state=state,
+            opened_at=time.time() if state == OPEN else None, reason=reason[:2000],
+            manual_stop=manual_stop, trial_until=0.0), replace=True)
+        session.flush()
+
+
+def is_closed(platform, user_id=None, *, db=None):
+    try:
+        with _session(db) as session:
+            key = _key(platform,user_id)
+            state = get_state(platform,user_id,db=session)
+            if state['state'] == CLOSED:
+                return True
+            if state.get('manual_stop'):
+                return False
+            now = time.time()
+            if state['state'] == OPEN:
+                if state.get('opened_at') is None or now-state['opened_at'] <= DEFAULT_COOLDOWN_SEC:
+                    return False
+                # A concurrent operator stop/reopen must win over stale cooldown.
+                changed = session.execute(update(AutomationCircuit).where(
+                    AutomationCircuit.key == key, AutomationCircuit.state == OPEN,
+                    AutomationCircuit.opened_at == state['opened_at'],
+                    AutomationCircuit.manual_stop.is_(False),
+                ).values(state=HALF_OPEN,trial_until=0.0,reason='cooldown elapsed',revision=AutomationCircuit.revision+1)).rowcount
+                if not changed:
+                    return False
+            return bool(session.execute(update(AutomationCircuit).where(
+                AutomationCircuit.key == key, AutomationCircuit.state == HALF_OPEN,
+                AutomationCircuit.manual_stop.is_(False), AutomationCircuit.trial_until <= now,
+            ).values(trial_until=now+TRIAL_TOKEN_TTL)).rowcount)
+    except SQLAlchemyError:
+        log.exception('Circuit admission unavailable; automation paused')
         return False
-    _local_trials[key] = time.time()
-    return True
 
 
-def _release_trial(platform: str, user_id: int | None = None):
-    key = _trial_key(platform, user_id)
-    _local_trials.pop(key, None)
-    if cache._r is not None:
-        try:
-            cache._r.delete(key)
-        except redis.RedisError as exc:
-            log.warning("Redis trial token release failed (%s); TTL will free it", exc)
+def open_circuit(platform, reason='', user_id=None, *, db=None):
+    transition(platform,OPEN,reason,user_id,db=db)
 
 
-def get_state(platform: str, user_id: int | None = None) -> dict:
-    if cache._r is not None:
-        data = cache.get_json(_key(platform, user_id))
-        if data:
-            return data
-    return _local.get(_key(platform, user_id),
-                      {"state": CLOSED, "opened_at": None, "reason": ""})
+def close_circuit(platform, reason='', user_id=None, *, db=None):
+    transition(platform,CLOSED,reason,user_id,db=db)
 
 
-def is_closed(platform: str, user_id: int | None = None) -> bool:
-    s = get_state(platform, user_id)
-    if s["state"] == CLOSED:
-        return True
-    if s["state"] == OPEN:
-        opened_at = s.get("opened_at") or 0
-        if time.time() - opened_at > DEFAULT_COOLDOWN_SEC:
-            transition(platform, HALF_OPEN, "cooldown elapsed, trial task allowed",
-                       user_id=user_id)
-        else:
-            return False
-    # half_open: admit a single trial; concurrent checks are blocked until
-    # the trial resolves (transition out) or its token TTL lapses
-    return _acquire_trial(platform, user_id)
-
-
-def transition(platform: str, state: str, reason: str = "",
-               user_id: int | None = None):
-    data = {
-        "state": state,
-        "opened_at": time.time() if state == OPEN else None,
-        "reason": reason,
-    }
-    _local[_key(platform, user_id)] = data
-    if cache._r is not None:
-        cache.set_json(_key(platform, user_id), data, ttl=86400)
-    if state != HALF_OPEN:
-        # the trial resolved (success → CLOSED, failure → OPEN): free the slot
-        _release_trial(platform, user_id)
-    scope = platform if user_id is None else f"{platform} (user {user_id})"
-    log.warning("circuit breaker %s → %s (%s)", scope, state, reason)
-
-
-def open_circuit(platform: str, reason: str = "", user_id: int | None = None):
-    transition(platform, OPEN, reason, user_id=user_id)
-
-
-def close_circuit(platform: str, reason: str = "", user_id: int | None = None):
-    transition(platform, CLOSED, reason, user_id=user_id)
-
-
-def check(platform: str, user_id: int | None = None) -> tuple[bool, str]:
-    """Gate for automation entry points. Returns (allowed, skip_reason).
-
-    When user_id is given, BOTH scopes are honored: a platform-global open
-    (manual kill switch) blocks every tenant, and a per-tenant open blocks
-    just that tenant.
-    """
-    if not is_closed(platform):
-        state = get_state(platform)
-        return False, f"circuit OPEN for {platform}: {state.get('reason', 'no reason recorded')}"
-    if user_id is not None and not is_closed(platform, user_id):
-        state = get_state(platform, user_id)
-        return False, (f"circuit OPEN for {platform} (user {user_id}): "
-                       f"{state.get('reason', 'no reason recorded')}")
-    return True, ""
+def check(platform, user_id=None, *, db=None):
+    if not is_closed(platform,db=db):
+        return False, f"circuit OPEN for {platform}: {get_state(platform,db=db).get('reason','')}"
+    if user_id is not None and not is_closed(platform,user_id,db=db):
+        return False, f"circuit OPEN for {platform} (user {user_id}): {get_state(platform,user_id,db=db).get('reason','')}"
+    return True, ''

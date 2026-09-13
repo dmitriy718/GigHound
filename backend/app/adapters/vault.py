@@ -18,7 +18,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
 
-from ..models import AdapterCredential, AdapterState
+from ..models import AdapterCredential, AdapterState, PlatformAccount, User
 from .base import AdapterAuthError
 
 log = logging.getLogger(__name__)
@@ -70,17 +70,44 @@ class CredentialVault:
     of the user it was created for (AD-1).
     """
 
-    def __init__(self, db: Session, user_id: int):
+    def __init__(self, db: Session, user_id: int, *, account_id: int | None = None, account_epoch: str | None = None):
         self.db = db
         self.user_id = user_id
+        self.account_id = account_id
+        self.account_epoch = account_epoch
+        if account_id is not None and account_epoch is None:
+            self.account_epoch = db.query(PlatformAccount.identity_epoch).filter_by(id=account_id, user_id=user_id).scalar()
+        self._observed = {}
+
+    def observe(self, platform: str, principal: str):
+        """Capture a credential version before an external token exchange."""
+        row = self.db.query(AdapterCredential).filter_by(
+            user_id=self.user_id, platform=platform, principal=principal
+        ).populate_existing().first()
+        self._observed[(platform, principal)] = row.blob if row else None
+        return row
+
+    def _lock_owner(self):
+        owner = self.db.query(User).filter_by(id=self.user_id).populate_existing().with_for_update().one_or_none()
+        if owner is None or not owner.is_active:
+            raise AdapterAuthError("credential owner is no longer active")
 
     def store(self, platform: str, principal: str, secrets: dict):
+        self._lock_owner()
+        if self.account_id is not None and not self.db.query(PlatformAccount.id).filter_by(
+            id=self.account_id, user_id=self.user_id, platform=platform, principal=principal, identity_epoch=self.account_epoch
+        ).first():
+            raise AdapterAuthError("enrollment account was removed; start again")
         blob = _fernet().encrypt(json.dumps(secrets).encode()).decode()
         row = (
             self.db.query(AdapterCredential)
             .filter_by(user_id=self.user_id, platform=platform, principal=principal)
+            .populate_existing()
             .first()
         )
+        key = (platform, principal)
+        if key in self._observed and self._observed[key] != (row.blob if row else None):
+            raise AdapterAuthError("credentials changed during token exchange; start again")
         if row:
             row.blob = blob
         else:
@@ -88,13 +115,10 @@ class CredentialVault:
                                     principal=principal, blob=blob)
             self.db.add(row)
         self.db.commit()
+        self._observed[key] = blob
 
     def load(self, platform: str, principal: str) -> dict | None:
-        row = (
-            self.db.query(AdapterCredential)
-            .filter_by(user_id=self.user_id, platform=platform, principal=principal)
-            .first()
-        )
+        row = self.observe(platform, principal)
         if not row:
             return None
         try:
@@ -105,6 +129,7 @@ class CredentialVault:
             ) from None
 
     def delete(self, platform: str, principal: str):
+        self._lock_owner()
         self.db.query(AdapterCredential).filter_by(
             user_id=self.user_id, platform=platform, principal=principal
         ).delete()
@@ -122,18 +147,19 @@ class StateStore:
         self.user_id = user_id
 
     def get(self, platform: str, key: str, default=None):
-        row = (self.db.query(AdapterState)
+        row = (self.db.query(AdapterState.value)
                .filter_by(user_id=self.user_id, platform=platform, key=key)
                .first())
-        return row.value if row else default
+        return row[0] if row else default
 
     def set(self, platform: str, key: str, value: dict):
-        row = (self.db.query(AdapterState)
-               .filter_by(user_id=self.user_id, platform=platform, key=key)
-               .first())
-        if row:
-            row.value = value
+        # Cursor/roster writers can start in different processes with no row yet.
+        if self.db.get_bind().dialect.name == 'postgresql':
+            from sqlalchemy.dialects.postgresql import insert
         else:
-            self.db.add(AdapterState(user_id=self.user_id, platform=platform,
-                                     key=key, value=value))
+            from sqlalchemy.dialects.sqlite import insert
+        from datetime import datetime, timezone
+        statement = insert(AdapterState).values(user_id=self.user_id,platform=platform,key=key,value=value)
+        self.db.execute(statement.on_conflict_do_update(
+            index_elements=['user_id','platform','key'],set_={'value':value,'updated_at':datetime.now(timezone.utc)}))
         self.db.commit()

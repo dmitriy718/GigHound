@@ -7,9 +7,8 @@ binaries installed.
 Sessions: one persistent Chromium context per (platform, user_id) under
 WORKER_SESSION_DIR. When a storage_state was enrolled via the Accounts UI
 (POST /api/accounts/{id}/credentials), the worker fetches it from
-GET /api/gigs/stealth-session and seeds the fresh context with it; otherwise
-it falls back to the local persistent profile, which a human can still seed
-via `python -m worker.login --platform <p>` (see README).
+GET /api/gigs/stealth-session and seeds a clean context with it. Authenticated
+worker tasks do not inherit credentials from a prior task or CLI profile.
 """
 import json
 import logging
@@ -233,7 +232,7 @@ def _type_chars(page, text: str, base_delay_ms: float):
         # rare burst: two chars fired off inside one short interval
         burst = 2 if i + 1 < len(text) and random.random() < 0.06 else 1
         for ch in text[i:i + burst]:
-            page.keyboard.press("Space" if ch == " " else ch)
+            page.keyboard.type(ch)
             delay_ms = min(350.0, base_delay_ms * random.uniform(0.6, 1.4))
             if ch in ".,;:!?":
                 delay_ms += random.uniform(100, 300)
@@ -349,8 +348,8 @@ class BrowserManager:
 
     `client` (a WorkerClient) is optional: when present, freshly launched
     contexts are seeded from the vault-enrolled storage_state served by the
-    backend; without it (or when nothing is enrolled) the local persistent
-    profile is used as before.
+    backend. Local CLI enrollment can use a manager without a client;
+    authenticated workers discard local credentials before seeding.
     """
 
     def __init__(self, config: Config, client=None):
@@ -364,6 +363,11 @@ class BrowserManager:
 
     def __enter__(self):
         from playwright.sync_api import sync_playwright  # lazy: needs browsers
+        if self.client is not None and self.config.session_dir.exists():
+            for directory in self.config.session_dir.glob("*/user_*"):
+                suffix = directory.name.removeprefix("user_")
+                if directory.is_dir() and not directory.is_symlink() and suffix.isdigit():
+                    self.purge_session(directory.parent.name, int(suffix))
         self._pw = sync_playwright().start()
         self._browser_type = self._pw.chromium
         return self
@@ -388,10 +392,14 @@ class BrowserManager:
         # proxy and per-account fingerprint geo (timezone/locale), both of
         # which must be known when the context is created
         session = self._fetch_session(platform, user_id)
+        if self.client is not None:
+            # Crash leftovers must never supply authentication to a new task.
+            self.purge_session(platform, user_id)
         fp = self._fingerprint_for(platform, user_id, session)
         kwargs = {
             "user_data_dir": str(user_data_dir),
             "headless": self.config.headless,
+            "service_workers": "block",
             "user_agent": fp["user_agent"],
             "viewport": fp["viewport"],
             "locale": fp["locale"],
@@ -404,6 +412,15 @@ class BrowserManager:
             log.info("%s/user %s via proxy %s",
                      platform, user_id, proxy_url.split("@")[-1])
         context = self._browser_type.launch_persistent_context(**kwargs)
+        from .security import validate_platform_url
+        def guard(route):
+            try:
+                validate_platform_url(platform, route.request.url)
+            except ValueError:
+                route.abort()
+                return
+            route.continue_()
+        context.route("**/*", guard)
         context.add_init_script(_stealth_init_script(fp))
         self._seed_session(context, platform, user_id, session)
         self._contexts[key] = context
@@ -447,34 +464,30 @@ class BrowserManager:
 
     def _fetch_session(self, platform: str, user_id: int) -> dict:
         """Fetch the vault-enrolled stealth session from the backend; {} when
-        there is no client, nothing is enrolled, or the backend is unreachable
-        — never block task execution on seeding."""
+        there is no client or nothing is enrolled. Backend refusal and
+        unavailability propagate; cached local credentials cannot override them."""
         if self.client is None:
             return {}
-        try:
-            return self.client.get_stealth_session(platform, user_id) or {}
-        except Exception as exc:  # noqa: BLE001
-            log.warning("could not fetch stealth session for %s/user %s (%s) — "
-                        "falling back to the local profile", platform, user_id, exc)
-            return {}
+        return self.client.get_stealth_session(platform, user_id) or {}
 
     def _seed_session(self, context, platform: str, user_id: int,
                       session: dict | None = None):
         """Prefer the vault-enrolled storage_state from the backend; fall back
-        to the local persistent profile when absent or unreachable. `session`
+        to the local persistent profile only when no enrolled state is returned. `session`
         is the prefetched payload when the caller already fetched it (the
         per-account proxy is chosen before the context launches)."""
         if session is None:
             session = self._fetch_session(platform, user_id)
         state = session.get("storage_state")
+        if state:
+            from .security import validate_storage_state
+            validate_storage_state(platform, state)
         if not state:
             return
         try:
             apply_storage_state(context, state)
         except Exception as exc:  # noqa: BLE001
-            log.warning("could not apply enrolled storage_state for %s/user %s (%s) — "
-                        "falling back to the local profile", platform, user_id, exc)
-            return
+            raise RuntimeError("could not apply the current enrolled browser session") from exc
         log.info("seeded %s session for user %s from enrolled credentials",
                  platform, user_id)
 
@@ -503,11 +516,10 @@ class BrowserManager:
         """Loud warning when the profile dir looks claimed by a LIVE Chromium
         — the signature of two workers sharing one worker_sessions volume
         (profile-lock corruption + one account active from two browsers).
-        Warning-only: a stale SingletonLock after a crash is normal and
-        Chromium cleans it up itself."""
+        Refuse a live lock. A dead process lock is safe to clean up."""
         lock = user_data_dir / "SingletonLock"
         try:
-            pid = int(lock.readlink().rsplit("-", 1)[-1])
+            pid = int(str(lock.readlink()).rsplit("-", 1)[-1])
         except (ValueError, OSError):
             return  # no lock (or not a Chromium symlink) — nothing to check
         try:
@@ -516,11 +528,7 @@ class BrowserManager:
             return  # stale lock after a crash — Chromium cleans it up itself
         except PermissionError:
             pass  # alive, owned by another user — still a live holder
-        log.warning("%s/user %s profile %s is locked by LIVE pid %d — is a "
-                    "second worker sharing this worker_sessions volume? Two "
-                    "Chromiums on one user_data_dir corrupt the profile and "
-                    "put one account in two browsers at once",
-                    platform, user_id, user_data_dir, pid)
+        raise RuntimeError(f"{platform}/user {user_id} browser profile is held by a live process; refusing reuse or erasure")
 
     def close_session(self, platform: str, user_id: int):
         context = self._contexts.pop((platform, user_id), None)
@@ -536,6 +544,25 @@ class BrowserManager:
             log.warning("could not save storage_state for %s/%s: %s",
                         platform, user_id, exc)
         context.close()
+
+    def purge_session(self, platform: str, user_id: int):
+        """Erase cookies, local storage and screenshots after task completion.
+
+        The non-secret fingerprint is retained; every future task must obtain
+        current credentials from its active backend claim.
+        """
+        import shutil
+        self.close_session(platform, user_id)
+        directory = self.session_dir_for(platform, user_id)
+        if directory.exists():
+            self._warn_if_profile_locked(platform, user_id, directory)
+            for entry in directory.iterdir():
+                if entry.name == "fingerprint.json":
+                    continue
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
 
     def screenshot(self, page, platform: str, user_id: int, name: str) -> str:
         path = self.session_dir_for(platform, user_id) / f"{_safe_name(name)}.png"

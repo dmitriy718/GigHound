@@ -18,7 +18,7 @@ export type Platform =
   | 'indeed';
 
 export type KeywordKind = 'primary' | 'secondary' | 'negative';
-export type JobType = 'fixed' | 'hourly' | 'retainer' | 'contest' | 'gig';
+export type JobType = 'fixed' | 'hourly' | 'retainer' | 'contest' | 'gig' | 'annual';
 export type ExperienceLevel = 'entry' | 'intermediate' | 'expert';
 export type WorkArrangement = 'remote' | 'onsite' | 'hybrid';
 export type JobStatus = 'new' | 'notified' | 'archived';
@@ -247,6 +247,9 @@ export const PROPOSAL_STATUSES: ProposalStatus[] = [
 ];
 
 export interface ProposalQueueItem {
+  platform_account_id?: number | null;
+  revision: number;
+  approved_snapshot?: {currency?: string} | null;
   id: number;
   job_id: number;
   platform: Platform;
@@ -277,6 +280,8 @@ export interface ProposalQueueItem {
 }
 
 export interface ProposalReviewAction {
+  platform_account_id?: number;
+  expected_revision: number;
   reviewer: string;
   proposal_text?: string;
   bid_amount?: number;
@@ -471,10 +476,10 @@ export interface GigMetricSuggestion {
 
 export interface GigMetric {
   week: string | null; // Optional[str] server-side (record_metrics always fills it today)
-  impressions: number;
-  clicks: number;
-  orders: number;
-  revenue: number;
+  impressions: number | null;
+  clicks: number | null;
+  orders: number | null;
+  revenue: number | null;
   suggestions: GigMetricSuggestion[];
 }
 

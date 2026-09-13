@@ -1,13 +1,13 @@
-"""Anti-detection text engine.
+"""Legacy text cleanup and typing helpers.
 
-Post-processes generated proposal text so it doesn't trip platform AI
-detection (linguistic patterns, structural fingerprints):
+Post-processes proposal text for readability. No detector-evasion or hiring
+advantage is established by these transformations:
 
-  * opening rotation from a 50+ pool stored in Redis (never reuse recent ones)
+  * neutral opening suggestions without invented credentials or availability
   * banned openers/phrases stripped ("I hope this finds you well", ...)
   * AI-tell removal: furthermore/moreover/additionally chains, numbered lists
   * sentence-length distribution report (target 40% short / 40% mid / 20% long)
-  * personality marker injection (casual transitions)
+  * preserve the generated voice without injecting random personality markers
   * humanization plan: 1-2 realistic typo→correction ops per 200 words, for
     the stealth browser's typing simulation (raw text + plan are stored;
     the final rendered text is unchanged)
@@ -36,65 +36,20 @@ PERSONALITY_MARKERS = [
     "Worth mentioning:", "Funny enough,", "Small detail, but",
 ]
 
+# These openers make no claims about experience, results, price or availability.
 OPENINGS_POOL = [
-    "Your {tech} project caught my eye —",
-    "Saw your post about {title} and had a few ideas.",
-    "{title} looks like a fun build.",
-    "I just finished something similar to {title}.",
-    "This is right in my wheelhouse — {tech} is what I do daily.",
-    "Read through your brief twice. Solid spec.",
-    "You had me at {tech}.",
-    "Not going to waste your time with fluff.",
-    "Quick question before anything else —",
-    "I've shipped three {tech} projects this year alone.",
-    "Your timeline looks tight but doable.",
-    "Most bids you'll get will be copy-paste. This isn't one.",
-    "I noticed something in your description others might miss.",
-    "{title} — I can start this week.",
-    "Been doing {tech} work for years; this one's straightforward.",
-    "Your budget actually makes sense for once. Refreshing.",
-    "I build exactly this kind of thing.",
-    "Skipped the generic intro. Here's my plan.",
-    "Two things stood out in your post.",
-    "This reminds me of a project I wrapped last month.",
-    "I've got a working approach for {title} already.",
-    "Short version: yes, I can do this, and here's how.",
-    "Your description is refreshingly specific.",
-    "I don't bid on many jobs. This one earned it.",
-    "The {tech} part is the easy bit — here's the real challenge.",
-    "Read your brief. No red flags. Let's talk details.",
-    "I've solved this exact problem before.",
-    "You're asking for {tech} done right — that's my entire portfolio.",
-    "Before the pitch: one thing worth clarifying.",
-    "I could write a wall of text. Instead, three short paragraphs.",
-    "This scope is realistic. Here's my read on it.",
-    "Happy to see a brief with actual deliverables listed.",
-    "I skimmed ten other posts today. Yours got a full read.",
-    "My last {tech} client left a 5-star review for similar work.",
-    "Straight to it — I can deliver {title}.",
-    "Your project ticks every box on my checklist.",
-    "I keep a short client list so projects like yours get real attention.",
-    "No templates here. I wrote this after reading your full brief.",
-    "The trick with {tech} projects is the details — yours are clear.",
-    "I had to double-check your budget. It's fair, and I can work with it.",
-    "Something in your description tells me you've been burned before.",
-    "Let me skip the sales pitch and talk approach.",
-    "Your job post answers most of my questions already.",
-    "I do my best work on projects exactly like this.",
-    "Here's my honest take on {title}.",
-    "This is a one-developer job, and I'd be that developer.",
-    "I'll be upfront about what's easy and what's tricky here.",
-    "Your {tech} requirements are specific enough that I can quote confidently.",
-    "Timing works — I have capacity opening this week.",
-    "I read the whole post, including the part most bidders skip.",
+    'About your project, {title}:',
+    'A question about {title}:',
+    'For {title}, I would start by clarifying the deliverables.',
+    'Here is my proposed next step for {title}.',
 ]
 
 _TYPO_MAP = {"the": "teh", "and": "adn", "you": "yuo", "with": "wiht",
              "that": "taht", "for": "fro", "your": "yuor", "this": "tihs",
              "have": "hvae", "from": "form", "project": "porject", "would": "woudl"}
 
-_redis_openings_key = "antidetect:openings_pool"
-_redis_used_key = "antidetect:openings_used"
+_redis_openings_key = "antidetect:openings_pool:v2"
+_redis_used_key = "antidetect:openings_used:v2"
 
 
 def seed_openings_pool():
@@ -213,7 +168,7 @@ def build_typing_plan(text: str, seed: int | None = None) -> list[dict]:
 def humanize(text: str, platform: str = "", title: str = "", tech: str = "") -> dict:
     """Full anti-detection pass. Returns raw/humanized/plan/stats."""
     cleaned = strip_ai_tells(text, platform)
-    cleaned = inject_personality(cleaned)
+    # Voice belongs to the owner: never splice random mannerisms into a draft.
     return {
         "raw_text": text,
         "humanized_text": cleaned,

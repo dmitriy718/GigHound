@@ -24,8 +24,8 @@ DISCOVERY_PLATFORMS = ("freelancer", "upwork", "linkedin")
 # browser platforms with a read-only scrape_proposal_status page in the worker
 BROWSER_SYNC_PLATFORMS = frozenset({"upwork", "fiverr", "peopleperhour", "guru"})
 
-# every platform the API schema accepts. "indeed" is accepted for
-# forward-compat but is served by NO subsystem — it appears in no set above.
+# Every platform accepted for job records. Indeed is manual import/tracking
+# only; no discovery or account connector is implemented.
 ALL_PLATFORMS = frozenset({
     "upwork", "fiverr", "freelancer", "peopleperhour", "guru",
     "linkedin", "indeed",

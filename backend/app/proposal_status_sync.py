@@ -4,7 +4,7 @@ gap: outcome/reply auto-sync was Freelancer-only).
 The API platforms (Freelancer) sync through `outcome_sync.py`; the browser
 platforms (upwork, fiverr, peopleperhour, guru) have no compliant status API,
 so a 60-minute beat enqueues a READ-ONLY `scrape_proposal_status` stealth
-task per tenant per platform. The worker loads the proposals/inbox page and
+task per tenant, platform and account. The worker loads the proposals/inbox page and
 posts per-proposal statuses back to `POST /api/gigs/proposal-status`, which
 applies them here:
 
@@ -17,6 +17,7 @@ Everything is idempotent: re-posting the same results is a no-op.
 import logging
 from datetime import datetime, timezone
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from .models import (Job, PlatformAccount, ProposalQueueItem, StealthTask,
@@ -50,54 +51,59 @@ def _enabled_platforms(db: Session, user_id: int) -> set[str]:
 
 
 def _open_status_task(db: Session, user_id: int,
-                      platform: str) -> StealthTask | None:
+                      platform: str, account_id: int | None = None) -> StealthTask | None:
     """A scrape task still in flight for this tenant+platform (avoids
     stacking dupes; other platforms are unaffected)."""
     return (db.query(StealthTask)
             .filter(StealthTask.user_id == user_id,
                     StealthTask.platform == platform,
                     StealthTask.task_type == SCRAPE_PROPOSAL_STATUS,
+                    *([or_(StealthTask.payload["account_id"].as_integer() == account_id,
+                           StealthTask.payload["account_id"].as_integer().is_(None))] if account_id is not None else []),
                     StealthTask.status.in_(("pending", "claimed")))
             .first())
 
 
 def enqueue_platform_status_scrapes(db: Session,
                                     user_id: int) -> list[StealthTask]:
-    """Enqueue one read-only status-scrape task per browser platform that has
-    an enabled account AND open proposals; [] when there is nothing to check
-    (or a scrape is already in flight for that platform)."""
-    enabled = _enabled_platforms(db, user_id)
+    """Group watched proposals by reviewed browser account, refusing ambiguity."""
     tasks = []
     for platform in BROWSER_SYNC_PLATFORMS:
-        if platform not in enabled:
+        accounts = db.query(PlatformAccount).filter(
+            PlatformAccount.user_id == user_id, PlatformAccount.platform == platform,
+            PlatformAccount.enabled.is_(True), PlatformAccount.mode.in_(['stealth','hybrid'])
+        ).order_by(PlatformAccount.id).all()
+        if not accounts:
             continue
-        items = (db.query(ProposalQueueItem)
-                 .filter(ProposalQueueItem.user_id == user_id,
-                         ProposalQueueItem.platform == platform,
-                         ProposalQueueItem.status.in_(_WATCHED_STATUSES))
-                 .all())
-        if not items or _open_status_task(db, user_id, platform) is not None:
-            continue
-        jobs = {j.id: j for j in db.query(Job)
-                .filter(Job.id.in_({i.job_id for i in items})).all()}
-        checks = []
-        for i in items:
-            job = jobs.get(i.job_id)
-            checks.append({"proposal_queue_item_id": i.id,
-                           "job_external_id": job.external_id if job else "",
-                           "job_url": job.url if job else ""})
-        task = enqueue_stealth_task(db, user_id, platform,
-                                    SCRAPE_PROPOSAL_STATUS,
-                                    {"items": checks})
-        # skipped_circuit_open rows are recorded for UI visibility but will
-        # never run — don't report them as enqueued work
-        if task.status == "pending":
-            tasks.append(task)
+        items = db.query(ProposalQueueItem).filter(
+            ProposalQueueItem.user_id == user_id, ProposalQueueItem.platform == platform,
+            ProposalQueueItem.status.in_(_WATCHED_STATUSES)).all()
+        jobs = {j.id: j for j in db.query(Job).filter(
+            Job.user_id == user_id, Job.id.in_({i.job_id for i in items})).all()} if items else {}
+        groups = {a.id: [] for a in accounts}
+        for item in items:
+            account_id = (item.approved_snapshot or {}).get('account_id') or item.platform_account_id
+            if account_id is None and len(accounts) == 1:
+                account_id = accounts[0].id
+            if account_id not in groups:
+                log.warning('status sync: proposal %d needs account reconciliation',item.id)
+                continue
+            job = jobs.get(item.job_id)
+            if job:
+                groups[account_id].append({'proposal_queue_item_id':item.id,
+                                          'job_external_id':job.external_id,'job_url':job.url})
+        for account_id, checks in groups.items():
+            if not checks or _open_status_task(db,user_id,platform,account_id) is not None:
+                continue
+            task = enqueue_stealth_task(db,user_id,platform,SCRAPE_PROPOSAL_STATUS,
+                                       {'account_id':account_id,'items':checks})
+            if task.status == 'pending':
+                tasks.append(task)
     return tasks
 
 
 async def apply_proposal_status_results(db: Session, task: StealthTask,
-                                        results: list[dict]) -> dict:
+                                        results: list[dict], notifications: list | None = None) -> dict:
     """Apply worker-reported statuses to the tenant's queue items.
 
     Tenancy is enforced per row: a result only lands when the item belongs to
@@ -117,19 +123,18 @@ async def apply_proposal_status_results(db: Session, task: StealthTask,
             skipped += 1
             continue
         outcome = _STATUS_OUTCOME_MAP.get(status)
-        if outcome and item.outcome == "pending":
-            record_outcome(db, item, outcome)
+        if outcome and item.outcome == "pending" and item.status == "submitted":
+            record_outcome(db, item, outcome, commit=False)
             outcomes += 1
             log.info("proposal-status: proposal %d → %s (task %d)",
                      item.id, outcome, task.id)
         if res.get("has_unread_reply") and item.client_replied_at is None:
             item.client_replied_at = datetime.now(timezone.utc)
-            db.commit()
+            db.flush()
             replies += 1
-            await alerts.broadcast(item.user_id, {
-                "type": "client_replied",
-                "proposal_id": item.id,
-                "job_id": item.job_id,
-                "snippet": "",
-            })
+            if notifications is not None:
+                notifications.append((item.user_id, {
+                    "type": "client_replied", "proposal_id": item.id,
+                    "job_id": item.job_id, "snippet": "",
+                }))
     return {"outcomes": outcomes, "replies": replies, "skipped": skipped}

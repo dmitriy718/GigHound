@@ -133,7 +133,7 @@ def test_approve_with_template_id_reuses_template(client):
     item_id = _make_item(Session, uid)
 
     r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-               json={"reviewer": "op", "template_id": tpl_id})
+               json={"expected_revision": 1, "reviewer": "op", "template_id": tpl_id})
     assert r.status_code == 200, r.text
     db = Session()
     try:
@@ -141,7 +141,7 @@ def test_approve_with_template_id_reuses_template(client):
         assert item.template_id == tpl_id
         # reused, not minted; uses counted at selection only
         assert db.query(Template).filter(Template.user_id == uid).count() == 1
-        assert db.get(Template, tpl_id).uses == 2
+        assert db.get(Template, tpl_id).uses == 3
     finally:
         db.close()
 
@@ -163,10 +163,10 @@ def test_approve_with_foreign_or_missing_template_id_is_404(client):
 
     item_id = _make_item(Session, uid)
     r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-               json={"reviewer": "op", "template_id": foreign_tpl_id})
+               json={"expected_revision": 1, "reviewer": "op", "template_id": foreign_tpl_id})
     assert r.status_code == 404
     r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-               json={"reviewer": "op", "template_id": 999999})
+               json={"expected_revision": 1, "reviewer": "op", "template_id": 999999})
     assert r.status_code == 404
     # the item stays pending_review after failed approvals
     db = Session()
@@ -245,7 +245,7 @@ def test_fiverr_offer_counter_is_per_user(client):
 def test_offers_counter_key_includes_user_id():
     from app.fiverr_monitor import _offers_key
 
-    assert _offers_key(7).startswith("fiverr:offers:7:")
+    assert _offers_key(7).startswith("fiverr:drafts:7:")
     assert _offers_key(7) != _offers_key(8)
 
 

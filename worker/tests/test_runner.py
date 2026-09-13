@@ -10,6 +10,9 @@ from worker.handlers.base import HandlerContext
 
 
 class FakeClient:
+    def authorize_task(self, task_id):
+        return {"authorized": True}
+
     def __init__(self, conflict_on=(), complete_error=None):
         self.calls = []
         self.conflict_on = set(conflict_on)
@@ -311,3 +314,28 @@ def test_poll_once_skips_scrapes_outside_window_runs_submits(monkeypatch):
     assert runner.poll_once(ctx) == 1
     assert processed == [(2, "submit_upwork_proposal")]
     assert ("claim", 1) not in client.calls  # scrape never claimed, stays queued
+
+
+@pytest.mark.parametrize('write_started', [False, True])
+def test_failed_submission_distinguishes_pre_and_post_write(monkeypatch, write_started):
+    client = FakeClient()
+    client.task_types = {9: 'submit_upwork_proposal'}
+    def fail(task, ctx):
+        ctx.external_write_started = write_started
+        raise RuntimeError('lost browser response')
+    monkeypatch.setattr(runner, 'get_handler', lambda kind: fail)
+    runner.process_task(StealthTaskOut(id=9, user_id=1, platform='upwork', task_type='submit_upwork_proposal'), make_ctx(client))
+    result = client.completed[0]['result']
+    assert result['submitted'] is (None if write_started else False)
+    assert result['state'] == ('submitted_unverified' if write_started else 'confirmed_not_submitted')
+
+
+def test_authorization_denial_prevents_handler_execution(monkeypatch):
+    client = FakeClient()
+    def denied(task_id): raise ClaimConflictError('account disabled')
+    client.authorize_task = denied
+    calls = []
+    monkeypatch.setattr(runner, 'get_handler', lambda kind: lambda task, ctx: calls.append(task.id))
+    runner.process_task(StealthTaskOut(id=1, user_id=1, platform='fiverr', task_type='scrape_gig_metrics'), make_ctx(client))
+    assert calls == []
+    assert client.completed[0]['success'] is False

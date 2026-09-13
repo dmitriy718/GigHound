@@ -52,7 +52,8 @@ class _FakePage:
         pass
 
     def query_selector(self, selector):
-        return self.markers.get(selector)
+        value = self.markers.get(selector)
+        return SimpleNamespace(is_visible=lambda: True) if type(value) is object else value
 
     def wait_for_selector(self, selector, timeout=0):
         el = self.markers.get(selector)
@@ -75,6 +76,9 @@ class _FakeBrowser:
 
 
 class _FakeClient:
+    def authorize_task(self, task_id):
+        return {"authorized": True}
+
     def __init__(self):
         self.metrics = []
 
@@ -95,13 +99,29 @@ def _submit(monkeypatch, markers):
     cfg = platform_config("upwork")
     form = cfg["proposal_form"]
     # the form fields must "exist" pre-submit so the flow reaches the click
-    page_markers = {form["cover_letter"]: object(), **markers}
+    class Control:
+        def __init__(self, value=''):
+            self.value = value
+        def is_visible(self): return True
+        def is_enabled(self): return True
+        def select_option(self, *, value): self.value = value
+        def input_value(self): return self.value
+        def fill(self, value): self.value = value
+    page_markers = {selector: Control() for selector in form.values()}
+    page_markers[form["cover_letter"]].value = "hello"
     page = _FakePage(markers=page_markers)
+    original_click = page.click
+    def click(selector):
+        original_click(selector)
+        if selector == form["submit"]:
+            page.markers.update(markers)
+    page.click = click
     monkeypatch.setattr("worker.handlers.upwork_proposal.fetch_page",
                         lambda ctx, platform, user_id, url: page)
     ctx = _ctx(_FakeBrowser(page))
     task = _FakeTask({"job_url": "https://www.upwork.com/jobs/~abc",
-                      "job_external_id": "~abc", "proposal_text": "hello"})
+                      "job_external_id": "~abc", "proposal_text": "hello",
+                      "agency_id": "agency-1", "on_behalf_of": "member-1", "bid_amount": 123})
     return upwork_proposal.handle_submit_upwork_proposal(task, ctx), page, ctx
 
 
@@ -167,12 +187,15 @@ def test_fetch_page_returns_on_live_session():
     marker = platform_config("upwork")["logged_in_marker"]
     page = _FakePage(markers={marker: object()})
     ctx = _ctx(_FakeBrowser(page))
-    assert fetch_page(ctx, "upwork", 7, "https://x/jobs/~abc") is page
+    assert fetch_page(ctx, "upwork", 7, "https://www.upwork.com/jobs/~abc") is page
 
 
 # ---------------- runner reporting branches ----------------
 
 class _RunnerClient:
+    def authorize_task(self, task_id):
+        return {"authorized": True}
+
     def __init__(self):
         self.completed = []
 
@@ -258,7 +281,7 @@ def test_scrape_posts_extracted_metrics(monkeypatch):
     task = _FakeTask({"gigs": [{"id": 11, "url": "https://x/gig"}]},
                      platform="fiverr")
     result = handle_scrape_gig_metrics(task, _ctx(_FakeBrowser(), client))
-    assert client.metrics == [(11, 1240, 37, 0, 0.0)]
+    assert client.metrics == [(11, 1240, 37, None, None)]
     assert result["scraped"][0]["gig_id"] == 11
 
 
@@ -315,3 +338,66 @@ def test_scrape_warmup_scrolls_before_extraction():
     assert 1 <= len(wheels) <= 3
     first_extract = page.order.index(("query", fields["impressions"]))
     assert all(w < first_extract for w in wheels)
+
+
+def test_manual_assist_click_without_confirmation_is_uncertain(monkeypatch):
+    from worker.handlers.manual_assist import handle_submit_fiverr_offer
+    cfg = platform_config('fiverr')
+    page = _FakePage(markers={cfg['offer_form']['message']: object()})
+    monkeypatch.setattr('worker.handlers.manual_assist.fetch_page', lambda *args: page)
+    monkeypatch.setattr('worker.handlers.manual_assist.type_with_plan', lambda *args: None)
+    ctx = _ctx(_FakeBrowser(page))
+    ctx.config.allow_submit = True
+    task = SimpleNamespace(id=91, user_id=1, platform='fiverr', task_type='submit_fiverr_offer', payload={'url': 'https://www.fiverr.com/inbox', 'proposal_text': 'Reviewed'})
+    result = handle_submit_fiverr_offer(task, ctx)
+    assert ctx.external_write_started is True
+    assert result['submitted'] is None
+    assert result['state'] == 'submitted_unverified'
+    assert 'before another submission' in result['note']
+
+
+def test_submit_conflicting_markers_requires_reconciliation(monkeypatch):
+    cfg = platform_config("upwork")
+    result, _, _ = _submit(monkeypatch, {
+        cfg["submit_success"][0]: object(), cfg["submit_failure"][0]: object(),
+    })
+    assert result["submitted"] is None
+    assert result["state"] == "submitted_unverified"
+
+
+def test_hidden_success_marker_cannot_confirm_submission(monkeypatch):
+    cfg = platform_config("upwork")
+    result, _, _ = _submit(monkeypatch, {
+        cfg["submit_success"][0]: SimpleNamespace(is_visible=lambda: False),
+    })
+    assert result["submitted"] is None
+
+
+@pytest.mark.parametrize("missing", ["agency_selector", "member_selector", "bid_amount", "cover_letter", "submit"])
+def test_required_upwork_control_missing_stops_before_write(monkeypatch, missing):
+    form = platform_config("upwork")["proposal_form"]
+    real = upwork_proposal._required_control
+    pages = []
+    def missing_control(page, selector):
+        pages.append(page)
+        if selector == form[missing]:
+            page.markers.pop(selector, None)
+        return real(page, selector)
+    monkeypatch.setattr(upwork_proposal, "_required_control", missing_control)
+    with pytest.raises(SelectorSuspectError):
+        _submit(monkeypatch, {})
+    assert pages
+    assert form["submit"] not in pages[-1].clicked
+
+
+def test_upwork_bid_changed_by_page_stops_before_write(monkeypatch):
+    verify = upwork_proposal._verify_form
+    pages = []
+    def changed(page, form, payload):
+        pages.append(page)
+        page.markers[form["bid_amount"]].value = "999"
+        return verify(page, form, payload)
+    monkeypatch.setattr(upwork_proposal, "_verify_form", changed)
+    with pytest.raises(SelectorSuspectError):
+        _submit(monkeypatch, {})
+    assert platform_config("upwork")["proposal_form"]["submit"] not in pages[-1].clicked

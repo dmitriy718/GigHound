@@ -29,6 +29,12 @@ def _fill(page, selector: str | None, value: str) -> bool:
 def handle_create_gig_draft(task, ctx: HandlerContext) -> dict:
     payload = task.payload
     template = payload.get("template", {})
+    if isinstance(template.get("description"), dict) or template.get("pricing"):
+        # The current selectors cannot faithfully fill every package/delivery/revision.
+        # Preserve the complete artifact for manual setup instead of saving partial data.
+        return {"draft": False, "published": False, "state": "manual_action_required",
+                "template_id": payload.get("template_id"), "template": template,
+                "note": "Export this complete template and create the gig in the platform editor; automated multi-package editing is unavailable"}
     cfg = platform_config(task.platform)
     form = cfg.get("gig_form")
     new_url = cfg.get("gig_new_url")
@@ -81,13 +87,14 @@ def handle_create_gig_draft(task, ctx: HandlerContext) -> dict:
     # is title/category/tags/price/description — below that the draft is too
     # hollow to be worth saving on the tenant's account).
     expected = len(filled) + len(missed)
-    required = min(expected, max(3, -(-expected // 2)))  # ceil(expected/2)
+    required = max(3, expected)  # every expected field must be present
     if len(filled) < required:
         raise RuntimeError(
             f"gig form on {task.platform} looks drifted: filled "
             f"{len(filled)}/{expected} fields (need {required}) — "
             f"missed: {missed}; NOT saving a partial draft")
 
+    ctx.client.authorize_task(task.id)
     page.click(form["save_draft"])  # DRAFT only — never the publish button
     page.wait_for_load_state("domcontentloaded")
     human_delay(1.0, 2.0)

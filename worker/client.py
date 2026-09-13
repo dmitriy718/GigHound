@@ -19,6 +19,7 @@ class StealthTaskOut(BaseModel):
     task_type: str
     payload: dict = {}
     status: str = "pending"
+    claim_token: str | None = None
 
 
 class ClaimConflictError(Exception):
@@ -34,10 +35,12 @@ class WorkerClient:
                  max_retries: int = 3, timeout: float = 30.0,
                  client: httpx.Client | None = None):
         self.worker_id = worker_id
+        self._claims: dict[int, str] = {}
+        self._active_tasks: dict[tuple[str, int], int] = {}
         self.max_retries = max_retries
         self._client = client or httpx.Client(
             base_url=api_url.rstrip("/"),
-            headers={"Authorization": f"Bearer {worker_token}"},
+            headers={"Authorization": f"Bearer {worker_token}", "X-Worker-ID":worker_id},
             timeout=timeout,
         )
 
@@ -76,6 +79,10 @@ class WorkerClient:
 
     # ---------------- protocol ----------------
 
+    def heartbeat(self, platforms):
+        return self._request("POST", "/api/gigs/worker-heartbeat",
+                             json={"worker_id": self.worker_id, "platforms": list(platforms)}).json()
+
     def poll_tasks(self, platform: str, status: str = "pending") -> list[StealthTaskOut]:
         resp = self._request("GET", "/api/gigs/stealth-tasks",
                              params={"platform": platform, "status": status})
@@ -91,36 +98,64 @@ class WorkerClient:
         per-account exit IP when set; timezone/locale (when set) align the
         fingerprint geo with the account/proxy geo.
         """
+        task_id = self._active_tasks.get((platform, user_id))
+        claim = self._claim_body(task_id)
         resp = self._request("GET", "/api/gigs/stealth-session",
-                             params={"platform": platform, "user_id": user_id})
+                             params={"platform": platform, "user_id": user_id},
+                             headers={"X-Worker-Claim": claim["claim_token"],
+                                      "X-Worker-ID": self.worker_id})
         return resp.json()
 
     def claim_task(self, task_id: int) -> StealthTaskOut:
         resp = self._request("POST", f"/api/gigs/stealth-tasks/{task_id}/claim",
                              json={"worker_id": self.worker_id})
-        return StealthTaskOut.model_validate(resp.json())
+        task = StealthTaskOut.model_validate(resp.json())
+        if not task.claim_token:
+            raise BackendError("backend did not issue a fenced worker claim")
+        # The runner executes one task at a time; never retain past claim secrets.
+        self._claims.clear()
+        self._active_tasks.clear()
+        self._claims[task_id] = task.claim_token
+        self._active_tasks[(task.platform, task.user_id)] = task_id
+        return task
+
+    def _claim_body(self, task_id: int) -> dict:
+        token = self._claims.get(task_id)
+        if not token:
+            raise ClaimConflictError("no local claim token for this task")
+        return {"worker_id": self.worker_id, "claim_token": token}
+
+    def authorize_task(self, task_id: int) -> dict:
+        return self._request("POST", f"/api/gigs/stealth-tasks/{task_id}/authorize",
+                             json=self._claim_body(task_id)).json()
 
     def complete_task(self, task_id: int, success: bool, result: dict) -> dict:
         resp = self._request("POST", f"/api/gigs/stealth-tasks/{task_id}/complete",
-                             json={"worker_id": self.worker_id,
+                             json={**self._claim_body(task_id),
                                    "success": success, "result": result})
         return resp.json()
 
     # ---------------- result posting ----------------
+
+    def _result_claim(self):
+        if len(self._claims) != 1:
+            raise ClaimConflictError("result requires exactly one active task claim")
+        task_id = next(iter(self._claims))
+        return {"task_id": task_id, **self._claim_body(task_id)}
 
     def post_buyer_requests(self, user_id: int, requests: list[dict]) -> dict:
         # session_verified: fetch_page only returns on a live session, so an
         # empty list here means "no briefs", never "logged out" (the backend
         # ignores the extra field — permissive schema)
         resp = self._request("POST", "/api/gigs/buyer-requests/process",
-                             json={"user_id": user_id, "requests": requests,
+                             json={**self._result_claim(), "user_id": user_id, "requests": requests,
                                    "session_verified": True})
         return resp.json()
 
     def post_metrics(self, gig_id: int, impressions: int, clicks: int,
                      orders: int, revenue: float, week: str | None = None) -> dict:
         resp = self._request("POST", "/api/gigs/metrics", json={
-            "gig_id": gig_id, "impressions": impressions, "clicks": clicks,
+            **self._result_claim(), "gig_id": gig_id, "impressions": impressions, "clicks": clicks,
             "orders": orders, "revenue": revenue, "week": week,
         })
         return resp.json()
@@ -128,7 +163,7 @@ class WorkerClient:
     def post_competitors(self, user_id: int, platform: str, category: str,
                          gigs: list[dict], my_price: float | None = None) -> dict:
         resp = self._request("POST", "/api/gigs/competitors", json={
-            "user_id": user_id, "platform": platform, "category": category,
+            **self._result_claim(), "user_id": user_id, "platform": platform, "category": category,
             "gigs": gigs, "my_price": my_price,
         })
         return resp.json()
@@ -137,5 +172,5 @@ class WorkerClient:
         """Post scrape_proposal_status results; the backend applies outcome /
         reply mappings and completes the task."""
         resp = self._request("POST", "/api/gigs/proposal-status",
-                             json={"task_id": task_id, "results": results})
+                             json={**self._claim_body(task_id), "task_id": task_id, "results": results})
         return resp.json()

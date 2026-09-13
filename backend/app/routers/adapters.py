@@ -1,3 +1,4 @@
+from ..schemas import AgencyMemberIn
 """Adapter control endpoints: discovery → ingest bridge, and gated write actions.
 
 Write actions (bid placement, Upwork proposal queueing) are bound to the
@@ -8,26 +9,26 @@ import logging
 import os
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ..adapters.base import AdapterError, QuotaDepletedError
+from ..adapters.base import AdapterError
+from ..adapters.accounts import selected_principal
 from ..adapters.freelancer import FreelancerAdapter
 from ..adapters.linkedin import LinkedInJobsAdapter
 from ..adapters.upwork_agency import UpworkAgencyAdapter
-from ..auth import (get_current_user, get_owned, platform_account_settings,
-                    platform_enabled)
+from ..auth import get_current_user, get_owned, platform_enabled
 from ..database import get_db
 from ..schemas import IngestJobsIn, JobOut
-from ..models import AuditLog, Job, ProposalQueueItem, User
+from ..models import ProposalQueueItem, User
 from ..ingest import run_ingest  # reuse scoring/alert pipeline
-from ..stealth import SUBMIT_UPWORK_PROPOSAL, enqueue_stealth_task
 
 router = APIRouter(prefix="/api/adapters", tags=["adapters"])
 log = logging.getLogger(__name__)
 
 
 class SearchRequest(BaseModel):
+    account_id: int | None = Field(default=None, ge=1)
     query: str = ""
     limit: int = 25
     location: str = ""
@@ -63,7 +64,7 @@ def _require_platform_enabled(db: Session, user: User, platform: str) -> None:
 @router.post("/freelancer/search", response_model=dict)
 async def freelancer_search(body: SearchRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_platform_enabled(db, user, "freelancer")
-    adapter = FreelancerAdapter(db, user.id, sandbox=body.sandbox)
+    adapter = FreelancerAdapter(db, user.id, sandbox=body.sandbox, principal=selected_principal(db, user.id, "freelancer", body.account_id, "default"))
     try:
         postings = await adapter.search_jobs(body.query, limit=body.limit)
         ingested = None
@@ -86,57 +87,42 @@ async def freelancer_search(body: SearchRequest, db: Session = Depends(get_db), 
 
 @router.post("/freelancer/bid", response_model=dict)
 async def freelancer_bid(body: QueueItemAction, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Place a bid for an APPROVED review-queue item.
-
-    The proposal text and bid amount come from the queue item, never from
-    the caller — this endpoint cannot bypass the human review boundary.
-    """
+    """Compatibility route using the same atomic dispatch as the review queue."""
     item = _load_approved_item(db, user, body.proposal_queue_item_id)
-    _require_platform_enabled(db, user, "freelancer")
-    job = db.get(Job, item.job_id)
-    if not job:
-        raise HTTPException(404, "job not found")
-    bidder_id = int(item.submission_result.get("bidder_id") or 0)
-    if not bidder_id:
-        bidder_id = int(platform_account_settings(db, user.id, "freelancer")
-                        .get("bidder_id") or 0)
-    if not bidder_id:
-        raise HTTPException(400, "no Freelancer bidder id: set 'bidder_id' in the "
-                            "freelancer account's settings on the Accounts page")
-    adapter = FreelancerAdapter(db, user.id)
+    if item.platform != "freelancer":
+        raise HTTPException(409, "proposal belongs to another platform")
+    from .proposals import submit_proposal
+    result = await submit_proposal(item.id, db, user)
+    adapter = FreelancerAdapter(db, user.id, principal=selected_principal(db, user.id, "freelancer", (item.approved_snapshot or {}).get("account_id"), "default"))
     try:
-        result = await adapter.place_bid(
-            project_id=int(job.external_id), bidder_id=bidder_id,
-            amount=item.bid_amount or 0, period=item.bid_period_days or 7,
-            proposal=item.proposal_text,
-        )
-    except QuotaDepletedError as exc:
-        raise HTTPException(429, str(exc))
-    except AdapterError as exc:
-        # AdapterError messages can embed upstream API bodies/URLs — log the
-        # detail server-side, return generic text to the client
-        log.warning("adapter call failed for user %d: %s", user.id, exc)
-        raise HTTPException(502, "upstream request failed")
+        return {"bid": result.submission_result.get("response", {}),
+                "bids_remaining": adapter.bids_remaining()}
     finally:
         await adapter.close()
-    db.add(AuditLog(user_id=user.id, action_type="bid_placed", platform="freelancer", detail={
-        "proposal_queue_item_id": item.id, "project_id": job.external_id,
-        "approved_by": item.reviewed_by, "response_id": result.get("id"),
-    }))
-    db.commit()
-    return {"bid": result, "bids_remaining": adapter.bids_remaining()}
 
 
 @router.get("/freelancer/quota", response_model=dict)
-def freelancer_quota(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    adapter = FreelancerAdapter(db, user.id)
-    return {"monthly_quota": adapter.monthly_bid_quota, "bids_remaining": adapter.bids_remaining()}
+async def freelancer_quota(db: Session = Depends(get_db), user: User = Depends(get_current_user), account_id: int | None = None):
+    adapter = FreelancerAdapter(db, user.id, principal=selected_principal(db, user.id, "freelancer", account_id, "default"))
+    try:
+        return {"monthly_quota": adapter.monthly_bid_quota, "bids_remaining": adapter.bids_remaining()}
+    finally:
+        await adapter.close()
+
+
+@router.get("/freelancer/sync-status", response_model=dict)
+def freelancer_sync_status(db: Session = Depends(get_db), user: User = Depends(get_current_user), account_id: int | None = None):
+    from ..outcome_sync import reply_cursor_key
+    from ..adapters.vault import StateStore
+    principal = selected_principal(db,user.id,'freelancer',account_id,'default')
+    return {'account_id':account_id,'reply_polling':StateStore(db,user.id).get('freelancer',reply_cursor_key(principal),{}),
+            'requires_known_client_id':True}
 
 
 @router.post("/upwork/search", response_model=dict)
 async def upwork_search(body: SearchRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_platform_enabled(db, user, "upwork")
-    adapter = UpworkAgencyAdapter(db, user.id)
+    adapter = UpworkAgencyAdapter(db, user.id, principal=selected_principal(db, user.id, "upwork", body.account_id, "agency_manager"))
     try:
         postings = await adapter.search_jobs(body.query, limit=body.limit)
         ingested = None
@@ -158,83 +144,75 @@ async def upwork_search(body: SearchRequest, db: Session = Depends(get_db), user
 
 
 @router.post("/upwork/proposals", response_model=dict)
-def upwork_submit_proposal(body: QueueItemAction, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Queue an Upwork agency-manager submission for an APPROVED review-queue item.
-
-    Sends exactly the queued proposal text (Upwork 2026 AI policy: the
-    approval comes from the review queue, not from a caller-supplied string).
-    """
+async def upwork_submit_proposal(body: QueueItemAction, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Compatibility route using the same atomic dispatch as the review queue."""
     item = _load_approved_item(db, user, body.proposal_queue_item_id)
-    _require_platform_enabled(db, user, "upwork")
-    job = db.get(Job, item.job_id)
-    if not job:
-        raise HTTPException(404, "job not found")
-    on_behalf_of = (item.submission_result.get("on_behalf_of")
-                    or platform_account_settings(db, user.id, "upwork")
-                    .get("on_behalf_of", ""))
-    if not on_behalf_of:
-        raise HTTPException(400, "no Upwork agency member: set 'on_behalf_of' in the "
-                            "upwork account's settings on the Accounts page")
-    connects_required = item.submission_result.get("connects_required", 0)
-    adapter = UpworkAgencyAdapter(db, user.id)
-    try:
-        record = adapter.submit_proposal(
-            job_external_id=job.external_id,
-            proposal_text=item.proposal_text,
-            on_behalf_of=on_behalf_of,
-            connects_required=connects_required,
-            approved_by=item.reviewed_by,
-        )
-    except AdapterError as exc:
-        raise HTTPException(400, str(exc))
-    # handoff to the stealth-browser worker (AD-4)
-    stealth_task = enqueue_stealth_task(db, user.id, "upwork", SUBMIT_UPWORK_PROPOSAL, {
-        "job_external_id": job.external_id,
-        "job_url": job.url,
-        "proposal_text": item.proposal_text,
-        "humanized_text": item.humanized_text or item.proposal_text,
-        "typing_plan": item.typing_plan or [],
-        "on_behalf_of": on_behalf_of,
-        "connects_required": connects_required,
-        "bid_amount": item.bid_amount,
-        "proposal_queue_item_id": item.id,
-    })
-    if stealth_task is None or stealth_task.status == "skipped_circuit_open":
-        # circuit open: no worker will ever run this task — leave the item
-        # approved so it stays submittable once the circuit closes
-        reason = ((stealth_task.result or {}).get("reason", "")
-                  if stealth_task is not None else "")
-        if not reason:
-            from .. import circuit_breaker
-            reason = circuit_breaker.check("upwork", user.id)[1] or "upwork circuit is open"
-        raise HTTPException(409, reason)
-    # same status contract as routers/proposals.py submit: task completion
-    # (gigs.py _apply_submission_outcome) only flips queued_for_browser items
-    item.status = "queued_for_browser"
-    db.add(AuditLog(user_id=user.id, action_type="proposal_queued", platform="upwork", detail={
-        "proposal_queue_item_id": item.id, "job_external_id": job.external_id,
-        "approved_by": item.reviewed_by, "record_status": record.get("status"),
-    }))
+    if item.platform != "upwork":
+        raise HTTPException(409, "proposal belongs to another platform")
+    from .proposals import submit_proposal
+    result = await submit_proposal(item.id, db, user)
+    return {"queued": result.submission_result.get("record", {})}
+
+
+@router.get("/upwork/agency/legacy-roster", response_model=dict)
+def legacy_agency_roster(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    from ..models import AdapterState
+    row = db.query(AdapterState).filter_by(user_id=user.id,platform='upwork',key='agency_roster').first()
+    return {'members':(row.value or {}).get('members',[]) if row else []}
+
+
+@router.post("/upwork/agency/legacy-roster/assign", response_model=dict)
+def assign_legacy_agency_roster(account_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    import copy, hashlib
+    from ..models import AdapterState, AuditLog
+    db.refresh(user,with_for_update=True)
+    principal = selected_principal(db,user.id,'upwork',account_id,'agency_manager')
+    legacy = db.query(AdapterState).filter_by(user_id=user.id,platform='upwork',key='agency_roster').populate_existing().first()
+    if legacy is None:
+        raise HTTPException(409,'no unassigned legacy roster remains')
+    value = legacy.value
+    members = value.get('members') if isinstance(value,dict) else None
+    if not isinstance(members,list) or any(not isinstance(m,dict) or not isinstance(m.get('username'),str) for m in members):
+        raise HTTPException(409,'legacy roster needs manual data repair before assignment')
+    key='agency_roster:'+hashlib.sha256(principal.encode()).hexdigest()
+    target = db.query(AdapterState).filter_by(user_id=user.id,platform='upwork',key=key).populate_existing().first()
+    if target is not None and (target.value or {}).get('members'):
+        raise HTTPException(409,'selected account already has a roster; reconcile it before assigning legacy members')
+    if target is None:
+        target=AdapterState(user_id=user.id,platform='upwork',key=key)
+        db.add(target)
+    target.value=copy.deepcopy(value)
+    db.delete(legacy)
+    db.add(AuditLog(user_id=user.id,platform='upwork',action_type='legacy_roster_assigned',detail={'account_id':account_id,'members':len(members)}))
     db.commit()
-    return {"queued": record}
+    return {'members':members}
 
 
 @router.get("/upwork/agency/members", response_model=dict)
-def upwork_agency_members(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return {"members": UpworkAgencyAdapter(db, user.id).list_agency_members()}
+async def upwork_agency_members(db: Session = Depends(get_db), user: User = Depends(get_current_user), account_id: int | None = None):
+    adapter = UpworkAgencyAdapter(db, user.id, principal=selected_principal(db, user.id, "upwork", account_id, "agency_manager"))
+    try:
+        return {"members": adapter.list_agency_members()}
+    finally:
+        await adapter.close()
 
 
 @router.post("/upwork/agency/members", response_model=dict)
-def upwork_agency_add_member(body: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    username = body.get("username")
-    if not username:
-        raise HTTPException(400, "username required")
-    return {"members": UpworkAgencyAdapter(db, user.id).add_agency_member(username)}
+async def upwork_agency_add_member(body: AgencyMemberIn, db: Session = Depends(get_db), user: User = Depends(get_current_user), account_id: int | None = None):
+    adapter = UpworkAgencyAdapter(db, user.id, principal=selected_principal(db, user.id, "upwork", account_id, "agency_manager"))
+    try:
+        return {"members": adapter.add_agency_member(body.username)}
+    finally:
+        await adapter.close()
 
 
 @router.delete("/upwork/agency/members/{username}", response_model=dict)
-def upwork_agency_remove_member(username: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return {"members": UpworkAgencyAdapter(db, user.id).remove_agency_member(username)}
+async def upwork_agency_remove_member(username: str, db: Session = Depends(get_db), user: User = Depends(get_current_user), account_id: int | None = None):
+    adapter = UpworkAgencyAdapter(db, user.id, principal=selected_principal(db, user.id, "upwork", account_id, "agency_manager"))
+    try:
+        return {"members": adapter.remove_agency_member(username)}
+    finally:
+        await adapter.close()
 
 
 @router.post("/linkedin/search", response_model=dict)

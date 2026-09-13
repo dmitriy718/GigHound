@@ -13,6 +13,7 @@ external id contained in each card's links.
 """
 import logging
 import re
+from urllib.parse import urlsplit
 
 from ..platforms import platform_config
 from .base import HandlerContext, extract_fields, fetch_page
@@ -21,9 +22,9 @@ log = logging.getLogger(__name__)
 
 # canonical status buckets, first match wins (checked in order)
 _STATUS_KEYWORDS = (
-    ("hired", ("hired", "awarded", "won", "offer accepted", "contract")),
     ("declined", ("declined", "rejected", "archived", "withdrawn",
                   "not selected", "lost")),
+    ("hired", ("hired", "awarded", "won", "offer accepted", "contract started")),
     ("interviewing", ("interview", "shortlist", "messag", "active candidacy")),
     ("viewed", ("viewed", "seen")),
 )
@@ -58,11 +59,11 @@ def _card_job_ref(card) -> str:
 def _matches(item: dict, card, card_text: str, card_ref: str) -> bool:
     external_id = (item.get("job_external_id") or "").strip()
     job_url = (item.get("job_url") or "").strip()
-    if external_id and (external_id in card_ref or external_id in card_text):
+    if external_id and (re.search(r"(?<![A-Za-z0-9])" + re.escape(external_id) + r"(?![A-Za-z0-9])", card_ref) or re.search(r"(?<![A-Za-z0-9])" + re.escape(external_id) + r"(?![A-Za-z0-9])", card_text)):
         return True
     if job_url and card_ref:
         tail = job_url.rstrip("/").split("/")[-1]
-        if tail and tail in card_ref:
+        if tail and any(tail == urlsplit(ref).path.rstrip("/").split("/")[-1] for ref in card_ref.split()):
             return True
     return False
 

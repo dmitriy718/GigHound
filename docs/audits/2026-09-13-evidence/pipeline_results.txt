@@ -1,0 +1,14 @@
+Redis unavailable (Error 111 connecting to 127.0.0.1:1. Connection refused.); cache disabled (reconnect retried on each operation)
+Redis invalidate failed (Error 111 connecting to 127.0.0.1:1. Connection refused.); prefix 'preview:1:' left stale
+E01 CONFIRMED: empty Freelancer result marks proposal submitted without a receipt
+E02 CONFIRMED: interrupted API send leaves durable submitting row with reconciliation rejected
+E03 CONFIRMED: queued_for_browser is counted as a completed submission in funnel
+E04 CONFIRMED: 10,000 JPY classified in nominal 1000+ USD bid band without currency/unit normalization
+E05 CONFIRMED: enrolling browser state after API token removes the API token
+E06 CONFIRMED: expired jobs are eligible for generation until archival
+E07 CONFIRMED: rediscovery with realtime alerts unarchives an archived job
+E08 CONFIRMED: concurrent follow-up requests create two active drafts for one parent
+E09 CONFIRMED: readiness is 200 with almost all application schema absent
+E10 CONFIRMED: final browser authorization allows archived jobs past their deadline
+E11 CONFIRMED: session-expired result flags oldest account instead of the task-bound account
+E12 CONFIRMED: return-to-review and reapproval inflate template uses for the same proposal

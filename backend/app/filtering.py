@@ -54,6 +54,9 @@ def job_matches_filter(job, flt) -> tuple[bool, list[str]]:
 
     # Time filters
     now = datetime.now(timezone.utc)
+    deadline = _aware(job.apply_deadline)
+    if deadline and deadline <= now:
+        reasons.append("application deadline has passed")
     if flt.posted_within_hours is not None:
         posted = _aware(job.posted_at)
         if not posted or (now - posted).total_seconds() / 3600 > flt.posted_within_hours:

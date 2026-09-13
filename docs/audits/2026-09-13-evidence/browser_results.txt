@@ -1,0 +1,4 @@
+upwork proposal for job None NOT confirmed: no success/failure marker matched after the submit click
+W01 CONFIRMED: Upwork clicks final submit when agency/member/bid fields are absent and allow_submit=False
+W02 CONFIRMED: Fiverr final submit is clicked without filling the approved bid amount
+W03 CONFIRMED: API ISO date with Z renders blank in datetime-local edit input

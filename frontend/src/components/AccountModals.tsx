@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { ApiError, changePassword, deleteMyAccount } from '../api/client';
+import { ApiError, changePassword, deleteMyAccount, forceUnauthorized } from '../api/client';
 import { ErrorBanner, Modal } from './common';
 
 function errorMessage(e: unknown): string {
@@ -50,11 +50,10 @@ export function ChangePasswordModal({ onClose }: { onClose: () => void }) {
       {done ? (
         <div>
           <p className="muted">
-            Password updated. Your current session stays signed in; use the new password next time
-            you log in.
+            Password updated. Sign in again with your new password.
           </p>
-          <button className="btn" onClick={onClose}>
-            Done
+          <button className="btn" onClick={() => { onClose(); forceUnauthorized(); }}>
+            Sign in
           </button>
         </div>
       ) : (

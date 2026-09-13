@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import {
   getAccounts,
   getCredentialStatus,
-  getProposals,
+  request,
   getSearchProfiles,
   runSearchProfileNow,
 } from '../api/client';
@@ -31,36 +31,43 @@ export default function OnboardingChecklist({ onNavigate }: Props) {
   const [discoveryRan, setDiscoveryRan] = useState(false);
   const [runBusy, setRunBusy] = useState(false);
   const [dismissed, setDismissed] = useState(false);
+  const [userId,setUserId] = useState<number|null>(null);
+  const [updatedAt,setUpdatedAt] = useState<string|null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const refresh = async () => {
       try {
-        const [accounts, profiles, pendingPage, submittedPage] = await Promise.all([
+        const [accounts, profiles, attention] = await Promise.all([
           getAccounts(),
           getSearchProfiles(),
-          getProposals({ status: 'pending_review', limit: 1 }),
-          getProposals({ status: 'submitted', limit: 200 }),
+          request<{user_id:number;pending_drafts:number;open_proposals_with_replies:number;last_successful_discovery:string|null;updated_at:string}>('/api/workbench/attention'),
         ]);
         const statuses = await Promise.all(
-          accounts.map((a) => getCredentialStatus(a.id).catch(() => null)),
+          accounts.filter(a=>a.enabled && a.mode!=='disabled').map((a) => getCredentialStatus(a.id).catch(() => null)),
         );
         if (cancelled) return;
+        setUserId(attention.user_id);
+        setUpdatedAt(attention.updated_at);
+        setDiscoveryRan(Boolean(attention.last_successful_discovery));
         setState({
           accountEnrolled: statuses.some((s) => s?.enrolled),
           autoQueueProfile: profiles.find((p) => p.auto_queue_proposals) ?? null,
           firstProfile: profiles[0] ?? null,
-          pendingDrafts: pendingPage.total,
-          unansweredReplies: submittedPage.items.filter(
-            (p) => p.client_replied_at != null && p.outcome === 'pending',
-          ).length,
+          pendingDrafts: attention.pending_drafts,
+          unansweredReplies: attention.open_proposals_with_replies,
         });
       } catch {
         // the strip is advisory — stay hidden rather than noisily erroring
         if (!cancelled) setState(null);
       }
-    })();
+    };
+    void refresh();
+    const timer = window.setInterval(refresh,30000);
+    window.addEventListener('focus',refresh);
     return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus',refresh);
       cancelled = true;
     };
   }, []);
@@ -79,11 +86,11 @@ export default function OnboardingChecklist({ onNavigate }: Props) {
   // Nothing to show once setup is complete and nothing needs attention.
   // Dismissal holds for 24h — after that the strip re-appears while still incomplete.
   if (allDone) return null;
-  const dismissedAt = Number(localStorage.getItem(DISMISS_KEY) ?? 0);
+  const dismissedAt = Number(localStorage.getItem(`${DISMISS_KEY}:${userId}`) ?? 0);
   if (dismissedAt && Date.now() - dismissedAt < REVEAL_AFTER_MS) return null;
 
   const dismiss = () => {
-    localStorage.setItem(DISMISS_KEY, String(Date.now()));
+    localStorage.setItem(`${DISMISS_KEY}:${userId}`, String(Date.now()));
     setDismissed(true);
   };
 
@@ -92,7 +99,7 @@ export default function OnboardingChecklist({ onNavigate }: Props) {
     setRunBusy(true);
     runSearchProfileNow(state.firstProfile.id)
       .then((res) => {
-        if (res.queued) setDiscoveryRan(true);
+        if (res.platforms.length > 0) setDiscoveryRan(true);
       })
       .catch(() => {})
       .finally(() => setRunBusy(false));
@@ -105,7 +112,7 @@ export default function OnboardingChecklist({ onNavigate }: Props) {
   return (
     <div className="panel">
       <div className="spread">
-        <h2 style={{ margin: 0 }}>Getting the most out of GigHound</h2>
+        <div><h2 style={{ margin: 0 }}>Getting the most out of GigHound</h2>{updatedAt&&<span className="muted">Updated {new Date(updatedAt).toLocaleTimeString()}</span>}</div>
         <button className="btn secondary small" onClick={dismiss}>
           Dismiss
         </button>
@@ -113,8 +120,7 @@ export default function OnboardingChecklist({ onNavigate }: Props) {
       <div className="item-list" style={{ marginTop: 10 }}>
         <div className="item-row" style={{ cursor: 'default' }}>
           <span style={rowText}>
-            {state.accountEnrolled ? check : todo} Connect a platform account with credentials
-            enrolled
+            {state.accountEnrolled ? check : todo} Enroll credentials for an enabled platform account
           </span>
           {!state.accountEnrolled && (
             <button className="btn secondary small" onClick={() => onNavigate('accounts')}>
@@ -160,8 +166,8 @@ export default function OnboardingChecklist({ onNavigate }: Props) {
         <div className="item-row" style={{ cursor: 'default' }}>
           <span style={rowText}>
             {state.unansweredReplies === 0
-              ? <>{check} No unanswered client replies</>
-              : <>{todo} {state.unansweredReplies} client repl{state.unansweredReplies === 1 ? 'y' : 'ies'} unanswered</>}
+              ? <>{check} No open proposals with client replies</>
+              : <>{todo} {state.unansweredReplies} open proposal{state.unansweredReplies === 1 ? '' : 's'} with client replies</>}
           </span>
           {state.unansweredReplies > 0 && (
             <button className="btn secondary small" onClick={() => onNavigate('proposals')}>

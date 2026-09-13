@@ -5,16 +5,17 @@ buckets; unknown emails run a dummy bcrypt verify so the timing matches the
 known-email path. When Redis is down the limiters are graceful no-ops.
 """
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from ..auth import (create_access_token, get_current_user, hash_password,
-                    invalidate_user_tokens, revoke_token, verify_password)
+                    invalidate_user_tokens, revoke_token, verify_password, decode_token)
 from ..cache import cache
 from ..config import ALLOW_REGISTRATION
 from ..database import get_db
-from ..models import User
+from ..models import AuthTransaction, User
 from ..schemas import (AccountDeleteIn, LoginIn, PasswordChangeIn, RegisterIn,
                        TokenOut, UserOut)
 
@@ -132,11 +133,20 @@ def _bearer_token(request: Request) -> str | None:
 
 
 @router.post("/logout", response_model=dict)
-def logout(request: Request, user: User = Depends(get_current_user)):
-    """Revoke the current token (jti denylist until its exp). Fail-open when
-    Redis is down: the token then stays valid until it expires naturally."""
+def logout(request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Durably revoke the current session, independent of Redis availability."""
     token = _bearer_token(request)
     if token:
+        payload = decode_token(token)
+        key = "revoked:" + payload["jti"]
+        if db.get(AuthTransaction, key) is None:
+            db.add(AuthTransaction(id=key, user_id=user.id, kind="revoked",
+                                  expires_at=datetime.fromtimestamp(payload["exp"], timezone.utc)))
+            from sqlalchemy.exc import IntegrityError
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()  # another logout already revoked this exact jti
         revoke_token(token)
     return {"status": "ok"}
 
@@ -147,10 +157,12 @@ def change_password(body: PasswordChangeIn, request: Request,
                     user: User = Depends(get_current_user)):
     """Change the account password. Revokes the current token and invalidates
     every other outstanding token of this user (per-user not-before), so all
-    clients must re-login. Fail-open when Redis is down."""
+    clients must re-login even when Redis is down."""
+    db.refresh(user, with_for_update=True)
     if not verify_password(body.current_password, user.password_hash):
         raise HTTPException(400, "current password is incorrect")
     user.password_hash = hash_password(body.new_password)
+    user.session_version += 1
     db.commit()
     token = _bearer_token(request)
     if token:

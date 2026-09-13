@@ -1,9 +1,10 @@
 import json
+import asyncio
 import logging
 import secrets
 
 import redis
-from fastapi import (APIRouter, Depends, HTTPException, Query, WebSocket,
+from fastapi import (APIRouter, Depends, HTTPException, Query, Request, WebSocket,
                      WebSocketDisconnect)
 from sqlalchemy.orm import Session
 
@@ -67,28 +68,28 @@ def digest_preview(db: Session = Depends(get_db), user: User = Depends(get_curre
 @router.post("/api/alerts/digest/send", response_model=dict)
 def digest_send(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Generate the digest and email it if SMTP is configured."""
-    from ..digest import send_digest_email
+    from ..digest import send_user_digest
 
     settings, jobs = _digest_jobs(db, user)
     if settings.digest_mode == "off":
         raise HTTPException(400, "digest_mode is 'off'")
-    sent = send_digest_email(jobs, settings.digest_mode)
+    sent = send_user_digest(db, user.id) > 0
     return {"jobs_in_digest": len(jobs), "emailed": sent}
 
 
 @router.post("/api/alerts/ws-ticket", response_model=dict)
-def issue_ws_ticket(user: User = Depends(get_current_user)):
+def issue_ws_ticket(request: Request, user: User = Depends(get_current_user)):
     """One-time, 30s ticket for WS auth — keeps the JWT out of query strings
     (access logs). 503 when the Redis ticket store is down; the client then
     falls back to the legacy ?token= JWT path."""
     if cache._client() is None:
         raise HTTPException(503, "ws ticket store unavailable")
     ticket = secrets.token_urlsafe(32)
-    cache.set_json(f"ws:ticket:{ticket}", user.id, ttl=WS_TICKET_TTL_SECONDS)
+    cache.set_json(f"ws:ticket:{ticket}", {"user_id": user.id, "token": request.headers.get("authorization", "")[7:]}, ttl=WS_TICKET_TTL_SECONDS)
     return {"ticket": ticket}
 
 
-def _consume_ws_ticket(ticket: str | None) -> int | None:
+def _consume_ws_ticket(ticket: str | None) -> dict | None:
     """Look up and delete a single-use WS ticket; returns the user_id.
     None when the ticket is missing/unknown/expired or Redis is down."""
     if not ticket:
@@ -105,7 +106,8 @@ def _consume_ws_ticket(ticket: str | None) -> int | None:
     if not raw:
         return None
     try:
-        return int(json.loads(raw))
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else None
     except (TypeError, ValueError):
         return None
 
@@ -118,25 +120,37 @@ async def alerts_ws(ws: WebSocket, token: str | None = Query(None),
     (from POST /api/alerts/ws-ticket), verified before accept(). The legacy
     ?token= JWT path is kept as a fallback for when the Redis ticket store
     is down. GIGHOUND_DEV_NOAUTH=1 skips the check."""
+    auth_token = None
     if DEV_NOAUTH:
         user = get_or_create_dev_user(db)
     else:
-        user = None
-        ticket_user_id = _consume_ws_ticket(ticket)
-        if ticket_user_id is not None:
-            candidate = db.get(User, ticket_user_id)
-            if candidate and candidate.is_active:
-                user = candidate
+        transaction = _consume_ws_ticket(ticket)
+        if transaction:
+            auth_token = transaction.get("token")
+        user = get_user_from_token(db, auth_token)
         if user is None:
-            user = get_user_from_token(db, token)
-        if user is None:
+            db.close()
             await ws.close(code=4401)
             return
-    await alerts.connect(ws, user.id)
+    user_id = user.id
+    db.close()  # do not reserve a pooled connection for an idle WebSocket
+    await alerts.connect(ws, user_id)
     try:
         while True:
-            await ws.receive_text()  # client pings keep the socket alive
+            try:
+                await asyncio.wait_for(ws.receive_text(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
+            if not DEV_NOAUTH:
+                try:
+                    valid = get_user_from_token(db, auth_token) is not None
+                finally:
+                    db.close()
+                if not valid:
+                    await ws.close(code=4401)
+                    break
     except WebSocketDisconnect:
         pass
     finally:
-        alerts.disconnect(ws, user.id)
+        db.close()
+        alerts.disconnect(ws, user_id)

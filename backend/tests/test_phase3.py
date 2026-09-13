@@ -182,7 +182,7 @@ def test_follow_up_gating(client):
                   headers=_auth(token)).status_code == 200
     assert c.post(f"/api/proposals/{ids[2]}/follow-up",
                   headers=_auth(token)).status_code == 409
-    # queued_for_browser (upwork handoff) is also follow-up eligible
+    # A browser handoff has not yet submitted; follow-ups must wait.
     db = Session()
     try:
         _, queued = _seed_submitted_item(db, uid, ext="g-4",
@@ -191,7 +191,7 @@ def test_follow_up_gating(client):
     finally:
         db.close()
     assert c.post(f"/api/proposals/{queued_id}/follow-up",
-                  headers=_auth(token)).status_code == 200
+                  headers=_auth(token)).status_code == 409
 
 
 # ---------------- 3.3 interview prep ----------------
@@ -329,7 +329,7 @@ def test_client_history_aggregation_and_null(client):
     assert r.json()["client_history"] is None
 
 
-def test_client_history_composite_identity_fallback(client):
+def test_client_history_does_not_merge_anonymous_cohorts(client):
     c, Session = client
     token = _register(c)
     uid = _user_id(Session)
@@ -355,8 +355,7 @@ def test_client_history_composite_identity_fallback(client):
         db.close()
 
     r = c.get(f"/api/jobs/{new_id}", headers=_auth(token))
-    assert r.json()["client_history"] == {
-        "past_proposals": 1, "hired": 1, "rejected": 0, "ghosted": 0}
+    assert r.json()["client_history"] is None
     r = c.get(f"/api/jobs/{other_id}", headers=_auth(token))
     assert r.json()["client_history"] is None
 
@@ -447,8 +446,13 @@ def test_won_bids_nudge_calculate_bid(db, user):
     base, _, base_rationale = calculate_bid(db, job, {})
     assert "nudged" not in base_rationale  # no samples yet
 
-    for amt in (base * 1.6, base * 1.7, base * 1.5):
-        record_winning_bid(db, user.id, "react", amt)
+    from app.templates import record_outcome
+    for n, amt in enumerate((base * 1.6, base * 1.7, base * 1.5)):
+        past = Job(user_id=user.id, external_id=f"won-{n}", platform="upwork", title="React dashboard", skills=["React"], job_type="fixed", currency="USD")
+        db.add(past); db.flush()
+        proposal = ProposalQueueItem(user_id=user.id, job_id=past.id, platform="upwork", status="submitted", bid_amount=amt)
+        db.add(proposal); db.commit()
+        record_outcome(db, proposal, "hired")
     nudged, _, rationale = calculate_bid(db, job, {})
     assert base < nudged <= base * 1.2  # pulled up, bounded at +20%
     assert "nudged toward 3 past winning bids" in rationale
@@ -459,7 +463,7 @@ def test_record_outcome_hired_stores_winning_bid(db, user):
     from app.templates import record_outcome
 
     db.add(RateCardEntry(user_id=user.id, skill_category="react", hourly_rate=50))
-    job = Job(user_id=user.id, external_id="ro-1", platform="upwork", title="React app",
+    job = Job(user_id=user.id, external_id="ro-1", platform="upwork", title="React app", job_type="fixed",
               skills=["React"])
     db.add(job)
     db.commit()
@@ -469,14 +473,12 @@ def test_record_outcome_hired_stores_winning_bid(db, user):
     db.commit()
 
     record_outcome(db, item, "hired")
-    samples = winning_bid_samples(db, user.id, "react")
+    samples = winning_bid_samples(db, user.id, "react", currency="USD", job_type=job.job_type)
     assert len(samples) == 1 and samples[0]["bid_amount"] == 900.0
-    assert samples[0]["at"]
-    row = db.query(AdapterState).filter_by(user_id=user.id, key="rate_feedback:react").one()
-    assert row.value["samples"][0]["bid_amount"] == 900.0
+    assert samples[0]["proposal_id"] == item.id
 
     # non-hired outcomes record nothing
-    job2 = Job(user_id=user.id, external_id="ro-2", platform="upwork", title="React app 2",
+    job2 = Job(user_id=user.id, external_id="ro-2", platform="upwork", title="React app 2", job_type="fixed",
                skills=["React"])
     db.add(job2)
     db.commit()
@@ -485,7 +487,7 @@ def test_record_outcome_hired_stores_winning_bid(db, user):
     db.add(item2)
     db.commit()
     record_outcome(db, item2, "rejected")
-    assert len(winning_bid_samples(db, user.id, "react")) == 1
+    assert len(winning_bid_samples(db, user.id, "react", currency="USD", job_type=job.job_type)) == 1
 
 
 # ---------------- P3-3: version history preserves the pre-edit draft ----------------
@@ -506,7 +508,7 @@ def test_approve_versions_previous_text(client):
 
     # first edit-approve versions the PREVIOUS text (v1 = the AI draft)
     r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-               json={"reviewer": "P3", "proposal_text": "Edited by the reviewer."})
+               json={"expected_revision": c.get(f"/api/proposals/{item_id}", headers=_auth(token)).json()["revision"], "reviewer": "P3", "proposal_text": "Edited by the reviewer."})
     assert r.status_code == 200, r.text
     versions = r.json()["versions"]
     assert len(versions) == 1
@@ -522,7 +524,7 @@ def test_approve_versions_previous_text(client):
 
     # a subsequent edit-approve versions the text live at that moment
     r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-               json={"reviewer": "P3", "proposal_text": "Second round of edits."})
+               json={"expected_revision": r.json()["revision"], "reviewer": "P3", "proposal_text": "Second round of edits."})
     assert r.status_code == 200, r.text
     versions = r.json()["versions"]
     assert len(versions) == 2

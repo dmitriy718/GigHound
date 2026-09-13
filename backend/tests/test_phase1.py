@@ -354,6 +354,7 @@ def test_disabled_platform_blocks_bid(client, monkeypatch):
     c, Session = client
     _FakeFreelancerAdapter.calls = []
     monkeypatch.setattr("app.routers.adapters.FreelancerAdapter", _FakeFreelancerAdapter)
+    monkeypatch.setattr("app.adapters.freelancer.FreelancerAdapter", _FakeFreelancerAdapter)
     token = _register(c)
     uid = _user_id(Session)
     _add_account(Session, uid, "freelancer", enabled=False)
@@ -365,17 +366,20 @@ def test_disabled_platform_blocks_bid(client, monkeypatch):
     assert _FakeFreelancerAdapter.calls == []
 
 
-def test_no_account_row_means_platform_allowed(client, monkeypatch):
+def test_missing_account_cannot_automatically_submit(client, monkeypatch):
     c, Session = client
     _FakeFreelancerAdapter.calls = []
     monkeypatch.setattr("app.routers.adapters.FreelancerAdapter", _FakeFreelancerAdapter)
+    monkeypatch.setattr("app.adapters.freelancer.FreelancerAdapter", _FakeFreelancerAdapter)
     token = _register(c)
     uid = _user_id(Session)
     item_id = _make_item(Session, uid, platform="freelancer",
                          submission_result={"bidder_id": 777})
     r = c.post("/api/adapters/freelancer/bid", headers=_auth(token),
                json={"proposal_queue_item_id": item_id})
-    assert r.status_code == 200, r.text
+    assert r.status_code == 400, r.text
+    assert "Accounts page" in r.json()["detail"]
+    assert _FakeFreelancerAdapter.calls == []
 
 
 # ---------------- 1.7 word-boundary matching ----------------

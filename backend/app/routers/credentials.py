@@ -8,12 +8,8 @@ values are never returned or logged — status exposes key names only.
 
 Recognized secret keys per platform:
   * freelancer: `access_token` (required), `refresh_token` (opt)
-  * stealth platforms (fiverr, peopleperhour, guru):
-    `storage_state_json` (a Playwright storage_state JSON string — the
-    preferred path, seeded straight into the worker's browser context), OR
-    raw `username` + `password` for the worker's login flow.
-    Password-based login is a FALLBACK only: it is challenge-prone
-    (CAPTCHA/2FA) and may escalate to a human at run time.
+  * stealth platforms (fiverr, peopleperhour, guru): enrolled Playwright
+    storage_state JSON. Raw username/password enrollment is unsupported.
   * upwork supports BOTH credential types: API tokens (`access_token`,
     `refresh_token`) OR a browser session per the stealth rules above
     (the worker drives upwork through the browser, so a stealth session is
@@ -22,6 +18,11 @@ Recognized secret keys per platform:
 import json
 import logging
 import os
+import hashlib
+import secrets
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
+from sqlalchemy import update
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -30,7 +31,7 @@ from ..adapters.freelancer import FreelancerAdapter
 from ..adapters.vault import CredentialVault
 from ..auth import get_current_user, get_owned
 from ..database import get_db
-from ..models import AdapterCredential, AuditLog, PlatformAccount, User
+from ..models import AdapterCredential, AuditLog, AuthTransaction, PlatformAccount, User
 # canonical sets live in app.platforms; upwork is BOTH oauth + stealth
 from ..platforms import OAUTH_PLATFORMS as _OAUTH_PLATFORMS
 from ..platforms import STEALTH_CREDENTIAL_PLATFORMS as _STEALTH_PLATFORMS
@@ -40,7 +41,7 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/accounts", tags=["credentials"])
 
-_OAUTH_KEYS = {"access_token", "refresh_token"}
+_OAUTH_KEYS = {"access_token", "refresh_token", "expires_at", "client_id", "client_secret"}
 _STEALTH_KEYS = {"storage_state_json", "username", "password"}
 
 # Absolute URI (the provider requires one). Defaults to the all-in-one
@@ -81,6 +82,15 @@ def _validate_oauth_secrets(platform: str, secrets: dict):
     unknown = set(secrets) - _OAUTH_KEYS
     if unknown:
         raise HTTPException(422, f"unknown credential keys for {platform}: {sorted(unknown)}")
+    if any(secrets.get(k) for k in ("client_id", "client_secret")) and not all(secrets.get(k) for k in ("client_id", "client_secret")):
+        raise HTTPException(422, "client_id and client_secret must be enrolled together")
+    if secrets.get("expires_at"):
+        try:
+            expiry = datetime.fromisoformat(secrets["expires_at"])
+            if expiry.tzinfo is None:
+                raise ValueError("timezone required")
+        except (ValueError, TypeError):
+            raise HTTPException(422, "expires_at must be an ISO timestamp with timezone") from None
     if not secrets.get("access_token"):
         raise HTTPException(422, f"{platform}: 'access_token' is required")
 
@@ -101,9 +111,13 @@ def _validate_stealth_secrets(platform: str, secrets: dict):
             raise HTTPException(422, "'storage_state_json' is not valid JSON") from None
         if not isinstance(state, dict):
             raise HTTPException(422, "'storage_state_json' must decode to a JSON object")
+        from ..browser_security import validate_storage_state
+        try:
+            validate_storage_state(platform, state)
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(422, "browser session contains invalid or foreign origins") from None
     elif has_userpass:
-        if not (secrets.get("username") and secrets.get("password")):
-            raise HTTPException(422, "'username' and 'password' must be provided together")
+        raise HTTPException(422, "password enrollment is unsupported; enroll a browser storage-state export")
     else:
         raise HTTPException(
             422, f"{platform}: provide 'storage_state_json' or 'username'+'password'")
@@ -115,6 +129,7 @@ def _validate_dual_secrets(platform: str, secrets: dict):
     if unknown:
         raise HTTPException(422, f"unknown credential keys for {platform}: {sorted(unknown)}")
     if secrets.get("access_token"):
+        _validate_oauth_secrets(platform, {k: v for k, v in secrets.items() if k in _OAUTH_KEYS})
         stealth = {k: v for k, v in secrets.items() if k in _STEALTH_KEYS}
         if stealth:  # mixed enrollment: the stealth half must still be coherent
             _validate_stealth_secrets(platform, stealth)
@@ -151,7 +166,7 @@ def enroll_credentials(account_id: int, body: CredentialsIn,
     account = _get_account(db, account_id, user)
     secrets = _validate_secrets(account.platform, body.secrets)
     _ensure_credential_ref(db, account)
-    CredentialVault(db, user.id).store(account.platform, account.principal, secrets)
+    CredentialVault(db, user.id, account_id=account.id, account_epoch=account.identity_epoch).store(account.platform, account.principal, secrets)
     _audit(db, user, "credentials_enrolled", account, list(secrets))
     log.info("credentials enrolled for account %d (%s/%s), keys=%s",
              account.id, account.platform, account.principal, sorted(secrets))
@@ -202,12 +217,17 @@ async def freelancer_oauth_start(account_id: int, db: Session = Depends(get_db),
         raise HTTPException(
             501, "Freelancer OAuth is not configured on this deployment — "
                  "set FREELANCER_CLIENT_ID/FREELANCER_CLIENT_SECRET")
-    adapter = FreelancerAdapter(db, user.id)
+    adapter = FreelancerAdapter(db, user.id, principal=account.principal)
     try:
         authorize_url = adapter.build_authorize_url(client_id, redirect_uri)
     finally:
         await adapter.close()
-    return {"authorize_url": authorize_url}
+    state = secrets.token_urlsafe(32)
+    db.add(AuthTransaction(id=hashlib.sha256(state.encode()).hexdigest(), user_id=user.id,
+                           kind="oauth_freelancer", payload={"account_id": account.id, "account_epoch": account.identity_epoch, "redirect_uri": redirect_uri},
+                           expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)))
+    db.commit()
+    return {"authorize_url": authorize_url + "&" + urlencode({"state": state}), "state": state}
 
 
 @router.post("/{account_id}/oauth/freelancer/complete", status_code=204)
@@ -222,16 +242,27 @@ async def freelancer_oauth_complete(account_id: int, body: OAuthCompleteIn,
         raise HTTPException(
             501, "Freelancer OAuth is not configured on this deployment — "
                  "set FREELANCER_CLIENT_ID/FREELANCER_CLIENT_SECRET")
-    adapter = FreelancerAdapter(db, user.id)
+    key = hashlib.sha256(body.state.encode()).hexdigest()
+    transaction = db.get(AuthTransaction, key)
+    now = datetime.now(timezone.utc)
+    if (transaction is None or transaction.user_id != user.id or transaction.kind != "oauth_freelancer"
+            or transaction.payload.get("account_id") != account.id
+            or transaction.payload.get("account_epoch") != account.identity_epoch
+            or transaction.payload.get("redirect_uri") != redirect_uri
+            or (body.redirect_uri is not None and body.redirect_uri != redirect_uri)):
+        raise HTTPException(409, "OAuth transaction does not match this account and redirect")
+    consumed = db.execute(update(AuthTransaction).execution_options(synchronize_session=False).where(
+        AuthTransaction.id == key, AuthTransaction.used_at.is_(None), AuthTransaction.expires_at > now,
+    ).values(used_at=now)).rowcount
+    db.commit()
+    if not consumed:
+        raise HTTPException(409, "OAuth transaction expired or already used; start again")
+    adapter = FreelancerAdapter(db, user.id, principal=account.principal)
     try:
-        tokens = await adapter.exchange_code(
-            client_id, client_secret, body.code, body.redirect_uri or redirect_uri)
+        adapter.vault = CredentialVault(db, user.id, account_id=account.id, account_epoch=account.identity_epoch)
+        tokens = await adapter.exchange_code(client_id, client_secret, body.code, redirect_uri)
     finally:
         await adapter.close()
-    # exchange_code persists under principal "default"; re-store under the
-    # account's own principal when it differs so credential_ref stays true.
-    if account.principal != "default":
-        CredentialVault(db, user.id).store(account.platform, account.principal, tokens)
     _ensure_credential_ref(db, account)
     _audit(db, user, "credentials_enrolled", account, list(tokens))
     log.info("freelancer OAuth completed for account %d (principal=%s)",

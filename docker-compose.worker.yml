@@ -13,6 +13,7 @@ services:
     environment:
       GIGHOUND_API_URL: ${GIGHOUND_API_URL:-http://backend:8000}
       GIGHOUND_WORKER_TOKEN: ${GIGHOUND_WORKER_TOKEN:?set GIGHOUND_WORKER_TOKEN}
+      WORKER_ID: ${WORKER_ID:?set a stable WORKER_ID matching the backend worker registry}
       WORKER_SESSION_DIR: /app/.sessions
       WORKER_PLATFORMS: ${WORKER_PLATFORMS:-}
       WORKER_HEADLESS: ${WORKER_HEADLESS:-true}

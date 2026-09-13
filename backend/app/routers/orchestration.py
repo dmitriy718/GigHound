@@ -1,3 +1,5 @@
+from ..pagination import PageLimit, PageOffset
+from ..schemas import BooleanValidateIn
 """CRUD for saved search profiles and connected platform accounts."""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -16,8 +18,8 @@ router = APIRouter(prefix="/api", tags=["orchestration"])
 # --- Search profiles ---
 
 @router.get("/search-profiles", response_model=list[SearchProfileOut])
-def list_search_profiles(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return scoped(db, SearchProfile, user).all()
+def list_search_profiles(db: Session = Depends(get_db), user: User = Depends(get_current_user), limit: PageLimit = 100, offset: PageOffset = 0):
+    return scoped(db, SearchProfile, user).order_by(SearchProfile.id).offset(offset).limit(limit).all()
 
 
 def _validate_refs(body: SearchProfileIn, db: Session, user: User):
@@ -67,7 +69,8 @@ def delete_search_profile(profile_id: int, db: Session = Depends(get_db), user: 
 
 
 @router.post("/search-profiles/validate-boolean", response_model=dict)
-def validate_boolean(body: dict, user: User = Depends(get_current_user)):
+def validate_boolean(body: BooleanValidateIn, user: User = Depends(get_current_user)):
+    body = body.model_dump()
     """Dry-run a boolean query string; returns parse status (for the builder UI)."""
     query = body.get("query", "")
     try:
@@ -104,12 +107,17 @@ def _validate_boolean(query: str):
 # --- Platform accounts ---
 
 @router.get("/accounts", response_model=list[PlatformAccountOut])
-def list_accounts(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return scoped(db, PlatformAccount, user).all()
+def list_accounts(db: Session = Depends(get_db), user: User = Depends(get_current_user), limit: PageLimit = 100, offset: PageOffset = 0):
+    return scoped(db, PlatformAccount, user).order_by(PlatformAccount.id).offset(offset).limit(limit).all()
 
 
 @router.post("/accounts", response_model=PlatformAccountOut, status_code=201)
 def create_account(body: PlatformAccountIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    if body.platform == "indeed":
+        raise HTTPException(422,"Indeed supports manual job import and tracking only; no account connector is implemented")
+    db.refresh(user, with_for_update=True)
+    if db.query(PlatformAccount.id).filter_by(user_id=user.id, platform=body.platform, principal=body.principal).first():
+        raise HTTPException(409, "this platform principal is already enrolled")
     account = PlatformAccount(user_id=user.id, **body.model_dump())
     db.add(account)
     db.commit()
@@ -122,6 +130,8 @@ def update_account(account_id: int, body: PlatformAccountIn, db: Session = Depen
     account = get_owned(db, PlatformAccount, account_id, user)
     if not account:
         raise HTTPException(404, "account not found")
+    if body.platform != account.platform or body.principal != account.principal:
+        raise HTTPException(409, "account platform and principal are immutable; enroll a separate account")
     for k, v in body.model_dump().items():
         setattr(account, k, v)
     db.commit()
@@ -131,8 +141,19 @@ def update_account(account_id: int, body: PlatformAccountIn, db: Session = Depen
 
 @router.delete("/accounts/{account_id}", status_code=204)
 def delete_account(account_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    # Serialize deletion with enrollment of the same principal. Vault rows are
+    # keyed by principal, not account ID, so deleting the account alone would
+    # leave a usable legacy credential and silently revive it on re-enrollment.
+    db.refresh(user, with_for_update=True)
     account = get_owned(db, PlatformAccount, account_id, user)
     if not account:
         raise HTTPException(404, "account not found")
+    from ..models import AdapterCredential, AuditLog
+    db.query(AdapterCredential).filter_by(
+        user_id=user.id, platform=account.platform, principal=account.principal
+    ).delete(synchronize_session=False)
+    db.add(AuditLog(user_id=user.id, action_type="platform_account_deleted",
+                    platform=account.platform, detail={"account_id": account.id,
+                                                       "credentials_revoked": True}))
     db.delete(account)
     db.commit()

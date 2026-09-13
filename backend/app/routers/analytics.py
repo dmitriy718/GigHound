@@ -188,8 +188,7 @@ def analytics_trend(weeks: int = Query(8, ge=1, le=26),
     labels = [(start + timedelta(days=7 * i)).strftime("%G-W%V")
               for i in range(weeks)]
 
-    submitted_ts = func.coalesce(ProposalQueueItem.reviewed_at,
-                                 ProposalQueueItem.created_at)
+    submitted_ts = ProposalQueueItem.submitted_at
     submitted_rows = (db.query(func.date(submitted_ts), func.count())
                       .filter(ProposalQueueItem.user_id == user.id,
                               ProposalQueueItem.status.in_(_SUBMITTED_STATUSES),

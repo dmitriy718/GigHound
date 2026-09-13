@@ -2,6 +2,7 @@
 validation, credential_ref auto-generation, tenancy, Freelancer OAuth, and
 the worker-facing stealth-session endpoint."""
 import json
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,7 +17,7 @@ from app.database import Base, get_db
 from app.main import app
 from app.models import AuditLog, PlatformAccount, StealthTask, User
 
-WORKER_HEADERS = {"Authorization": "Bearer test-worker-token"}
+WORKER_HEADERS = {"Authorization": "Bearer test-worker-token", "X-Worker-ID": "w-1", "X-Worker-Claim": "test-claim"}
 
 STORAGE_STATE = {
     "cookies": [{"name": "session", "value": "abc123secret", "domain": ".fiverr.com",
@@ -71,7 +72,8 @@ def _claimed_task(db, user_id, platform="fiverr"):
     """Session reads are scoped to an active claim (the worker fetches the
     session only while executing a claimed task)."""
     t = StealthTask(user_id=user_id, platform=platform, task_type="fetch_metrics",
-                    payload={}, status="claimed", claimed_by="w-1")
+                    payload={}, status="claimed", claimed_by="w-1",
+                    claim_token="test-claim", claimed_at=datetime.now(timezone.utc))
     db.add(t)
     db.commit()
     return t
@@ -127,12 +129,8 @@ def test_enroll_username_password_and_existing_ref_kept(client):
     r = c.post(f"/api/accounts/{acct.id}/credentials",
                json={"secrets": {"username": "me@example.com", "password": "hunter2"}},
                headers=_headers(u))
-    assert r.status_code == 204, r.text
-    db.refresh(acct)
-    assert acct.credential_ref == "vault://guru/default"  # untouched
-    r = c.get(f"/api/accounts/{acct.id}/credentials/status", headers=_headers(u))
-    assert r.json()["keys"] == ["password", "username"]
-    assert "hunter2" not in r.text
+    assert r.status_code == 422, r.text
+    assert CredentialVault(db, u.id).load("guru", "default") is None
 
 
 def test_enroll_freelancer_tokens(client):
@@ -160,7 +158,7 @@ def test_enroll_upwork_browser_session(client):
     u = _user(db, "uw-state@example.com")
     acct = _account(db, u.id, platform="upwork")
     r = c.post(f"/api/accounts/{acct.id}/credentials",
-               json={"secrets": {"storage_state_json": json.dumps(STORAGE_STATE)}},
+               json={"secrets": {"storage_state_json": json.dumps(json.loads(json.dumps(STORAGE_STATE).replace("fiverr.com", "upwork.com")))}},
                headers=_headers(u))
     assert r.status_code == 204, r.text
     r = c.get(f"/api/accounts/{acct.id}/credentials/status", headers=_headers(u))
@@ -170,7 +168,12 @@ def test_enroll_upwork_browser_session(client):
     _claimed_task(db, u.id, platform="upwork")
     r = c.get(f"/api/gigs/stealth-session?platform=upwork&user_id={u.id}",
               headers=WORKER_HEADERS)
-    assert r.json()["storage_state"] == STORAGE_STATE
+    assert r.status_code == 409  # API-only enrollment does not authorize browser work.
+    acct.mode = "hybrid"
+    db.commit()
+    r = c.get(f"/api/gigs/stealth-session?platform=upwork&user_id={u.id}", headers=WORKER_HEADERS)
+    assert r.status_code == 200
+    assert r.json()["storage_state"] == json.loads(json.dumps(STORAGE_STATE).replace("fiverr.com", "upwork.com"))
 
 
 def test_enroll_upwork_userpass_and_tokens(client):
@@ -181,7 +184,7 @@ def test_enroll_upwork_userpass_and_tokens(client):
     r = c.post(f"/api/accounts/{acct.id}/credentials",
                json={"secrets": {"username": "me@example.com", "password": "hunter2"}},
                headers=_headers(u))
-    assert r.status_code == 204, r.text
+    assert r.status_code == 422, r.text
 
     # API tokens still enroll on the same platform (oauth branch preserved)
     acct2 = _account(db, u.id, platform="upwork", principal="api")
@@ -288,7 +291,7 @@ def test_oauth_start_returns_authorize_url(client, monkeypatch):
     r = c.get(f"/api/accounts/{acct.id}/oauth/freelancer/start", headers=_headers(u))
     assert r.status_code == 200
     url = r.json()["authorize_url"]
-    assert url.startswith("https://accounts.freelancer.com/oauth/authorise?")
+    assert url.startswith("https://accounts.freelancer.com/oauth/authorize?")
     assert "client_id=cid-123" in url
 
     # non-freelancer account rejected
@@ -313,8 +316,9 @@ def test_oauth_complete_stores_tokens(client, monkeypatch):
              "expires_in": 3600}, client_id, client_secret)
 
     monkeypatch.setattr(FreelancerAdapter, "exchange_code", fake_exchange)
+    state = c.get(f"/api/accounts/{acct.id}/oauth/freelancer/start", headers=_headers(u)).json()["state"]
     r = c.post(f"/api/accounts/{acct.id}/oauth/freelancer/complete",
-               json={"code": "auth-code-1"}, headers=_headers(u))
+               json={"code": "auth-code-1", "state": state}, headers=_headers(u))
     assert r.status_code == 204, r.text
 
     db.refresh(acct)
@@ -339,12 +343,15 @@ def test_oauth_complete_non_default_principal(client, monkeypatch):
     monkeypatch.setenv("FREELANCER_CLIENT_SECRET", "sekret")
 
     async def fake_exchange(self, client_id, client_secret, code, redirect_uri):
-        return {"access_token": "tok2", "refresh_token": "ref2",
-                "expires_at": "2999-01-01T00:00:00+00:00"}
+        tokens = {"access_token": "tok2", "refresh_token": "ref2",
+                  "expires_at": "2999-01-01T00:00:00+00:00"}
+        self.vault.store(self.platform, self.credential_principal, tokens)
+        return tokens
 
     monkeypatch.setattr(FreelancerAdapter, "exchange_code", fake_exchange)
+    state = c.get(f"/api/accounts/{acct.id}/oauth/freelancer/start", headers=_headers(u)).json()["state"]
     r = c.post(f"/api/accounts/{acct.id}/oauth/freelancer/complete",
-               json={"code": "x"}, headers=_headers(u))
+               json={"code": "x", "state": state}, headers=_headers(u))
     assert r.status_code == 204, r.text
     db.refresh(acct)
     assert acct.credential_ref == "vault://freelancer/secondary"
@@ -430,9 +437,7 @@ def test_stealth_session_null_when_absent(client):
 
     r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
               headers=WORKER_HEADERS)
-    assert r.status_code == 200
-    assert r.json() == {"storage_state": None, "credentials_present": False,
-                        "proxy_url": None, "timezone": None, "locale": None}
+    assert r.status_code == 409
 
     # account exists but nothing enrolled
     _account(db, u.id, platform="fiverr")
@@ -446,10 +451,10 @@ def test_stealth_session_null_when_absent(client):
     r = c.post(f"/api/accounts/{acct.id}/credentials",
                json={"secrets": {"username": "x", "password": "y"}},
                headers=_headers(u))
-    assert r.status_code == 204
+    assert r.status_code == 422
     r = c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
               headers=WORKER_HEADERS)
-    assert r.json() == {"storage_state": None, "credentials_present": True,
+    assert r.json() == {"storage_state": None, "credentials_present": False,
                         "proxy_url": None, "timezone": None, "locale": None}
 
 
@@ -509,3 +514,50 @@ def test_stealth_session_requires_worker_token(client):
                  headers=_headers(u)).status_code == 401
     assert c.get(f"/api/gigs/stealth-session?platform=fiverr&user_id={u.id}",
                  headers={"Authorization": "Bearer wrong"}).status_code == 401
+
+
+def test_oauth_state_is_single_use_and_bound_to_account(client, monkeypatch):
+    c, Session = client
+    db = Session()
+    u = _user(db, 'oauth-state@example.test')
+    a = _account(db, u.id, platform='freelancer', principal='one')
+    b = _account(db, u.id, platform='freelancer', principal='two')
+    monkeypatch.setenv('FREELANCER_CLIENT_ID','test-client')
+    monkeypatch.setenv('FREELANCER_CLIENT_SECRET','test-secret')
+    calls = []
+    async def exchange(self, *args):
+        calls.append(self.credential_principal)
+        return {'access_token':'new-token'}
+    monkeypatch.setattr(FreelancerAdapter, 'exchange_code', exchange)
+    h = _headers(u)
+    state = c.get(f'/api/accounts/{a.id}/oauth/freelancer/start',headers=h).json()['state']
+    body = {'code':'test-code','state':state}
+    assert c.post(f'/api/accounts/{b.id}/oauth/freelancer/complete',headers=h,json=body).status_code == 409
+    assert not calls
+    assert c.post(f'/api/accounts/{a.id}/oauth/freelancer/complete',headers=h,json={**body,'redirect_uri':'https://evil.test'}).status_code == 409
+    assert c.post(f'/api/accounts/{a.id}/oauth/freelancer/complete',headers=h,json=body).status_code == 204
+    assert c.post(f'/api/accounts/{a.id}/oauth/freelancer/complete',headers=h,json=body).status_code == 409
+    assert calls == ['one']
+    assert CredentialVault(db,u.id).load('freelancer','default') is None
+
+
+def test_oauth_state_cannot_enroll_recreated_account_with_same_id(client, monkeypatch):
+    c, Session = client
+    db = Session()
+    u = _user(db, 'oauth-recreated@example.test')
+    a = _account(db,u.id,platform='freelancer')
+    account_id = a.id
+    monkeypatch.setenv('FREELANCER_CLIENT_ID','test-client')
+    monkeypatch.setenv('FREELANCER_CLIENT_SECRET','test-secret')
+    h = _headers(u)
+    state = c.get(f'/api/accounts/{account_id}/oauth/freelancer/start',headers=h).json()['state']
+    db.delete(a); db.commit()
+    db.add(PlatformAccount(id=account_id,user_id=u.id,platform='freelancer',principal='default',label='Replacement'))
+    db.commit()
+    calls=[]
+    async def exchange(self,*args): calls.append(True); return {'access_token':'must-not-store'}
+    monkeypatch.setattr(FreelancerAdapter,'exchange_code',exchange)
+    result=c.post(f'/api/accounts/{account_id}/oauth/freelancer/complete',headers=h,json={'state':state,'code':'synthetic'})
+    assert result.status_code == 409
+    assert not calls
+    assert CredentialVault(db,u.id).load('freelancer','default') is None

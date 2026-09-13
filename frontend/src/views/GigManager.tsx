@@ -59,7 +59,7 @@ function MetricsChart({ metrics }: { metrics: GigMetric[] }) {
   const W = 640;
   const H = 200;
   const PAD = 28;
-  const max = Math.max(1, ...metrics.flatMap((m) => [m.impressions, m.clicks, m.orders]));
+  const max = Math.max(1, ...metrics.flatMap((m) => [m.impressions, m.clicks, m.orders]).filter((v): v is number => v !== null));
   const x = (i: number) =>
     metrics.length === 1 ? W / 2 : PAD + (i / (metrics.length - 1)) * (W - PAD * 2);
   const y = (v: number) => H - PAD - (v / max) * (H - PAD * 2);
@@ -70,13 +70,9 @@ function MetricsChart({ metrics }: { metrics: GigMetric[] }) {
         <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke="var(--border)" />
         <line x1={PAD} y1={PAD} x2={PAD} y2={H - PAD} stroke="var(--border)" />
         {SERIES.map(({ key, color }) => (
-          <polyline
-            key={key}
-            fill="none"
-            stroke={color}
-            strokeWidth={2}
-            points={metrics.map((m, i) => `${x(i)},${y(m[key])}`).join(' ')}
-          />
+          <g key={key}>
+            {metrics.map((m,i) => m[key] === null ? null : <circle key={i} cx={x(i)} cy={y(m[key] as number)} r={3} fill={color}><title>{key}: {m[key]}</title></circle>)}
+          </g>
         ))}
         {metrics.map((m, i) => (
           <text key={m.week} x={x(i)} y={H - PAD + 14} textAnchor="middle" className="chart-label">
@@ -144,7 +140,7 @@ function GigsTab() {
     registerGig({
       platform: form.platform,
       title: form.title.trim(),
-      external_id: null,
+      external_id: '',
       url: form.url.trim(),
       status: form.status,
       price_min: form.price_min !== '' ? Number(form.price_min) : null,
@@ -283,25 +279,32 @@ function GigsTab() {
             </select>
           </div>
           <div className="field" style={{ marginBottom: 0, flex: 1, minWidth: 200 }}>
-            <label>Title</label>
+            <label htmlFor="register-gig-title">Title</label>
             <input
+              id="register-gig-title"
+              maxLength={300}
               type="text"
               value={form.title}
               onChange={(e) => setForm({ ...form, title: e.target.value })}
             />
           </div>
           <div className="field" style={{ marginBottom: 0, flex: 1, minWidth: 200 }}>
-            <label>URL</label>
+            <label htmlFor="register-gig-url">URL</label>
             <input
+              id="register-gig-url"
+              maxLength={1000}
               type="url"
               value={form.url}
               onChange={(e) => setForm({ ...form, url: e.target.value })}
             />
           </div>
           <div className="field" style={{ marginBottom: 0 }}>
-            <label>Price min</label>
+            <label htmlFor="register-gig-price">Price min</label>
             <input
+              id="register-gig-price"
               type="number"
+              min="0"
+              step="0.01"
               value={form.price_min}
               onChange={(e) => setForm({ ...form, price_min: e.target.value })}
             />

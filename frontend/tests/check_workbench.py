@@ -1,0 +1,107 @@
+"""Live local API/SPA journey; run only against the disposable audit UI server."""
+import secrets
+import re
+from playwright.sync_api import sync_playwright, expect
+
+with sync_playwright() as p:
+    browser=p.chromium.launch(headless=True)
+    page=browser.new_page(viewport={'width':1440,'height':1100}, timezone_id='America/New_York')
+    errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
+    page.on('dialog',lambda d:d.accept())
+    page.goto('http://127.0.0.1:8059/?view=workbench')
+    page.get_by_role('button',name='Create account',exact=True).first.click()
+    page.get_by_label('Display name').fill('Synthetic UI auditor')
+    page.get_by_label('Email',exact=True).fill('astra-'+secrets.token_hex(4)+'@example.test')
+    page.get_by_label('Password',exact=True).fill('synthetic-test-password')
+    page.get_by_role('button',name='Create account',exact=True).last.click()
+    expect(page.get_by_role('heading',name='Business workbench',exact=True)).to_be_visible()
+    page.get_by_role('button',name='Proof library',exact=True).click()
+    page.get_by_label('Evidence title',exact=True).fill('Build improvement')
+    page.get_by_label('Exact supported claim',exact=True).fill('Reduced build time by 20%')
+    page.get_by_label('Source URL or document reference',exact=True).fill('synthetic-case-study.pdf page 3')
+    page.get_by_label('I checked that this source supports the claim',exact=True).check()
+    page.get_by_role('button',name='Create record',exact=True).click()
+    expect(page.get_by_role('heading',name=re.compile(r'Build improvement'))).to_be_visible()
+    page.get_by_role('button',name='Evidence check',exact=True).click()
+    page.get_by_label('Proposal text',exact=True).fill('Reduced build time by 20%')
+    page.get_by_role('button',name='Link proof library claims',exact=True).click()
+    expect(page.get_by_test_id('workbench-result')).to_contain_text('synthetic-case-study.pdf page 3')
+    page.get_by_role('button',name='Scope & pricing',exact=True).click()
+    for label,value in {'Project title':'API project','Deliverables':'Two endpoints','Assumptions and acceptance conditions':'Client supplies documentation','Currency (three uppercase letters)':'EUR','hours low':'10','hours high':'20','cost per hour':'40.5','expenses':'100','margin percent':'25','available hours':'15'}.items():
+        page.get_by_label(label,exact=True).fill(value)
+    page.get_by_role('button',name='Calculate & draft scope',exact=True).click()
+    expect(page.get_by_test_id('workbench-result')).to_contain_text('673.33')
+    expect(page.get_by_test_id('workbench-result')).to_contain_text('exceeds your available capacity')
+    page.get_by_role('button',name='Conversation inbox',exact=True).click()
+    page.get_by_label('Conversation title',exact=True).fill('Timezone regression')
+    page.get_by_label('Imported message',exact=True).fill('Synthetic client message')
+    page.get_by_label('Next action due',exact=True).fill('2026-12-01T09:30')
+    page.get_by_role('button',name='Create record',exact=True).click()
+    expect(page.get_by_role('heading',name=re.compile('Timezone regression'))).to_be_visible()
+    page.get_by_role('button',name='Edit',exact=True).click()
+    assert page.get_by_label('Next action due',exact=True).input_value().startswith('2026-12-01T09:30')
+    page.get_by_label('Imported message',exact=True).fill('Edited message, same due time')
+    page.get_by_role('button',name='Save changes',exact=True).click()
+    expect(page.get_by_role('button',name='Create record',exact=True)).to_be_visible()
+    page.get_by_role('button',name='Edit',exact=True).click()
+    assert page.get_by_label('Next action due',exact=True).input_value().startswith('2026-12-01T09:30')
+    # Preserve the second occurrence of a repeated local hour, including seconds.
+    page.evaluate("""async () => {
+        const headers={Authorization:`Bearer ${localStorage.getItem('gighound_token')}`,'Content-Type':'application/json'};
+        const rows=await (await fetch('/api/workbench/records?kind=conversation',{headers})).json();
+        const row=rows.find(r=>r.data.title==='Timezone regression');
+        const response=await fetch(`/api/workbench/records/${row.id}`,{method:'PUT',headers,body:JSON.stringify({expected_version:row.version,data:{...row.data,due_at:'2026-11-01T06:30:17.123Z'}})});
+        if(!response.ok) throw new Error('Synthetic DST fixture failed');
+    }""")
+    page.reload()
+    page.get_by_role('button',name='Conversation inbox',exact=True).click()
+    page.get_by_role('button',name='Edit',exact=True).click()
+    assert page.get_by_label('Next action due',exact=True).input_value().startswith('2026-11-01T01:30:17.123')
+    page.get_by_label('Imported message',exact=True).fill('Edited during repeated local hour')
+    page.get_by_role('button',name='Save changes',exact=True).click()
+    expect(page.get_by_role('button',name='Create record',exact=True)).to_be_visible()
+    saved_due=page.evaluate("""async () => {
+        const headers={Authorization:`Bearer ${localStorage.getItem('gighound_token')}`};
+        const rows=await (await fetch('/api/workbench/records?kind=conversation',{headers})).json();
+        return new Date(rows.find(r=>r.data.title==='Timezone regression').data.due_at).toISOString();
+    }""")
+    assert saved_due=='2026-11-01T06:30:17.123Z',saved_due
+    page.get_by_role('button',name='Connection doctor',exact=True).click()
+    page.get_by_role('button',name='Inspect unfinished generation',exact=True).click()
+    expect(page.get_by_role('heading',name='Generation recovery',exact=True)).to_be_visible()
+    page.screenshot(path='/tmp/astra-workbench-ui.png',full_page=True)
+    page.goto('http://127.0.0.1:8059/?view=teams')
+    expect(page.get_by_role('heading',name='Team workspace',exact=True)).to_be_visible()
+    page.get_by_label('Workspace name',exact=True).fill('Synthetic review team')
+    page.get_by_role('button',name='Create workspace',exact=True).click()
+    page.get_by_role('button',name='Open Synthetic review team (owner)',exact=True).click()
+    page.get_by_label('Title',exact=True).fill('Shared test proposal')
+    page.get_by_label('Destination URL or reference',exact=True).fill('synthetic job reference')
+    page.get_by_label('Exact proposal text',exact=True).fill('Source-supported shared draft')
+    page.get_by_role('button',name='Share for review',exact=True).click()
+    page.get_by_role('button',name='Approve this version',exact=True).click()
+    expect(page.get_by_role('button',name='Export reviewed draft',exact=True)).to_be_visible()
+    page.get_by_role('button',name='Edit',exact=True).click()
+    page.get_by_label('Exact proposal text',exact=True).fill('Changed scope needs fresh review')
+    page.get_by_role('button',name='Save and require fresh review',exact=True).click()
+    expect(page.get_by_role('button',name='Export reviewed draft',exact=True)).to_have_count(0)
+    expect(page.get_by_role('button',name='Approve this version',exact=True)).to_be_visible()
+    page.screenshot(path='/tmp/astra-team-ui.png',full_page=True)
+    page.goto('http://127.0.0.1:8059/?view=accounts')
+    expect(page.get_by_role('heading',name='Automation safety',exact=True)).to_be_visible()
+    page.get_by_role('button',name='Pause automation',exact=True).click()
+    expect(page.get_by_test_id('circuit-status')).to_contain_text('Automation paused')
+    page.reload()
+    expect(page.get_by_test_id('circuit-status')).to_contain_text('Automation paused')
+    page.get_by_role('button',name='Resume reviewed automation',exact=True).click()
+    expect(page.get_by_test_id('circuit-status')).to_contain_text('Automation enabled')
+    page.goto('http://127.0.0.1:4179/tests/modal.html')
+    opener=page.get_by_role('button',name='Open dialog',exact=True);opener.click()
+    close=page.get_by_role('button',name='Close',exact=True)
+    expect(close).to_be_focused()
+    page.keyboard.press('Shift+Tab');expect(page.get_by_role('button',name='Last control',exact=True)).to_be_focused()
+    page.keyboard.press('Tab');expect(close).to_be_focused()
+    page.keyboard.press('Escape');expect(opener).to_be_focused()
+    assert not errors,errors
+    print('PASS: register, proof library, evidence linking, decimal scope/capacity, team review/edit invalidation, URL reload, keyboard trap and focus restoration')
+    browser.close()

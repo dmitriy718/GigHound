@@ -81,10 +81,10 @@ def test_typing_plan_typo_correction():
     assert page.events[0] == ("click", "#field")
     types = [e for e in page.events if e[0] == "type"]
     # typo typed first (the real word goes through the per-char human path)
-    assert types == [("type", "teh")]
+    assert types[0] == ("type", "teh")
     # one backspace per typo char, before the correction's first char
     teh_idx = page.events.index(("type", "teh"))
-    t_idx = page.events.index(("press", "t"))
+    t_idx = page.events.index(("type", "t"))
     backspaces = [e for e in page.events[teh_idx:t_idx] if e == ("press", "Backspace")]
     assert len(backspaces) == 3
     # final rendered text is intact (typo chars are erased by backspaces)
@@ -153,6 +153,9 @@ def test_parse_proxy_requires_explicit_port():
 # ---------------- API session seeding ----------------
 
 class FakeContext:
+    def route(self, pattern, handler):
+        self.navigation_guard = handler
+
     def __init__(self):
         self.cookies = []
         self.init_scripts = []
@@ -231,16 +234,17 @@ def test_seed_session_applies_enrolled_storage_state():
     assert ctx2.cookies == state["cookies"]
 
 
-def test_seed_session_falls_back_when_absent_or_unreachable():
+def test_seed_session_absent_is_allowed_but_unreachable_fails_closed():
     # nothing enrolled → no seeding, no error
     ctx = FakeContext()
     _manager(FakeClient({"storage_state": None,
                          "credentials_present": False}))._seed_session(ctx, "guru", 1)
     assert ctx.cookies == [] and ctx.init_scripts == []
 
-    # backend unreachable → fall back to the local profile, never raise
+    # Backend refusal/unavailability must never reactivate local credentials.
     ctx2 = FakeContext()
-    _manager(FakeClient(raises=True))._seed_session(ctx2, "guru", 1)
+    with pytest.raises(RuntimeError, match="backend down"):
+        _manager(FakeClient(raises=True))._seed_session(ctx2, "guru", 1)
     assert ctx2.cookies == [] and ctx2.init_scripts == []
 
     # no client at all (e.g. worker.login) → no-op

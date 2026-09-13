@@ -9,12 +9,15 @@ import type { ProposalQueueItem } from '../types';
 
 interface StoredDraft<E> {
   edits: E;
-  base: string; // server text the edit started from — stale drafts never restore
+  revision: number;
+  base: string; // server text the edit started from
 }
 
 const readStore = <E,>(key: string): Record<string, StoredDraft<E>> => {
   try {
-    return JSON.parse(sessionStorage.getItem(key) ?? '{}') as Record<string, StoredDraft<E>>;
+    const value: unknown = JSON.parse(sessionStorage.getItem(key) ?? '{}');
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, StoredDraft<E>> : {};
   } catch {
     return {};
   }
@@ -29,13 +32,13 @@ const writeStore = <E,>(key: string, stored: Record<string, StoredDraft<E>>) => 
 };
 
 /**
- * Mirror `edits` to sessionStorage and restore matching drafts on load.
+ * Mirror `edits` to sessionStorage and restore drafts with their original revision.
  * Only dirty entries are persisted (isPristine decides), so approving or
  * rejecting an item — which resets its entry to pristine — clears the draft.
- * Restore happens only when the item's current server text still equals the
- * draft's base, so a newer server state is never clobbered.
+ * Stale pending-review drafts remain visible for comparison; callers must require
+ * an explicit conflict choice before approval. Restoring never updates the server.
  */
-export function useDrafts<E>(
+export function useDrafts<E extends { base_revision: number }>(
   userId: number | null | undefined,
   items: ProposalQueueItem[],
   edits: Record<number, E>,
@@ -52,7 +55,15 @@ export function useDrafts<E>(
       const item = items.find((p) => p.id === Number(idStr));
       if (!item) continue;
       if (isPristine(item, e)) delete stored[idStr];
-      else stored[idStr] = { edits: e, base: item.humanized_text || item.proposal_text };
+      else {
+        const previous = stored[idStr];
+        stored[idStr] = {
+          edits: e,
+          revision: e.base_revision,
+          base: previous?.revision === e.base_revision
+            ? previous.base : item.humanized_text || item.proposal_text,
+        };
+      }
     }
     writeStore(key, stored);
   }, [edits, items, key, isPristine]);
@@ -66,7 +77,7 @@ export function useDrafts<E>(
       for (const item of items) {
         const s = stored[item.id];
         if (!s || next[item.id]) continue;
-        if (item.proposal_text === s.base || item.humanized_text === s.base) {
+        if (item.status === "pending_review" && s.edits && typeof s.edits === "object" && Number.isInteger(s.revision) && s.revision >= 1 && s.edits.base_revision === s.revision) {
           // editsFrom defaults keep entries written by another view complete
           next[item.id] = { ...editsFrom(item), ...s.edits };
           changed = true;

@@ -1,6 +1,8 @@
+import {CircuitControls} from '../components/CircuitControls';
 import { useEffect, useRef, useState } from 'react';
 import {
   completeFreelancerOAuth,
+  request,
   createAccount,
   deleteAccount,
   deleteCredentials,
@@ -17,7 +19,7 @@ import { useReconnectRefetch, type SocketStatus } from '../hooks/useAlertsSocket
 import { ErrorBanner, formatDate, Modal } from '../components/common';
 
 // Token-based platforms enroll access_token (+ optional refresh_token);
-// stealth platforms enroll a Playwright storage_state JSON or username+password fallback.
+// Browser platforms enroll Playwright storage_state JSON.
 // Upwork is in BOTH sets (API tokens OR a browser session — the worker drives it via browser).
 const TOKEN_PLATFORMS: Platform[] = ['freelancer', 'upwork'];
 const STEALTH_PLATFORMS: Platform[] = ['fiverr', 'peopleperhour', 'guru', 'upwork'];
@@ -32,7 +34,7 @@ const apiMessage = (e: unknown): string => {
 const emptyPayload: PlatformAccountPayload = {
   platform: 'upwork',
   label: '',
-  principal: '',
+  principal: 'default',
   mode: 'api',
   enabled: true,
   credential_ref: '',
@@ -41,11 +43,12 @@ const emptyPayload: PlatformAccountPayload = {
 
 // Inline row warnings: these settings keys are required before proposals can be submitted
 function missingSettingsWarning(a: PlatformAccount): string | null {
+  if (a.platform === "indeed") return "manual import only; no connector";
   if (a.platform === 'freelancer' && typeof a.settings.bidder_id !== 'number') {
     return 'missing bidder_id';
   }
-  if (a.platform === 'upwork' && typeof a.settings.on_behalf_of !== 'string') {
-    return 'missing on_behalf_of';
+  if (a.platform === 'upwork' && (!a.settings.on_behalf_of || !a.settings.agency_id)) {
+    return 'missing agency or member UID';
   }
   return null;
 }
@@ -70,6 +73,7 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   // freelancer OAuth
+  const [oauthState, setOauthState] = useState('');
   const [oauthStarted, setOauthStarted] = useState(false);
   const [oauthCode, setOauthCode] = useState('');
 
@@ -179,10 +183,11 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
   const oauthStart = async () => {
     setBusy(true);
     try {
-      const { authorize_url } = await startFreelancerOAuth(account.id);
+      const { authorize_url, state } = await startFreelancerOAuth(account.id);
+      setOauthState(state);
       // the redirect comes back without account context (no state param) —
       // remember which account started the flow for the SPA callback handler
-      localStorage.setItem('gh_oauth_account', String(account.id));
+      localStorage.setItem(`gh_oauth_${state}`, String(account.id));
       window.open(authorize_url, '_blank', 'noopener');
       setOauthStarted(true);
       setError(null);
@@ -201,7 +206,7 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
     }
     setBusy(true);
     try {
-      await completeFreelancerOAuth(account.id, oauthCode.trim());
+      await completeFreelancerOAuth(account.id, oauthCode.trim(), oauthState);
       setOauthCode('');
       setOauthStarted(false);
       setError(null);
@@ -268,14 +273,7 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
                 />
                 Browser session (storage_state JSON)
               </label>
-              <label className="checkbox-row">
-                <input
-                  type="radio"
-                  checked={credForm === 'userpass'}
-                  onChange={() => setCredForm('userpass')}
-                />
-                Username + password
-              </label>
+
             </div>
           )}
           {showTokenForm ? (
@@ -344,14 +342,7 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
                 />
                 Browser session (storage_state JSON)
               </label>
-              <label className="checkbox-row">
-                <input
-                  type="radio"
-                  checked={credForm === 'userpass'}
-                  onChange={() => setCredForm('userpass')}
-                />
-                Username + password
-              </label>
+
             </div>
           )}
           {credForm === 'storage_state' ? (
@@ -417,6 +408,11 @@ function CredentialsPanel({ account, onChanged, onClose }: CredentialsPanelProps
 }
 
 export default function Accounts({ status: socketStatus }: { status: SocketStatus }) {
+  const [legacyRoster,setLegacyRoster] = useState<{username:string}[]>([]);
+  const [roster,setRoster] = useState<{username:string}[]>([]);
+  const pollingSerial = useRef(0);
+  const [replyPolling, setReplyPolling] = useState<{last_success_at?:string;last_complete_scan_at?:string;last_error?:string;offset?:number} | null>(null);
+  const [rosterName,setRosterName] = useState('');
   const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
   const [draft, setDraft] = useState<PlatformAccountPayload>(emptyPayload);
   const [draftId, setDraftId] = useState<number | null>(null);
@@ -440,6 +436,22 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
   };
 
   useEffect(reloadAccounts, []);
+  const rosterSerial = useRef(0);
+  const loadRoster = () => {
+    const serial = ++rosterSerial.current;
+    if (draftId === null || draft.platform !== 'upwork') { setRoster([]); return Promise.resolve(); }
+    return Promise.all([request<{members:{username:string}[]}>(`/api/adapters/upwork/agency/members?account_id=${draftId}`),request<{members:{username:string}[]}>('/api/adapters/upwork/agency/legacy-roster')])
+      .then(([r,legacy]) => { if (serial === rosterSerial.current) { setRoster(r.members); setLegacyRoster(legacy.members); } })
+      .catch((e: Error) => { if (serial === rosterSerial.current) setError(e.message); });
+  };
+  useEffect(() => { setRoster([]); setLegacyRoster([]); void loadRoster(); }, [draftId, draft.platform]);
+  useEffect(() => { ++pollingSerial.current; setReplyPolling(null); }, [draftId]);
+  const loadReplyPolling = () => {
+    const serial=++pollingSerial.current;
+    return request<{reply_polling:NonNullable<typeof replyPolling>}>(`/api/adapters/freelancer/sync-status?account_id=${draftId}`)
+      .then(r=>{if(serial===pollingSerial.current)setReplyPolling(r.reply_polling);})
+      .catch((e:Error)=>{if(serial===pollingSerial.current)setError(e.message);});
+  };
 
   // reconnect = events were missed while the socket was down — reload once
   useReconnectRefetch(socketStatus, reloadAccounts);
@@ -447,6 +459,7 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
   const selectAccount = (a: PlatformAccount) => {
     const { id, created_at: _created, ...rest } = a;
     setDraft({ ...emptyPayload, ...rest });
+    setReplyPolling(null);
     setDraftId(id);
     setShowForm(true);
   };
@@ -509,6 +522,7 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
   return (
     <div>
       <h1>Platform Accounts</h1>
+      <CircuitControls/>
       <p className="page-sub">
         Marketplace identities the orchestrator acts through. Enroll secrets via the Credentials
         panel — they go straight to the vault; <code>credential_ref</code> only points at the vault
@@ -576,6 +590,7 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
                     <td>
                       <button
                         className="btn secondary small"
+                        disabled={a.platform === "indeed"}
                         onClick={(e) => {
                           e.stopPropagation();
                           setCredAccountId((prev) => (prev === a.id ? null : a.id));
@@ -617,7 +632,7 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
                 disabled={draftId != null} // platform is identity — set at creation only
                 onChange={(e) => setDraft({ ...draft, platform: e.target.value as Platform })}
               >
-                {PLATFORMS.map((p) => (
+                {PLATFORMS.filter((p) => p !== "indeed" || (draftId !== null && draft.platform === "indeed")).map((p) => (
                   <option key={p} value={p}>
                     {p}
                   </option>
@@ -642,6 +657,7 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
               <label>Principal</label>
               <input
                 type="text"
+                disabled={draftId !== null}
                 value={draft.principal}
                 placeholder="e.g. agency name or account owner"
                 onChange={(e) => setDraft({ ...draft, principal: e.target.value })}
@@ -682,6 +698,22 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
               </label>
             </div>
           </div>
+          {draft.platform === 'freelancer' && draftId !== null && <div className="panel">
+            <h3>Reply polling</h3>
+            <button type="button" className="btn secondary" onClick={loadReplyPolling}>Refresh polling status</button>
+            {replyPolling && <><p>Last successful check: {replyPolling.last_success_at ? new Date(replyPolling.last_success_at).toLocaleString() : 'Not polled yet'}</p>
+              <p>Last complete scan: {replyPolling.last_complete_scan_at ? new Date(replyPolling.last_complete_scan_at).toLocaleString() : 'Not completed yet'}</p>{(replyPolling.offset ?? 0) > 0 && <p>The scan continues on the next scheduled check.</p>}
+              {replyPolling.last_error && <p role="alert">{replyPolling.last_error}</p>}</>}
+            <p className="muted">A reply alert requires a known client ID, matching project and a valid message after submission. Unknown senders are left for manual review on the platform.</p>
+          </div>}
+          {draft.platform === 'fiverr' && <div className="field"><label htmlFor="seller-username">Fiverr seller username</label><input id="seller-username" value={String(draft.settings.username??'')} onChange={e=>patchSettings('username',e.target.value.trim())}/><span className="muted">Used for the seller dashboard read workflow.</span></div>}
+          {draft.platform === 'upwork' && draftId !== null && legacyRoster.length > 0 && <div className="panel">
+            <h3>Unassigned legacy roster</h3>
+            <p>These local records predate account-specific rosters. Review which account they belong to before assigning them.</p>
+            <ul>{legacyRoster.map(m=><li key={m.username}>{m.username}</li>)}</ul>
+            <button type="button" className="btn secondary" onClick={()=>request(`/api/adapters/upwork/agency/legacy-roster/assign?account_id=${draftId}`,{method:'POST'}).then(loadRoster).catch((e:Error)=>setError(e.message))}>Assign reviewed legacy roster to this account</button>
+          </div>}
+          {draft.platform === 'upwork' && draftId !== null && <div className="panel"><h3>Local agency roster</h3><p>Record members after completing their real agency enrollment on Upwork. This list does not invite anyone or verify platform membership.</p><ul>{roster.map(m=><li key={m.username}>{m.username} <button className="btn secondary small" onClick={()=>request(`/api/adapters/upwork/agency/members/${encodeURIComponent(m.username)}?account_id=${draftId}`,{method:'DELETE'}).then(loadRoster).catch(e=>setError(e.message))}>Remove locally</button></li>)}</ul><label htmlFor="roster-username">Member username / UID</label><input id="roster-username" value={rosterName} onChange={e=>setRosterName(e.target.value)}/><button className="btn secondary" disabled={!rosterName.trim()} onClick={()=>request(`/api/adapters/upwork/agency/members?account_id=${draftId}`,{method:'POST',body:JSON.stringify({username:rosterName.trim()})}).then(()=>{setRosterName('');return loadRoster();}).catch(e=>setError(e.message))}>Add to local roster</button></div>}
           {(draft.platform === 'freelancer' || draft.platform === 'upwork') && (
             <>
               <div className="form-row" style={{ marginBottom: 0 }}>
@@ -703,6 +735,12 @@ export default function Accounts({ status: socketStatus }: { status: SocketStatu
                     />
                   </div>
                 )}
+                {draft.platform === 'upwork' && draftId !== null && <div className="field" style={{ flex: 1, marginBottom: 0 }}>
+                  <label htmlFor="upwork-agency-id">Agency UID</label>
+                  <input id="upwork-agency-id" value={String(draft.settings.agency_id ?? '')}
+                    onChange={e => patchSettings('agency_id', e.target.value.trim())}
+                    placeholder="Reviewed Upwork agency identity" />
+                </div>}
                 {draft.platform === 'upwork' && (
                   <div className="field" style={{ flex: 1, marginBottom: 0 }}>
                     <label>On behalf of</label>

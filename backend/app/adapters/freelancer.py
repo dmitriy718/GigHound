@@ -14,7 +14,9 @@ Obtain the initial tokens via the authorization-code flow (see
 `build_authorize_url` / `exchange_code`).
 """
 import logging
-from datetime import datetime, timezone
+import os
+import secrets
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import httpx
@@ -30,7 +32,8 @@ log = logging.getLogger(__name__)
 
 API_BASE = "https://www.freelancer.com/api"
 SANDBOX_BASE = "https://www.freelancer-sandbox.com/api"
-AUTHORIZE_URL = "https://accounts.freelancer.com/oauth/authorise"
+AUTHORIZE_URL = "https://accounts.freelancer.com/oauth/authorize"
+TOKEN_URL = "https://accounts.freelancer.com/oauth/token"
 
 _JOB_TYPE_MAP = {"fixed": "fixed", "hourly": "hourly"}
 _EXP_MAP = {1: "entry", 2: "intermediate", 3: "expert"}
@@ -41,12 +44,19 @@ class FreelancerAdapter(PlatformAdapter):
     rate_per_sec = 2.0  # conservative; Freelancer does not publish exact limits
 
     def __init__(self, db: Session, user_id: int, client: httpx.AsyncClient | None = None,
-                 sandbox: bool = False, monthly_bid_quota: int = 50):
-        super().__init__(client, principal=f"user{user_id}:default")
+                 sandbox: bool = False, monthly_bid_quota: int | None = None, principal: str | None = None):
+        if principal is None:
+            from .accounts import default_principal
+            principal = default_principal(db, user_id, self.platform, "default")
+        super().__init__(client, principal=f"user{user_id}:{principal}")
+        self.credential_principal = principal
         self.base = SANDBOX_BASE if sandbox else API_BASE
         self.vault = CredentialVault(db, user_id)
         self.state = StateStore(db, user_id)
-        self.monthly_bid_quota = monthly_bid_quota
+        self.monthly_bid_quota = (int(os.getenv("GIGHOUND_MONTHLY_BID_CAP_FREELANCER", "50"))
+                                  if monthly_bid_quota is None else monthly_bid_quota)
+        if self.monthly_bid_quota < 0:
+            raise ValueError("monthly Freelancer bid cap must be nonnegative")
 
     # ---------------- OAuth 2.0 ----------------
 
@@ -63,7 +73,8 @@ class FreelancerAdapter(PlatformAdapter):
 
     async def exchange_code(self, client_id: str, client_secret: str,
                             code: str, redirect_uri: str) -> dict:
-        resp = await self._request("POST", f"{self.base}/oauth/token", data={
+        self.vault.observe(self.platform, self.credential_principal)
+        resp = await self._request("POST", TOKEN_URL, data={
             "grant_type": "authorization_code",
             "client_id": client_id,
             "client_secret": client_secret,
@@ -84,20 +95,25 @@ class FreelancerAdapter(PlatformAdapter):
                 datetime.now(timezone.utc).timestamp() + expires_in - 60, timezone.utc
             ).isoformat(),
         }
-        self.vault.store(self.platform, "default", tokens)
+        self.vault.store(self.platform, self.credential_principal, tokens)
         return tokens
 
     async def _access_token(self) -> str:
-        creds = self.vault.load(self.platform, "default")
+        creds = self.vault.load(self.platform, self.credential_principal)
         if not creds:
             raise AdapterAuthError("freelancer: no credentials in vault")
+        if not creds.get("expires_at"):
+            # A manually enrolled static access token can be used without invented expiry metadata.
+            return creds["access_token"]
         expires_at = datetime.fromisoformat(creds["expires_at"])
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at > datetime.now(timezone.utc):
             return creds["access_token"]
         # refresh
-        resp = await self._request("POST", f"{self.base}/oauth/token", data={
+        if not all(creds.get(k) for k in ("refresh_token", "client_id", "client_secret")):
+            raise AdapterAuthError("freelancer: expired token needs refresh metadata or reenrollment")
+        resp = await self._request("POST", TOKEN_URL, data={
             "grant_type": "refresh_token",
             "client_id": creds["client_id"],
             "client_secret": creds["client_secret"],
@@ -111,7 +127,7 @@ class FreelancerAdapter(PlatformAdapter):
         token = await self._access_token()
         resp = await self._request(
             method, f"{self.base}{path}",
-            headers={"Authorization": f"Bearer {token}"}, **kwargs
+            headers={"Freelancer-OAuth-V1": token}, **kwargs
         )
         payload = resp.json()
         if payload.get("status") == "error":
@@ -146,19 +162,45 @@ class FreelancerAdapter(PlatformAdapter):
         return await self._api("GET", f"/users/0.1/users/{user_id}/")
 
     async def get_threads(self, limit: int = 50, offset: int = 0) -> list[dict]:
-        result = await self._api("GET", "/projects/0.1/threads/",
-                                 params={"limit": limit, "offset": offset})
+        result = await self._api("GET", "/messages/0.1/threads/",
+                                 params={"limit": limit, "offset": offset, "last_message": "true", "context_details": "true", "context_type": "project"})
         return result.get("threads", [])
 
     # ---------------- Bidding ----------------
 
     def _quota(self) -> dict:
+        from ..models import AuthTransaction
         month = datetime.now(timezone.utc).strftime("%Y-%m")
-        quota = self.state.get(self.platform, "bid_quota", {})
-        if quota.get("month") != month:
-            quota = {"month": month, "used": 0}
-            self.state.set(self.platform, "bid_quota", quota)
-        return quota
+        legacy = self.state.get(self.platform, "bid_quota", {})
+        # Legacy usage was not attributed to accounts. Conservatively retain
+        # it for this month instead of granting a fresh allowance on rollout.
+        baseline = int(legacy.get("used", 0)) if legacy.get("month") == month else 0
+        reserved = self.state.db.query(AuthTransaction).filter(
+            AuthTransaction.user_id == self.state.user_id,
+            AuthTransaction.kind == "monthly_bid_attempt",
+            AuthTransaction.payload["principal"].as_string() == self.credential_principal,
+            AuthTransaction.payload["month"].as_string() == month,
+        ).count()
+        return {"month": month, "used": baseline + reserved}
+
+    def _reserve_monthly_bid(self):
+        from ..models import AuthTransaction, User
+        db = self.state.db
+        owner = db.get(User, self.state.user_id)
+        if owner is None or not owner.is_active:
+            raise AdapterAuthError("account is no longer active")
+        db.refresh(owner, with_for_update=True)
+        quota = self._quota()
+        if quota["used"] >= self.monthly_bid_quota:
+            db.rollback()
+            raise QuotaDepletedError("monthly Freelancer write-attempt allowance exhausted")
+        now = datetime.now(timezone.utc)
+        next_month = (now.replace(day=28) + timedelta(days=4)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        db.add(AuthTransaction(id="monthlybid:" + secrets.token_hex(24), user_id=owner.id,
+                               kind="monthly_bid_attempt",
+                               payload={"principal": self.credential_principal, "month": quota["month"]},
+                               expires_at=next_month + timedelta(days=7)))
+        db.commit()  # reserve before the external action; uncertain attempts stay charged
 
     def bids_remaining(self) -> int:
         return max(0, self.monthly_bid_quota - self._quota()["used"])
@@ -176,6 +218,7 @@ class FreelancerAdapter(PlatformAdapter):
                 f"freelancer: monthly bid quota of {self.monthly_bid_quota} depleted; paused"
             )
         self._consume_daily_action()
+        self._reserve_monthly_bid()
         data: dict = {
             "project_id": project_id,
             "bidder_id": bidder_id,
@@ -186,13 +229,14 @@ class FreelancerAdapter(PlatformAdapter):
         if milestone_percentage is not None:
             data["milestone_percentage"] = milestone_percentage
         result = await self._api("POST", "/projects/0.1/bids/", data=data)
-        quota = self._quota()
-        quota["used"] += 1
-        self.state.set(self.platform, "bid_quota", quota)
         return result
 
     async def get_bid_status(self, bid_id: int) -> dict:
-        return await self._api("GET", f"/projects/0.1/bids/{bid_id}/")
+        result = await self._api("GET", "/projects/0.1/bids/", params={"bids[]":bid_id,"limit":1,"offset":0})
+        bids = result.get("bids",[])
+        if not isinstance(bids,list) or len(bids)!=1 or not isinstance(bids[0],dict) or str(bids[0].get("id"))!=str(bid_id):
+            raise AdapterAuthError("requested bid was not present in the provider response")
+        return bids[0]
 
     # ---------------- Normalization ----------------
 

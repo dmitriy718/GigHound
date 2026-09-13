@@ -78,12 +78,12 @@ def _job(db, user_id, platform="upwork", external_id="~abc123", **kw):
 
 
 def _item(db, user_id, job, status="submitted", outcome="pending",
-          reviewed_at=None, created_at=None, request_type="job",
+          submitted_at=None, reviewed_at=None, created_at=None, request_type="job",
           client_replied_at=None, submission_result=None, bid_advice=None):
     item = ProposalQueueItem(
         user_id=user_id, job_id=job.id, platform=job.platform,
         proposal_text="hi", status=status, outcome=outcome,
-        reviewed_at=reviewed_at, request_type=request_type,
+        reviewed_at=reviewed_at, submitted_at=submitted_at, request_type=request_type,
         client_replied_at=client_replied_at,
         submission_result=submission_result or {}, bid_advice=bid_advice)
     if created_at is not None:
@@ -100,7 +100,7 @@ def test_upwork_outcome_tick_enqueues_scrape_task(db, user, monkeypatch):
     monkeypatch.setattr("app.tasks.SessionLocal", sessionmaker(bind=db.bind))
 
     db.add(PlatformAccount(user_id=user.id, platform="upwork", label="uw",
-                           enabled=True))
+                           enabled=True, mode="hybrid"))
     db.commit()
     job = _job(db, user.id)
     open_item = _item(db, user.id, job, status="submitted")
@@ -133,7 +133,7 @@ def test_upwork_outcome_tick_circuit_open_not_counted(db, user, monkeypatch):
     monkeypatch.setattr("app.tasks.SessionLocal", sessionmaker(bind=db.bind))
 
     db.add(PlatformAccount(user_id=user.id, platform="upwork", label="uw",
-                           enabled=True))
+                           enabled=True, mode="hybrid"))
     db.commit()
     job = _job(db, user.id)
     _item(db, user.id, job, status="submitted")
@@ -153,7 +153,7 @@ def test_upwork_outcome_tick_skips_without_account_or_items(db, user, monkeypatc
 
     # enabled account but no open proposals → nothing to check
     db.add(PlatformAccount(user_id=user.id, platform="upwork", label="uw",
-                           enabled=True))
+                           enabled=True, mode="hybrid"))
     db.commit()
     assert upwork_outcome_user_core(user.id)["enqueued"] == 0
 
@@ -175,7 +175,7 @@ def test_platform_outcome_tick_covers_fiverr_pph_guru(db, user, monkeypatch):
 
     for platform in ("fiverr", "peopleperhour", "guru"):
         db.add(PlatformAccount(user_id=user.id, platform=platform,
-                               label=platform, enabled=True))
+                               label=platform, enabled=True, mode="hybrid"))
         job = _job(db, user.id, platform=platform,
                    external_id=f"{platform}-1")
         _item(db, user.id, job, status="submitted")
@@ -186,7 +186,7 @@ def test_platform_outcome_tick_covers_fiverr_pph_guru(db, user, monkeypatch):
         .update({"enabled": False})
     # freelancer is an API platform — never browser-scraped
     db.add(PlatformAccount(user_id=user.id, platform="freelancer",
-                           label="fl", enabled=True))
+                           label="fl", enabled=True, mode="hybrid"))
     fl_job = _job(db, user.id, platform="freelancer", external_id="fl-1")
     _item(db, user.id, fl_job, status="submitted")
     db.commit()
@@ -207,7 +207,10 @@ def test_platform_outcome_tick_covers_fiverr_pph_guru(db, user, monkeypatch):
 def _scrape_task(db, user_id, status="claimed", platform="upwork"):
     task = StealthTask(user_id=user_id, platform=platform,
                        task_type="scrape_proposal_status",
-                       payload={"items": []}, status=status)
+                       payload={"items": [{"proposal_queue_item_id": p.id} for p in
+                           db.query(ProposalQueueItem).filter_by(user_id=user_id, platform=platform).all()]},
+                       status=status, claimed_by="w-1", claim_token="test-claim",
+                       claimed_at=datetime.now(timezone.utc))
     db.add(task)
     db.commit()
     return task
@@ -250,7 +253,7 @@ def test_proposal_status_endpoint_maps_and_completes(client, monkeypatch):
          "has_unread_reply": False},
     ]
     r = c.post("/api/gigs/proposal-status",
-               json={"task_id": task.id, "results": results},
+               json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": task.id, "results": results},
                headers=WORKER_HEADERS)
     assert r.status_code == 200, r.text
     body = r.json()
@@ -282,10 +285,9 @@ def test_proposal_status_endpoint_maps_and_completes(client, monkeypatch):
 
     # idempotent repost: nothing re-applied, no duplicate broadcast/wins
     r = c.post("/api/gigs/proposal-status",
-               json={"task_id": task.id, "results": results},
+               json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": task.id, "results": results},
                headers=WORKER_HEADERS)
-    assert r.status_code == 200
-    assert r.json()["outcomes"] == 0 and r.json()["replies"] == 0
+    assert r.status_code == 409
     db.refresh(tpl)
     assert tpl.wins == 1
     assert len(sent) == 1
@@ -321,16 +323,14 @@ def test_proposal_status_applies_for_new_browser_platforms(client, monkeypatch):
          "has_unread_reply": False},
         {"proposal_queue_item_id": reply_item.id, "platform_status": "pending",
          "has_unread_reply": True},
-        {"proposal_queue_item_id": foreign.id, "platform_status": "hired",
-         "has_unread_reply": True},
     ]
     r = c.post("/api/gigs/proposal-status",
-               json={"task_id": task.id, "results": results},
+               json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": task.id, "results": results},
                headers=WORKER_HEADERS)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["outcomes"] == 1 and body["replies"] == 1
-    assert body["skipped"] == 1  # cross-tenant row rejected
+    assert body["skipped"] == 0
     db.refresh(hired_item)
     db.refresh(reply_item)
     db.refresh(foreign)
@@ -341,9 +341,9 @@ def test_proposal_status_applies_for_new_browser_platforms(client, monkeypatch):
 
     # idempotent repost
     r = c.post("/api/gigs/proposal-status",
-               json={"task_id": task.id, "results": results},
+               json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": task.id, "results": results},
                headers=WORKER_HEADERS)
-    assert r.json()["outcomes"] == 0 and r.json()["replies"] == 0
+    assert r.status_code == 409
     assert len(sent) == 1
 
 
@@ -361,47 +361,46 @@ def test_proposal_status_endpoint_guards(client):
 
     # auth: no token / user JWT → 401
     assert c.post("/api/gigs/proposal-status",
-                  json={"task_id": task.id, "results": []}).status_code == 401
+                  json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": task.id, "results": []}).status_code == 401
     user_headers = {"Authorization": f"Bearer {create_access_token(u)}"}
     assert c.post("/api/gigs/proposal-status",
-                  json={"task_id": task.id, "results": []},
+                  json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": task.id, "results": []},
                   headers=user_headers).status_code == 401
 
     # validation + lookup
-    assert c.post("/api/gigs/proposal-status", json={"task_id": task.id},
+    assert c.post("/api/gigs/proposal-status", json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": task.id},
                   headers=WORKER_HEADERS).status_code == 422
     assert c.post("/api/gigs/proposal-status",
-                  json={"task_id": 99999, "results": []},
+                  json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": 99999, "results": []},
                   headers=WORKER_HEADERS).status_code == 404
     wrong_kind = StealthTask(user_id=u.id, platform="upwork",
                              task_type="submit_upwork_proposal", payload={})
     db.add(wrong_kind)
     db.commit()
     assert c.post("/api/gigs/proposal-status",
-                  json={"task_id": wrong_kind.id, "results": []},
+                  json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": wrong_kind.id, "results": []},
                   headers=WORKER_HEADERS).status_code == 404
 
     # a scrape task the worker has not claimed yet is not open for results
     pending = _scrape_task(db, u.id, status="pending")
     r = c.post("/api/gigs/proposal-status",
-               json={"task_id": pending.id, "results": []},
+               json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": pending.id, "results": []},
                headers=WORKER_HEADERS)
     assert r.status_code == 409
     db.refresh(pending)
     assert pending.status == "pending"
 
-    # cross-tenant results and unknown statuses are skipped, not applied
+    # A result outside the claimed task rejects the entire batch.
     item = _item(db, u.id, job)
     r = c.post("/api/gigs/proposal-status",
-               json={"task_id": task.id, "results": [
+               json={"worker_id": "w-1", "claim_token": "test-claim", "task_id": task.id, "results": [
                    {"proposal_queue_item_id": foreign.id,
                     "platform_status": "hired", "has_unread_reply": True},
                    {"proposal_queue_item_id": item.id,
                     "platform_status": "bogus", "has_unread_reply": False},
                ]},
                headers=WORKER_HEADERS)
-    assert r.status_code == 200
-    assert r.json()["skipped"] == 2
+    assert r.status_code == 422
     db.refresh(foreign)
     assert foreign.outcome == "pending" and foreign.client_replied_at is None
 
@@ -420,20 +419,20 @@ def test_follow_up_due_gating(db, user, monkeypatch):
 
     job = _job(db, user.id)
     old = NOW - timedelta(days=6)
-    eligible = _item(db, user.id, job, reviewed_at=old)
+    eligible = _item(db, user.id, job, submitted_at=old)
     # one live generated proposal per job (partial unique index) — each
     # gating case parks on its own job
     _item(db, user.id, _job(db, user.id, external_id="~fu1"),
-          reviewed_at=NOW - timedelta(days=2))  # too recent
+          submitted_at=NOW - timedelta(days=2))  # too recent
     _item(db, user.id, _job(db, user.id, external_id="~fu2"),
           status="queued_for_browser",
-          reviewed_at=old)  # not confirmed submitted yet
+          submitted_at=old)  # not confirmed submitted yet
     _item(db, user.id, _job(db, user.id, external_id="~fu3"),
-          outcome="hired", reviewed_at=old)  # terminal
-    _item(db, user.id, _job(db, user.id, external_id="~fu4"), reviewed_at=old,
+          outcome="hired", submitted_at=old)  # terminal
+    _item(db, user.id, _job(db, user.id, external_id="~fu4"), submitted_at=old,
           client_replied_at=NOW)  # client already replied
     has_child = _item(db, user.id, _job(db, user.id, external_id="~fu5"),
-                      reviewed_at=old)
+                      submitted_at=old)
     _item(db, user.id, job, status="rejected", request_type="follow_up",
           submission_result={"parent_proposal_id": has_child.id})
 
@@ -474,7 +473,7 @@ def test_follow_up_due_cap_per_run(db, user, monkeypatch):
     old = NOW - timedelta(days=6)
     for i in range(FOLLOW_UP_CAP_PER_RUN + 2):
         job = _job(db, user.id, external_id=f"~cap{i}")
-        _item(db, user.id, job, reviewed_at=old)
+        _item(db, user.id, job, submitted_at=old)
 
     result = follow_up_due_user_core(user.id)
     assert len(result["queued"]) == FOLLOW_UP_CAP_PER_RUN
@@ -491,22 +490,22 @@ def test_analytics_trend(client):
     db.commit()
     job = _job(db, u.id, platform="freelancer")
 
-    replied = _item(db, u.id, job, reviewed_at=NOW, client_replied_at=NOW)
+    replied = _item(db, u.id, job, submitted_at=NOW, client_replied_at=NOW)
     # one live generated proposal per job (partial unique index)
     hired = _item(db, u.id, _job(db, u.id, platform="freelancer",
-                                 external_id="~tr1"), reviewed_at=NOW)
+                                 external_id="~tr1"), submitted_at=NOW)
     from app.templates import record_outcome
     record_outcome(db, hired, "hired")  # stamps outcome_recorded_at
     two_weeks_ago = NOW - timedelta(days=14)
     _item(db, u.id, _job(db, u.id, platform="freelancer", external_id="~tr2"),
-          reviewed_at=two_weeks_ago)
+          submitted_at=two_weeks_ago)
     # another tenant's data must not leak in
     v = User(email="trend2@example.com",
              password_hash=hash_password("password123"))
     db.add(v)
     db.commit()
     _item(db, v.id, _job(db, v.id, platform="freelancer", external_id="99"),
-          reviewed_at=NOW, client_replied_at=NOW)
+          submitted_at=NOW, client_replied_at=NOW)
 
     headers = {"Authorization": f"Bearer {create_access_token(u)}"}
     r = c.get("/api/analytics/trend?weeks=8", headers=headers)
@@ -603,7 +602,8 @@ def test_buyer_request_tick_skips_accountless_and_stacks_nothing(db, user, monke
     assert len(result["enqueued"]) == 1
     task = db.get(StealthTask, result["enqueued"][0])
     assert task.task_type == "fetch_buyer_requests"
-    assert task.payload == {"username": "seller1"}
+    assert task.payload["username"] == "seller1"
+    assert task.payload["account_id"] > 0
 
     # a pending fetch already in flight → no duplicate stacking
     assert fiverr_buyer_request_tick_core() == {"enqueued": []}
@@ -631,10 +631,10 @@ def test_buyer_request_tick_isolates_failing_user(db, user, monkeypatch):
 
     real = tasks_mod.enqueue_buyer_request_fetch
 
-    def flaky(db_, user_id):
+    def flaky(db_, user_id, **kwargs):
         if user_id == user.id:
             raise RuntimeError("boom")
-        return real(db_, user_id)
+        return real(db_, user_id, **kwargs)
 
     monkeypatch.setattr("app.tasks.enqueue_buyer_request_fetch", flaky)
     result = tasks_mod.fiverr_buyer_request_tick_core()
