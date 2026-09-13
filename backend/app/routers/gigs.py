@@ -436,6 +436,9 @@ def _require_browser_account(db: Session, task: StealthTask):
     accounts = q.limit(2).all()
     if owner is None or not owner.is_active or len(accounts) != 1:
         raise HTTPException(409, "bound account is missing, disabled, or ambiguous")
+    epoch = (task.payload or {}).get("account_epoch")
+    if epoch is not None and epoch != accounts[0].identity_epoch:
+        raise HTTPException(409, "task belongs to a previous account identity; create new work for the current account")
     return accounts[0]
 
 

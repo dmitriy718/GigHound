@@ -286,3 +286,44 @@ async def test_linkedin_missing_key_raises(db, monkeypatch):
     adapter = LinkedInJobsAdapter(db, provider="theirstack", client=_mock_client(lambda r: httpx.Response(200)))
     with pytest.raises(AdapterAuthError, match="missing API key"):
         await adapter.search_jobs("python")
+
+
+@pytest.mark.asyncio
+async def test_refresh_without_rotation_preserves_next_refresh(db, user):
+    _seed_freelancer_creds(db, user.id, expired=True)
+    requests = []
+    def handler(request):
+        requests.append(request)
+        assert 'refresh_token=REFRESH' in request.content.decode()
+        return httpx.Response(200, json={'access_token': 'NEW_ACCESS', 'expires_in': 30})
+    adapter = FreelancerAdapter(db, user.id, client=_mock_client(handler))
+    try:
+        assert await adapter._access_token() == 'NEW_ACCESS'
+        saved = CredentialVault(db, user.id).load('freelancer', 'default')
+        assert saved['refresh_token'] == 'REFRESH'
+        assert datetime.fromisoformat(saved['expires_at']) > datetime.now(timezone.utc)
+        assert await adapter._access_token() == 'NEW_ACCESS'
+        assert len(requests) == 1  # Short-lived token is not already expired by skew.
+        saved['expires_at'] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        CredentialVault(db, user.id).store('freelancer', 'default', saved)
+        assert await adapter._access_token() == 'NEW_ACCESS'
+        assert len(requests) == 2
+    finally:
+        await adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', [[], {}, {'access_token': ''}, {'access_token': 42},
+    {'access_token':'valid', 'refresh_token':None}, {'access_token':'valid', 'expires_in':True},
+    {'access_token':'valid', 'expires_in':-1}, {'access_token':'valid', 'expires_in':'forever'},
+    {'access_token':'valid', 'expires_in':10**30}])
+async def test_malformed_refresh_does_not_overwrite_credentials(db, user, payload):
+    _seed_freelancer_creds(db, user.id, expired=True)
+    before = CredentialVault(db, user.id).load('freelancer', 'default')
+    adapter = FreelancerAdapter(db, user.id, client=_mock_client(lambda request: httpx.Response(200,json=payload)))
+    try:
+        with pytest.raises(AdapterAuthError):
+            await adapter._access_token()
+        assert CredentialVault(db, user.id).load('freelancer', 'default') == before
+    finally:
+        await adapter.close()

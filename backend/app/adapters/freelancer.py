@@ -84,16 +84,38 @@ class FreelancerAdapter(PlatformAdapter):
         tokens = self._persist_tokens(resp.json(), client_id, client_secret)
         return tokens
 
-    def _persist_tokens(self, payload: dict, client_id: str, client_secret: str) -> dict:
-        expires_in = int(payload.get("expires_in", 3600))
+    def _persist_tokens(self, payload: dict, client_id: str, client_secret: str,
+                        *, previous_refresh_token: str | None = None) -> dict:
+        # RFC 6749 §6 permits omitting a replacement refresh token. Preserve
+        # the one used for this exchange, without weakening the vault's CAS.
+        if not isinstance(payload, dict):
+            raise AdapterAuthError("freelancer: invalid token response")
+        access_token = payload.get("access_token")
+        refresh_token = payload.get("refresh_token", previous_refresh_token)
+        def valid_token(value):
+            return isinstance(value, str) and bool(value.strip()) and not any(ord(c) < 32 or ord(c) == 127 for c in value)
+        if not valid_token(access_token) or (
+            ("refresh_token" in payload or refresh_token is not None) and not valid_token(refresh_token)
+        ):
+            raise AdapterAuthError("freelancer: invalid token response")
+        expiry = payload.get("expires_in", 3600)
+        if isinstance(expiry, bool) or not isinstance(expiry, (int, str)):
+            raise AdapterAuthError("freelancer: invalid token expiry")
+        try:
+            expires_in = int(expiry)
+            if expires_in <= 0:
+                raise ValueError("nonpositive expiry")
+            expires_at = datetime.fromtimestamp(
+                datetime.now(timezone.utc).timestamp() + expires_in - min(60, expires_in / 10), timezone.utc
+            ).isoformat()
+        except (ValueError, OverflowError, OSError) as exc:
+            raise AdapterAuthError("freelancer: invalid token expiry") from exc
         tokens = {
             "client_id": client_id,
             "client_secret": client_secret,
-            "access_token": payload["access_token"],
-            "refresh_token": payload.get("refresh_token"),
-            "expires_at": datetime.fromtimestamp(
-                datetime.now(timezone.utc).timestamp() + expires_in - 60, timezone.utc
-            ).isoformat(),
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at,
         }
         self.vault.store(self.platform, self.credential_principal, tokens)
         return tokens
@@ -119,7 +141,8 @@ class FreelancerAdapter(PlatformAdapter):
             "client_secret": creds["client_secret"],
             "refresh_token": creds["refresh_token"],
         })
-        refreshed = self._persist_tokens(resp.json(), creds["client_id"], creds["client_secret"])
+        refreshed = self._persist_tokens(resp.json(), creds["client_id"], creds["client_secret"],
+                                         previous_refresh_token=creds["refresh_token"])
         log.info("freelancer: access token refreshed")
         return refreshed["access_token"]
 
