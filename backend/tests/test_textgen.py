@@ -275,3 +275,16 @@ async def test_reasoning_only_response_eventually_raises(monkeypatch):
                         lambda **kw: real_client(transport=_mock_transport(handler), **kw))
     with pytest.raises(LLMUnavailable, match="reasoning tokens"):
         await generateText("s", "u")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', [None, {'choices': []}, {'choices': [{'message': {'content': 123}}]}, {'choices': [{'message': {'content': '   '}}]}])
+async def test_malformed_or_empty_completion_is_unavailable(monkeypatch, payload):
+    real_client = httpx.AsyncClient
+    def handler(request):
+        if payload is None:
+            return httpx.Response(200, text='invalid JSON')
+        return httpx.Response(200, json=payload)
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    with pytest.raises(LLMUnavailable):
+        await generateText('system', 'job-specific context')

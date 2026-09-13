@@ -168,10 +168,13 @@ def test_digest_sent_count_reflects_actual_send(db, user, monkeypatch):
     db.commit()
 
     # SMTP not configured → send_digest_email False → nothing was "sent"
-    monkeypatch.setattr("app.digest.send_digest_email", lambda jobs, mode: False)
+    monkeypatch.setattr("app.digest.send_digest_email", lambda jobs, mode, **kwargs: False)
     assert send_user_digest(db, user.id) == 0
+    import json
+    monkeypatch.setenv("SMTP_HOST", "fake.example.test")
+    monkeypatch.setenv("GIGHOUND_VERIFIED_DIGEST_RECIPIENTS", json.dumps({str(user.id): user.email}))
     # actually emailed → the job count is reported
-    monkeypatch.setattr("app.digest.send_digest_email", lambda jobs, mode: True)
+    monkeypatch.setattr("app.digest.send_digest_email", lambda jobs, mode, **kwargs: True)
     assert send_user_digest(db, user.id) == 1
 
 
@@ -258,10 +261,11 @@ def test_circuit_breaker_degrades_to_local_when_redis_dies(monkeypatch):
 
 
 def test_daily_action_budget_noops_when_redis_dies(monkeypatch):
-    from app.adapters.ratelimit import consume_daily_action
+    from app.adapters.ratelimit import consume_daily_action, DailyBudgetExceeded
     monkeypatch.setenv("GIGHOUND_DAILY_CAP_UPWORK", "5")
     monkeypatch.setattr("app.adapters.ratelimit.cache._r", _DeadRedis())
-    assert consume_daily_action("upwork", "principal") == 0  # graceful no-op
+    with pytest.raises(DailyBudgetExceeded):
+        consume_daily_action("upwork", "principal")
 
 
 def test_llm_token_bucket_fails_open_when_redis_dies(monkeypatch):

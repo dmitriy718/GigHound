@@ -29,7 +29,8 @@ USD_RATES = {
 def to_usd(amount, currency):
     if amount is None:
         return None
-    return round(amount * USD_RATES.get((currency or "USD").upper(), 1.0), 2)
+    rate = USD_RATES.get((currency or "").upper())
+    return round(amount * rate, 2) if rate is not None else None
 
 
 # --- Complexity heuristics ---
@@ -250,7 +251,7 @@ def compute_quality_score(job, keywords=None, market_rate: float | None = None) 
     # explicit None checks: a legitimate budget_max of 0 must not fall
     # through to budget_min
     budget_ref = job.budget_max if job.budget_max is not None else job.budget_min
-    budget_usd = to_usd(budget_ref, job.currency)
+    budget_usd = None if job.job_type == "annual" else to_usd(budget_ref, job.currency)
     complexity = estimate_complexity(text)
     est_hours = estimate_hours(complexity, text)
     rate = market_rate or DEFAULT_MARKET_RATE

@@ -128,7 +128,8 @@ def test_daily_cap_parsing(monkeypatch):
     monkeypatch.setenv("GIGHOUND_DAILY_CAP_LINKEDIN", "0")
     assert daily_cap("linkedin") is None
     monkeypatch.setenv("GIGHOUND_DAILY_CAP_LINKEDIN", "junk")
-    assert daily_cap("linkedin") is None
+    with pytest.raises(DailyBudgetExceeded):
+        daily_cap("linkedin")
 
 
 def test_consume_daily_action_enforces_cap(monkeypatch):
@@ -153,4 +154,28 @@ def test_consume_daily_action_noop_without_cap_or_redis(monkeypatch):
     assert fake.store == {}
     monkeypatch.setenv("GIGHOUND_DAILY_CAP_LINKEDIN", "1")
     monkeypatch.setattr(ratelimit.cache, "_r", None)  # Redis down
-    assert consume_daily_action("linkedin", "user1:default") == 0  # graceful no-op
+    with pytest.raises(DailyBudgetExceeded):
+        consume_daily_action("linkedin", "user1:default")
+
+
+def test_distributed_slots_are_atomic_on_disposable_redis(monkeypatch):
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    from uuid import uuid4
+    import redis
+    from app.adapters.ratelimit import reserve_distributed_delay
+    url = os.environ.get('GIGHOUND_TEST_REDIS_URL')
+    if not url:
+        pytest.skip('requires an explicitly disposable Redis database')
+    broker = redis.Redis.from_url(url)
+    monkeypatch.setattr(ratelimit.cache, '_r', broker)
+    key = 'astra:pacing-proof:'+uuid4().hex
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            delays = list(pool.map(lambda _: reserve_distributed_delay(key, .2), range(6)))
+        values = sorted(delays)
+        assert values[0] == 0
+        assert values[-1] >= .9
+        assert all(b-a > .1 for a,b in zip(values,values[1:]))
+    finally:
+        broker.delete(key)

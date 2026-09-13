@@ -21,7 +21,7 @@ are learned over time.
   edit (with version history), bulk-approve, or reject with reasons that
   feed back into generation (`prompt_hints`). No auto-submit, ever.
 - **Submission with audit trail** — Freelancer bids via the API; Upwork via
-  the compliant Agency Plus hybrid path (audited handoff to the agency
+  the permission-dependent agency hybrid path (audited handoff to the agency
   manager's browser session). Every action writes an immutable audit row.
 - **Learning loop** — outcome/reply sync (Freelancer), template provenance
   and stats, win-rate funnel analytics (queued → approved → submitted →
@@ -161,3 +161,9 @@ for the full reference and run modes. Key variables:
 - [docs/platform-intelligence-report.md](docs/platform-intelligence-report.md) — platform risk research
 - [evolution/](evolution/README.md) — audits, architecture decisions
   (multi-tenancy, auth, stealth worker), and the phased plan of attack
+
+### Audited implementation and operations
+
+See [deployment, capabilities, backup and recovery](docs/operations.md) before enabling live channels. The [Astra audit and implementation records](astra/09052026_06.md) distinguish local tests from provider permissions and deployment checks. The Workbench provides evidence, scope/capacity, client, experiment and receipt workflows; Teams provides accepted memberships and versioned shared-draft review. These are first releases with explicit manual and observational boundaries.
+
+Review API clients must now send `expected_revision`; bulk approval sends `expected_revisions` keyed by proposal ID. Fetch the current proposal before reviewing. Credential rotation or a material account/job change invalidates a stored approval. A saved review draft retains its original revision and cannot silently approve a newer version.

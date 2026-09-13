@@ -8,8 +8,7 @@ instances built by routers and Celery tasks. The pacing interval is jittered
 Daily action budgets cap platform-touching actions (searches, submissions)
 per (platform, principal): a Redis counter `rl:{platform}:{principal}:{date}`
 compared against `GIGHOUND_DAILY_CAP_{PLATFORM}` (unset = unlimited). When
-Redis is down the budget check is a graceful no-op — pacing still applies
-via the shared limiter.
+Redis is down configured budgets fail closed; unconfigured budgets are unlimited.
 """
 import asyncio
 import logging
@@ -48,6 +47,7 @@ class AsyncRateLimiter:
         self._jitter = jitter
         self._max_concurrent = max_concurrent
         self._loops: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self.distributed_key: str | None = None
 
     def _state(self) -> dict:
         loop = asyncio.get_running_loop()
@@ -64,6 +64,15 @@ class AsyncRateLimiter:
     async def acquire(self):
         state = self._state()
         await state["sem"].acquire()
+        if self.distributed_key and os.getenv("GIGHOUND_DISTRIBUTED_PACING", "1") != "0":
+            try:
+                delay = reserve_distributed_delay(self.distributed_key, self._interval)
+                if delay:
+                    await asyncio.sleep(delay)
+                return
+            except BaseException:
+                state["sem"].release()
+                raise
         async with state["lock"]:
             now = asyncio.get_running_loop().time()
             wait = state["next_at"] - now
@@ -90,8 +99,34 @@ def get_limiter(platform: str, principal: str, rate_per_sec: float,
         limiter = _limiters.get(key)
         if limiter is None:
             limiter = AsyncRateLimiter(rate_per_sec, max_concurrent)
+            import hashlib
+            limiter.distributed_key = "pacing:" + hashlib.sha256(f"{platform}:{principal}".encode()).hexdigest()
             _limiters[key] = limiter
         return limiter
+
+
+_RESERVE_SLOT = """
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2])/1000)
+local slot = math.max(now, tonumber(redis.call('GET', KEYS[1]) or now))
+if slot - now > 5000 then return -1 end
+local following = slot + tonumber(ARGV[1])
+redis.call('SET', KEYS[1], following, 'PX', math.ceil(following-now+60000))
+return math.floor(slot-now)
+"""
+
+
+def reserve_distributed_delay(key: str, interval: float) -> float:
+    """Atomic Redis-clock request slots across API/Celery processes."""
+    if cache._r is None:
+        raise RateLimitExceeded("distributed platform pacing requires an available broker")
+    try:
+        delay = cache._r.eval(_RESERVE_SLOT, 1, key, max(1, int(interval * 1000)))
+    except redis.RedisError as exc:
+        raise RateLimitExceeded("distributed platform pacing cannot be verified") from exc
+    if delay < 0:
+        raise RateLimitExceeded("platform pacing queue exceeds five seconds; try later")
+    return delay / 1000
 
 
 # --- daily action budget (Phase 4.5) ---
@@ -104,20 +139,21 @@ def daily_cap(platform: str) -> int | None:
     try:
         cap = int(raw)
     except ValueError:
-        log.warning("invalid GIGHOUND_DAILY_CAP_%s=%r — ignoring", platform.upper(), raw)
-        return None
+        raise DailyBudgetExceeded("invalid daily budget configuration") from None
     return cap if cap > 0 else None
 
 
 def consume_daily_action(platform: str, principal: str) -> int:
     """Count one platform action against today's budget; return actions used.
 
-    Returns 0 (no-op) when no cap is configured or Redis is unavailable.
+    Returns 0 (no-op) only when no cap is configured.
     Raises DailyBudgetExceeded when the cap is already reached.
     """
     cap = daily_cap(platform)
-    if cap is None or cache._r is None:
+    if cap is None:
         return 0
+    if cache._r is None:
+        raise DailyBudgetExceeded("configured daily budget cannot be verified while Redis is unavailable")
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     key = f"rl:{platform}:{principal}:{today}"
     try:
@@ -125,10 +161,7 @@ def consume_daily_action(platform: str, principal: str) -> int:
         if used == 1:
             cache._r.expire(key, 48 * 3600)
     except redis.RedisError as exc:
-        # graceful no-op per module docstring: Redis down → no budget
-        # enforcement, pacing via the shared limiter still applies
-        log.warning("Redis unavailable (%s); daily budget check skipped", exc)
-        return 0
+        raise DailyBudgetExceeded("configured daily budget cannot be verified while Redis is unavailable") from exc
     if used > cap:
         raise DailyBudgetExceeded(
             f"{platform}: daily action budget of {cap} reached for '{principal}'; "
@@ -152,6 +185,12 @@ async def request_with_retry(
     Honors `Retry-After` when present. Raises the final httpx.HTTPStatusError
     if all attempts are exhausted.
     """
+    # A timeout or 5xx can arrive AFTER a write committed remotely. Only
+    # read-only methods may be replayed without a provider idempotency contract.
+    if method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+        max_attempts = 1
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
     delay = 1.0
     for attempt in range(1, max_attempts + 1):
         if limiter:

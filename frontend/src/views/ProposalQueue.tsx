@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   approveProposal,
+  getAccounts,
+  returnProposalToReview,
   bulkApproveProposals,
   followUpProposal,
   getInterviewPrep,
@@ -12,13 +14,14 @@ import {
   retryProposalGeneration,
   revertProposal,
   submitProposal,
+  reconcileProposalSubmission,
   suggestProposalTemplates,
 } from '../api/client';
 import type {
   BidAdvice,
   InterviewPrep,
-  Platform,
   PortfolioItem,
+  PlatformAccount,
   ProposalOutcome,
   ProposalQueueItem,
   ProposalStatus,
@@ -28,16 +31,22 @@ import type {
 } from '../types';
 import { PROPOSAL_STATUSES, REJECTION_REASONS } from '../types';
 import { useNewAlertMessages, useReconnectRefetch, type AlertMessage, type SocketStatus } from '../hooks/useAlertsSocket';
+import { DraftConflict } from '../components/DraftConflict';
+import ApplicationTone from '../components/ApplicationTone';
+import { request } from '../api/client';
 import { useDrafts } from '../hooks/useDrafts';
 import { ErrorBanner, ScoreBadge, formatDate, scoreClass } from '../components/common';
 
 interface Props {
+  jobId?: number;
   messages: AlertMessage[];
   status: SocketStatus;
   user?: User | null;
 }
 
 interface DraftEdits {
+  platform_account_id: string;
+  base_revision: number;
   proposal_text: string;
   bid_amount: string;
   bid_period_days: string;
@@ -66,14 +75,6 @@ const STATUS_LABELS: Partial<Record<ProposalStatus, string>> = {
   submitted_unverified: 'submitted — verify on platform',
 };
 
-// Platforms with an automated dispatch: upwork (browser-worker queue via the
-// submit endpoint) and freelancer (bid API). Fiverr buyer requests
-// auto-dispatch on approve; everything else is submitted by hand on the
-// platform and marked submitted here. The same goes for approved/failed
-// leftovers of a fiverr dispatch (no account enrolled, or the worker's
-// allow-submit gate left the final click to a human).
-const AUTOMATED_SUBMIT_PLATFORMS: Platform[] = ['upwork', 'freelancer'];
-
 const OUTCOME_COLORS: Record<ProposalOutcome, string> = {
   pending: 'var(--text-dim)',
   hired: 'var(--green)',
@@ -88,6 +89,8 @@ const BID_ADVICE_COLORS: Record<BidAdvice['recommendation'], string> = {
 };
 
 const editsFrom = (item: ProposalQueueItem): DraftEdits => ({
+  base_revision: item.revision,
+  platform_account_id: item.platform_account_id != null ? String(item.platform_account_id) : "",
   proposal_text: item.humanized_text || item.proposal_text,
   bid_amount: item.bid_amount != null ? String(item.bid_amount) : '',
   bid_period_days: item.bid_period_days != null ? String(item.bid_period_days) : '',
@@ -97,24 +100,34 @@ const editsFrom = (item: ProposalQueueItem): DraftEdits => ({
 const isPristine = (item: ProposalQueueItem, e: DraftEdits): boolean => {
   const base = editsFrom(item);
   return (
+    (e.platform_account_id ?? "") === base.platform_account_id &&
     e.proposal_text === base.proposal_text &&
     e.bid_amount === base.bid_amount &&
     e.bid_period_days === base.bid_period_days
   );
 };
 
+const strings = (value: unknown): string[] => Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+
 const truncate = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
 const PAGE_SIZE = 50;
 
-export default function ProposalQueue({ messages, status: socketStatus, user }: Props) {
+export default function ProposalQueue({ messages, status: socketStatus, user, jobId }: Props) {
+  const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const [toneBusy,setToneBusy] = useState(false);
+  const [rewriting,setRewriting] = useState<number|null>(null);
+  const [accountError, setAccountError] = useState<string | null>(null);
+  useEffect(() => { getAccounts().then(setAccounts).catch((e: Error) => setAccountError(e.message)); }, []);
   const [proposals, setProposals] = useState<ProposalQueueItem[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
   const [portfolio, setPortfolio] = useState<PortfolioItem[]>([]);
-  const [statusFilter, setStatusFilter] = useState<ProposalStatus | ''>('pending_review');
+  const [statusFilter, setStatusFilter] = useState<ProposalStatus | ''>(jobId ? '' : 'pending_review');
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [edits, setEdits] = useState<Record<number, DraftEdits>>({});
+  const editsRef = useRef(edits);
+  editsRef.current = edits;
   const [rejectDrafts, setRejectDrafts] = useState<Record<number, RejectDraft>>({});
   const [suggestions, setSuggestions] = useState<Record<number, Template[]>>({});
   // template the reviewer picked via "Start from template" — sent as template_id on approve
@@ -162,18 +175,22 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
     toastTimer.current = window.setTimeout(() => setToast(null), 8000);
   };
 
+  const loadSerial = useRef(0);
   const load = () => {
-    getProposals({ status: statusFilter || undefined, limit: PAGE_SIZE, offset })
+    const serial = ++loadSerial.current;
+    getProposals({ job_id:jobId, status: statusFilter || undefined, limit: PAGE_SIZE, offset })
       .then((page) => {
+        if (serial !== loadSerial.current) return;
         setProposals(page.items);
         setTotal(page.total);
         setSelected(new Set());
         setError(null);
       })
-      .catch((e: Error) => setError(e.message));
+      .catch((e: Error) => { if (serial === loadSerial.current) setError(e.message); });
   };
 
-  useEffect(load, [statusFilter, offset]);
+  useEffect(() => () => { loadSerial.current++; }, []);
+  useEffect(load, [statusFilter, offset, jobId]);
 
   // reconnect = events were missed while the socket was down — reload once
   useReconnectRefetch(socketStatus, load);
@@ -274,9 +291,15 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
   const approve = (item: ProposalQueueItem) => {
     if (!requireReviewer(item.id)) return;
     const draft = edits[item.id] ?? editsFrom(item);
+    if (draft.base_revision !== item.revision) {
+      setRowError((prev) => ({ ...prev, [item.id]: "This draft started from an older revision. Use the comparison in the expanded editor to resolve this draft before approving." }));
+      return;
+    }
     const chosen = chosenTemplates[item.id];
     void run(item.id, () =>
       approveProposal(item.id, {
+        expected_revision: draft.base_revision,
+        ...(draft.platform_account_id ? { platform_account_id: Number(draft.platform_account_id) } : {}),
         reviewer: reviewer.trim(),
         proposal_text: draft.proposal_text,
         ...(draft.bid_amount !== '' ? { bid_amount: Number(draft.bid_amount) } : {}),
@@ -306,6 +329,18 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
   // by-hand submission on platforms with no automated channel
   const markSubmitted = (item: ProposalQueueItem) => {
     void run(item.id, () => markProposalSubmitted(item.id));
+  };
+
+  const reconcile = (item: ProposalQueueItem, submitted: boolean) => {
+    const evidence = window.prompt(submitted
+      ? 'Check the platform first. Record the proposal link or other evidence confirming it was submitted:'
+      : 'Check the platform first. Describe how you confirmed no proposal was submitted. This returns it to human review:');
+    if (!evidence) return;
+    if (evidence.trim().length < 10) {
+      showToast('Please describe the platform check in at least 10 characters.');
+      return;
+    }
+    void run(item.id, () => reconcileProposalSubmission(item.id, submitted, evidence));
   };
 
   const markOutcome = (item: ProposalQueueItem, outcome: Exclude<ProposalOutcome, 'pending'>) => {
@@ -402,7 +437,7 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
       return;
     }
     setBulkBusy(true);
-    bulkApproveProposals([...selected], reviewer.trim())
+    bulkApproveProposals([...selected], reviewer.trim(), Object.fromEntries(proposals.filter(p => selected.has(p.id)).map(p => [p.id, p.revision])))
       .then((res) => {
         showToast(`Bulk approve: ${res.approved.length} approved, ${res.skipped.length} skipped`);
         clearDrafts(res.approved);
@@ -523,9 +558,10 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                   </div>
                   <div className="job-meta">
                     {item.platform} ·{' '}
-                    {item.bid_amount != null ? `bid $${item.bid_amount}` : 'no bid'} · drafted{' '}
+                    {item.bid_amount != null ? `bid ${item.approved_snapshot?.currency ?? item.job?.currency ?? "unknown currency"} ${item.bid_amount}` : 'no bid'} · drafted{' '}
                     {formatDate(item.created_at)}
                     {item.reviewed_by && ` · reviewed by ${item.reviewed_by}`}
+                    {item.status === 'approved' && <button className="btn secondary small" disabled={busyId === item.id} onClick={() => run(item.id, () => returnProposalToReview(item.id))}>Return to review</button>}
                   </div>
                 </div>
                 <span className="pill" style={{ color: STATUS_COLORS[item.status] }}>
@@ -661,17 +697,17 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                         {item.needs_review && (
                           <span className="chip flag">needs review</span>
                         )}
-                        {item.analysis.tone && (
+                        {typeof item.analysis.tone === 'string' && item.analysis.tone && (
                           <span className="muted" style={{ fontSize: 12 }}>
                             tone: {item.analysis.tone}
                           </span>
                         )}
                       </div>
-                      {(item.analysis.required_skills ?? []).length > 0 && (
+                      {strings(item.analysis.required_skills).length > 0 && (
                         <>
                           <div className="section-title">Required skills</div>
                           <div className="chips">
-                            {(item.analysis.required_skills ?? []).map((s) => (
+                            {strings(item.analysis.required_skills).map((s) => (
                               <span className="chip" key={s}>
                                 {s}
                               </span>
@@ -679,48 +715,52 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                           </div>
                         </>
                       )}
-                      {(item.analysis.strengths.length > 0 || item.analysis.gaps.length > 0) && (
+                      {(strings(item.analysis.strengths).length > 0 || strings(item.analysis.gaps).length > 0) && (
                         <>
                           <div className="section-title">Skill match</div>
                           <div className="chips">
-                            {item.analysis.strengths.map((s) => (
+                            {strings(item.analysis.strengths).map((s) => (
                               <span className="chip" key={s} style={{ color: 'var(--green)' }}>
                                 ✓ {s}
                               </span>
                             ))}
-                            {item.analysis.gaps.map((g) => (
+                            {strings(item.analysis.gaps).map((g) => (
                               <span className="chip flag" key={g}>
-                                {g} (not claimed)
+                                {g} (evidence missing)
                               </span>
                             ))}
                           </div>
+                          {strings(item.analysis.gaps).length > 0 && <p className="muted">
+                            Have you done work using these skills? Add a specific example in <a href="?view=profiles">your portfolio</a>,
+                            then regenerate the draft, or add the relevant facts while reviewing below.
+                          </p>}
                         </>
                       )}
-                      {item.analysis.client_pain_points.length > 0 && (
+                      {strings(item.analysis.client_pain_points).length > 0 && (
                         <>
                           <div className="section-title">Client pain points</div>
                           <ul className="muted" style={{ margin: '4px 0', paddingLeft: 18 }}>
-                            {item.analysis.client_pain_points.map((p) => (
+                            {strings(item.analysis.client_pain_points).map((p) => (
                               <li key={p}>{p}</li>
                             ))}
                           </ul>
                         </>
                       )}
-                      {item.analysis.missing_info.length > 0 && (
+                      {strings(item.analysis.missing_info).length > 0 && (
                         <>
                           <div className="section-title">Missing info</div>
                           <ul className="muted" style={{ margin: '4px 0', paddingLeft: 18 }}>
-                            {item.analysis.missing_info.map((m) => (
+                            {strings(item.analysis.missing_info).map((m) => (
                               <li key={m}>{m}</li>
                             ))}
                           </ul>
                         </>
                       )}
-                      {item.analysis.red_flags.length > 0 && (
+                      {strings(item.analysis.red_flags).length > 0 && (
                         <>
                           <div className="section-title">Red flags</div>
                           <div className="chips">
-                            {item.analysis.red_flags.map((f) => (
+                            {strings(item.analysis.red_flags).map((f) => (
                               <span className="chip flag" key={f}>
                                 {f}
                               </span>
@@ -776,6 +816,37 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                     </div>
                   )}
 
+                  {item.status === 'pending_review' && draft.base_revision !== item.revision &&
+                    <DraftConflict item={item}
+                      onDiscard={() => { clearDrafts([item.id]); setEdits(prev => ({ ...prev, [item.id]: editsFrom(item) })); setChosenTemplates(prev => { const next = { ...prev }; delete next[item.id]; return next; }); setRowError(prev => ({ ...prev, [item.id]: '' })); }}
+                      onKeep={() => { setEdits(prev => ({ ...prev, [item.id]: { ...draft, base_revision: item.revision } })); setRowError(prev => ({ ...prev, [item.id]: '' })); }} />}
+                  <ApplicationTone jobId={item.job_id} disabled={rewriting!==null} onBusy={setToneBusy}/>
+                  {item.status==='pending_review'&&<button className="btn secondary" disabled={toneBusy||rewriting!==null||draft.base_revision!==item.revision} onClick={async()=>{
+                    if (!window.confirm('Generate a fresh draft from this job and your profile? This will replace the text in this editor. Save any wording you want to keep first.')) return;
+                    setRewriting(item.id);
+                    try {
+                      const preview=await request<{text:string;revision:number;warning:string|null}>(`/api/proposals/${item.id}/tone-preview`,{method:'POST',body:JSON.stringify({expected_revision:draft.base_revision})});
+                      const current=editsRef.current[item.id];
+                      if(current && (current.proposal_text!==draft.proposal_text||current.base_revision!==draft.base_revision)) {
+                        setRowError(prev=>({...prev,[item.id]:'Your draft changed while AI was writing. Your edits were preserved; request another preview when ready.'}));
+                        return;
+                      }
+                      patchEdit(item.id,{proposal_text:preview.text,base_revision:preview.revision});
+                      setRowError(prev=>({...prev,[item.id]:preview.warning??''}));
+                    } catch(e){setRowError(prev=>({...prev,[item.id]:(e as Error).message}));}
+                    finally{setRewriting(null);}
+                  }}>{rewriting===item.id?'Writing new draft…':'Write a fresh draft in this tone'}</button>}
+                  <div className="field">
+                    <label htmlFor={`proposal-account-${item.id}`}>Submission account</label>
+                    {accountError && <p role="alert">Accounts could not be loaded: {accountError}</p>}
+                    <select id={`proposal-account-${item.id}`} value={draft.platform_account_id ?? ''}
+                      disabled={item.status !== 'pending_review'}
+                      onChange={(e) => patchEdit(item.id, { platform_account_id: e.target.value })}>
+                      <option value="">Use the only enabled account (choose if there are several)</option>
+                      {accounts.filter((a) => a.platform === item.platform && a.enabled && a.mode !== 'disabled').map((a) =>
+                        <option key={a.id} value={a.id}>{a.label || a.principal} · {a.principal}</option>)}
+                    </select>
+                  </div>
                   <div className="field">
                     <label>
                       Proposal text
@@ -819,24 +890,24 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                   {Object.keys(item.portfolio_match ?? {}).length > 0 && (
                     <>
                       <h3>Portfolio auto-selection</h3>
-                      {Object.entries(item.portfolio_match).map(([pid, m]) => (
+                      {Object.entries(item.portfolio_match).filter(([, m]) => m !== null && typeof m === 'object' && !Array.isArray(m)).map(([pid, m]) => (
                         <div className="score-bar-row" key={pid}>
-                          <span className="label">{m.title || portfolioTitle(Number(pid))}</span>
+                          <span className="label">{typeof m.title === 'string' && m.title ? m.title : portfolioTitle(Number(pid))}</span>
                           <div className="bar-track">
                             <div
                               className="bar-fill"
-                              style={{ width: `${Math.min(100, m.overlap_pct)}%` }}
+                              style={{ width: `${Math.min(100, Math.max(0, Number.isFinite(m.overlap_pct) ? m.overlap_pct : 0))}%` }}
                             />
                           </div>
                           <span className="muted" style={{ textAlign: 'right', fontSize: 12 }}>
-                            {Math.round(m.overlap_pct)}%
+                            {Math.round(Number.isFinite(m.overlap_pct) ? m.overlap_pct : 0)}%
                           </span>
-                          {m.matched_skills.length > 0 && (
+                          {strings(m.matched_skills).length > 0 && (
                             <div
                               className="chips"
                               style={{ gridColumn: '1 / -1', marginTop: -2, marginBottom: 6 }}
                             >
-                              {m.matched_skills.map((s) => (
+                              {strings(m.matched_skills).map((s) => (
                                 <span className="chip" key={s}>
                                   {s}
                                 </span>
@@ -1047,7 +1118,7 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                       </>
                     )}
                     {item.status === 'approved' &&
-                      (item.platform === 'upwork' ? (
+                      (item.platform === 'upwork' && item.request_type !== 'follow_up' ? (
                         <button
                           className="btn"
                           disabled={busyId === item.id}
@@ -1056,7 +1127,7 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                         >
                           {busyId === item.id ? 'Queueing…' : 'Queue for browser worker'}
                         </button>
-                      ) : item.platform === 'freelancer' ? (
+                      ) : item.platform === 'freelancer' && item.request_type !== 'follow_up' ? (
                         <button
                           className="btn"
                           disabled={busyId === item.id}
@@ -1074,17 +1145,15 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                           {busyId === item.id ? 'Marking…' : 'Mark as submitted'}
                         </button>
                       ))}
-                    {item.status === 'failed' &&
-                      !AUTOMATED_SUBMIT_PLATFORMS.includes(item.platform) && (
-                        <button
-                          className="btn"
-                          disabled={busyId === item.id}
-                          title="Submit on the platform yourself, then confirm here"
-                          onClick={() => markSubmitted(item)}
-                        >
-                          {busyId === item.id ? 'Marking…' : 'Mark as submitted'}
-                        </button>
-                      )}
+                    {(item.status === 'failed' || item.status === 'submitted_unverified') && (
+                      <>
+                        <span className="muted">Check the platform before choosing an outcome.</span>
+                        <button className="btn" disabled={busyId === item.id}
+                          onClick={() => reconcile(item, true)}>Confirm already submitted</button>
+                        <button className="btn secondary" disabled={busyId === item.id}
+                          onClick={() => reconcile(item, false)}>Not submitted — return to review</button>
+                      </>
+                    )}
                     {item.status === 'submitted' && (
                       <>
                         <span className="muted" style={{ fontSize: 12, alignSelf: 'center' }}>
@@ -1102,7 +1171,7 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                         ))}
                       </>
                     )}
-                    {(item.status === 'submitted' || item.status === 'queued_for_browser') &&
+                    {item.status === 'submitted' &&
                       item.outcome === 'pending' && (
                         <button
                           className="btn small secondary"

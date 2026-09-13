@@ -32,10 +32,15 @@ def handle_scrape_gig_metrics(task, ctx: HandlerContext) -> dict:
                 f"no metrics fields extracted for gig {gig['id']} on "
                 f"{task.platform} — metrics_fields in worker/platforms.py "
                 f"likely drifted")
-        impressions = int(parse_number(fields.get("impressions")) or 0)
-        clicks = int(parse_number(fields.get("clicks")) or 0)
-        orders = int(parse_number(fields.get("orders")) or 0)
-        revenue = parse_number(fields.get("revenue")) or 0.0
+        parsed = {key: parse_number(fields.get(key)) for key in ("impressions", "clicks", "orders", "revenue")}
+        if all(value is None for value in parsed.values()):
+            raise SelectorSuspectError(f"metrics were present but unparseable for gig {gig['id']}")
+        if any(value is not None and value < 0 for value in parsed.values()):
+            raise SelectorSuspectError("negative metric extraction rejected")
+        impressions = int(parsed["impressions"]) if parsed["impressions"] is not None else None
+        clicks = int(parsed["clicks"]) if parsed["clicks"] is not None else None
+        orders = int(parsed["orders"]) if parsed["orders"] is not None else None
+        revenue = parsed["revenue"]
         ctx.client.post_metrics(gig["id"], impressions, clicks, orders, revenue)
         scraped.append({"gig_id": gig["id"], "impressions": impressions,
                         "clicks": clicks, "orders": orders, "revenue": revenue})

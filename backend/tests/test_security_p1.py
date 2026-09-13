@@ -11,7 +11,7 @@ from app.adapters.base import AdapterError
 from app.database import Base, get_db
 from app.main import app
 from app.models import (Job, Keyword, KeywordGroup, ProposalQueueItem,
-                        SearchFilter, SearchProfile, User)
+                        SearchFilter, SearchProfile, User, PlatformAccount)
 
 
 @pytest.fixture()
@@ -288,6 +288,8 @@ def test_submit_proposal_502_is_generic(client, monkeypatch):
     token = _register(c, "submitter@example.com")["access_token"]
     uid = _user_id(Session, "submitter@example.com")
     db = Session()
+    db.add(PlatformAccount(user_id=uid, platform="freelancer", label="Synthetic account", principal="default", mode="api", enabled=True))
+    db.flush()
     job = Job(user_id=uid, external_id="123", platform="freelancer", title="j")
     db.add(job)
     db.flush()

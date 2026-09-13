@@ -12,7 +12,7 @@ from app import circuit_breaker
 from app.auth import create_access_token, hash_password
 from app.database import Base, get_db
 from app.main import app
-from app.models import Job, ProposalQueueItem, StealthTask, User
+from app.models import Job, PlatformAccount, ProposalQueueItem, StealthTask, User
 
 WORKER_HEADERS = {"Authorization": "Bearer test-worker-token"}
 
@@ -52,9 +52,13 @@ def _user(db, email):
 
 def _task(db, user_id, platform="fiverr", task_type="fetch_buyer_requests",
           status="pending", payload=None, completed_at=None, claimed_by=None):
+    if status == "pending" and not db.query(PlatformAccount).filter_by(user_id=user_id, platform=platform).first():
+        db.add(PlatformAccount(user_id=user_id, platform=platform, label="Test browser account", mode="stealth", enabled=True))
     t = StealthTask(user_id=user_id, platform=platform, task_type=task_type,
                     payload=payload or {}, status=status,
-                    completed_at=completed_at, claimed_by=claimed_by)
+                    completed_at=completed_at, claimed_by=claimed_by,
+                    claimed_at=datetime.now(timezone.utc) if status == "claimed" else None,
+                    claim_token="test-claim" if status == "claimed" else None)
     db.add(t)
     db.commit()
     return t
@@ -74,7 +78,7 @@ def test_claim_success_then_conflict(client):
     body = r.json()
     assert body["status"] == "claimed"
     assert body["claimed_by"] == "w-1"
-    assert body["payload"] == {}
+    assert body["payload"]["account_id"] > 0
     assert body["user_id"] == u.id
 
     # second claim (same or different worker) loses the race
@@ -159,7 +163,7 @@ def test_complete_transitions(client):
     # pending tasks can no longer be completed directly — claim first
     t1 = _task(db, u.id)
     r = c.post(f"/api/gigs/stealth-tasks/{t1.id}/complete",
-               json={"worker_id": "w-1", "success": True, "result": {"requests": []}},
+               json={"worker_id": "w-1", "claim_token": "test-claim", "success": True, "result": {"requests": []}},
                headers=WORKER_HEADERS)
     assert r.status_code == 409
 
@@ -167,8 +171,9 @@ def test_complete_transitions(client):
     r = c.post(f"/api/gigs/stealth-tasks/{t1.id}/claim",
                json={"worker_id": "w-1"}, headers=WORKER_HEADERS)
     assert r.status_code == 200
+    token = r.json()["claim_token"]
     r = c.post(f"/api/gigs/stealth-tasks/{t1.id}/complete",
-               json={"worker_id": "w-1", "success": True, "result": {"requests": []}},
+               json={"worker_id": "w-1", "claim_token": token, "success": True, "result": {"requests": []}},
                headers=WORKER_HEADERS)
     assert r.status_code == 200 and r.json()["status"] == "done"
     db.refresh(t1)
@@ -178,13 +183,13 @@ def test_complete_transitions(client):
     # claimed → failed
     t2 = _task(db, u.id, status="claimed", claimed_by="w-1")
     r = c.post(f"/api/gigs/stealth-tasks/{t2.id}/complete",
-               json={"worker_id": "w-1", "success": False, "result": {"captcha": True}},
+               json={"worker_id": "w-1", "claim_token": "test-claim", "success": False, "result": {"captcha": True}},
                headers=WORKER_HEADERS)
     assert r.status_code == 200 and r.json()["status"] == "failed"
 
     # terminal states reject further completion
     r = c.post(f"/api/gigs/stealth-tasks/{t1.id}/complete",
-               json={"worker_id": "w-1", "success": True}, headers=WORKER_HEADERS)
+               json={"worker_id": "w-1", "claim_token": "test-claim", "success": True}, headers=WORKER_HEADERS)
     assert r.status_code == 409
 
 
@@ -207,7 +212,7 @@ def test_complete_bound_to_claiming_worker(client):
 
     # the claiming worker succeeds
     r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
-               json={"worker_id": "w-1", "success": True},
+               json={"worker_id": "w-1", "claim_token": "test-claim", "success": True},
                headers=WORKER_HEADERS)
     assert r.status_code == 200 and r.json()["status"] == "done"
 
@@ -232,8 +237,8 @@ def test_windowed_circuit_breaker(client):
     def fail_one():
         t = _task(db, u.id, status="claimed", claimed_by="w-1")
         r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
-                   json={"worker_id": "w-1", "success": False,
-                         "result": {"error": "boom"}},
+                   json={"worker_id": "w-1", "claim_token": "test-claim", "success": False,
+                         "result": {"error": "boom", "submitted": False}},
                    headers=WORKER_HEADERS)
         assert r.status_code == 200
 
@@ -259,8 +264,8 @@ def test_per_tenant_circuit_isolation(client):
     for _ in range(3):
         t = _task(db, a.id, status="claimed", claimed_by="w-1")
         r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
-                   json={"worker_id": "w-1", "success": False,
-                         "result": {"error": "boom"}},
+                   json={"worker_id": "w-1", "claim_token": "test-claim", "success": False,
+                         "result": {"error": "boom", "submitted": False}},
                    headers=WORKER_HEADERS)
         assert r.status_code == 200
 
@@ -296,7 +301,7 @@ def test_complete_submission_flips_queue_item(client):
     t = _task(db, u.id, platform="upwork", task_type="submit_upwork_proposal",
               status="claimed", claimed_by="w-1", payload=payload)
     r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
-               json={"worker_id": "w-1", "success": True,
+               json={"worker_id": "w-1", "claim_token": "test-claim", "success": True,
                      "result": {"submitted": True}},
                headers=WORKER_HEADERS)
     assert r.status_code == 200
@@ -317,12 +322,12 @@ def test_complete_submission_flips_queue_item(client):
                status="claimed", claimed_by="w-1",
                payload={"proposal_queue_item_id": item2.id, "job_external_id": "~def456"})
     r = c.post(f"/api/gigs/stealth-tasks/{t2.id}/complete",
-               json={"worker_id": "w-1", "success": False,
+               json={"worker_id": "w-1", "claim_token": "test-claim", "success": False,
                      "result": {"error": "challenge page"}},
                headers=WORKER_HEADERS)
     assert r.status_code == 200
     db.refresh(item2)
-    assert item2.status == "failed"
+    assert item2.status == "submitted_unverified"
     assert item2.submission_result["error"] == "challenge page"
 
 
@@ -333,33 +338,27 @@ def test_worker_posts_results(client):
     db = Session()
     from app.models import Gig
     u = _user(db, "results@example.com")
-    gig = Gig(user_id=u.id, platform="fiverr", title="g", url="https://x/g")
-    db.add(gig)
-    db.commit()
-
-    # metrics: tenancy resolves via the gig, not the token
-    r = c.post("/api/gigs/metrics",
-               json={"gig_id": gig.id, "impressions": 10, "clicks": 2},
-               headers=WORKER_HEADERS)
-    assert r.status_code == 201, r.text
-
-    # competitor snapshots + buyer requests need explicit user_id from workers
-    r = c.post("/api/gigs/competitors",
-               json={"platform": "fiverr", "category": "logo", "gigs": []},
-               headers=WORKER_HEADERS)
-    assert r.status_code == 422
-    r = c.post("/api/gigs/competitors",
-               json={"user_id": u.id, "platform": "fiverr", "category": "logo",
-                     "gigs": [{"title": "x", "price": 50}]},
-               headers=WORKER_HEADERS)
-    assert r.status_code == 201, r.text
-
-    r = c.post("/api/gigs/buyer-requests/process",
-               json={"requests": []}, headers=WORKER_HEADERS)
-    assert r.status_code == 422
-    r = c.post("/api/gigs/buyer-requests/process",
-               json={"user_id": u.id, "requests": []}, headers=WORKER_HEADERS)
-    assert r.status_code == 200, r.text
+    db.add(PlatformAccount(user_id=u.id,platform="fiverr",label="account",mode="stealth"))
+    gig = Gig(user_id=u.id, platform="fiverr", title="g", url="https://www.fiverr.com/g")
+    db.add(gig);db.commit()
+    def claimed(kind,payload):
+        t = _task(db,u.id,task_type=kind,payload=payload,status="claimed",claimed_by="w-1")
+        return {"task_id":t.id,"worker_id":"w-1","claim_token":"test-claim"}
+    metric_claim=claimed("scrape_gig_metrics",{"gigs":[{"id":gig.id,"url":gig.url}]})
+    assert c.post("/api/gigs/metrics",json={"gig_id":gig.id},headers=WORKER_HEADERS).status_code==409
+    for _ in range(2):
+        r=c.post("/api/gigs/metrics",json={**metric_claim,"gig_id":gig.id,"impressions":10,"clicks":2},headers=WORKER_HEADERS)
+        assert r.status_code==201,r.text
+        assert r.json()["orders"] is None
+    from app.models import GigMetric
+    assert db.query(GigMetric).filter_by(gig_id=gig.id).count()==1
+    competitor_claim=claimed("scrape_competitors",{"category":"logo"})
+    r=c.post("/api/gigs/competitors",json={**competitor_claim,"user_id":u.id,"platform":"fiverr","category":"logo","gigs":[]},headers=WORKER_HEADERS)
+    assert r.status_code==201,r.text
+    requests_claim=claimed("fetch_buyer_requests",{})
+    assert c.post("/api/gigs/buyer-requests/process",json={"user_id":u.id,"requests":[]},headers=WORKER_HEADERS).status_code==409
+    r=c.post("/api/gigs/buyer-requests/process",json={**requests_claim,"user_id":u.id,"requests":[]},headers=WORKER_HEADERS)
+    assert r.status_code==200,r.text
 
 
 # ---------------- submission-outcome verdicts (P2-2) ----------------
@@ -378,7 +377,7 @@ def _complete(c, db, u, item, result, success=True):
               payload={"proposal_queue_item_id": item.id,
                        "job_external_id": "~abc123"})
     r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
-               json={"worker_id": "w-1", "success": success, "result": result},
+               json={"worker_id": "w-1", "claim_token": "test-claim", "success": success, "result": result},
                headers=WORKER_HEADERS)
     assert r.status_code == 200, r.text
     db.refresh(item)
@@ -464,7 +463,7 @@ def test_submission_outcome_broadcasts_status_change(client, monkeypatch):
     # a non-submission task (no proposal_queue_item_id) broadcasts nothing
     t = _task(db, u.id, status="claimed", claimed_by="w-1")
     r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
-               json={"worker_id": "w-1", "success": True, "result": {}},
+               json={"worker_id": "w-1", "claim_token": "test-claim", "success": True, "result": {}},
                headers=WORKER_HEADERS)
     assert r.status_code == 200
     assert len(sent) == 1
@@ -488,7 +487,7 @@ def test_session_expired_audited_and_account_flagged(client):
 
     t = _task(db, u.id, status="claimed", claimed_by="w-1")
     r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
-               json={"worker_id": "w-1", "success": False,
+               json={"worker_id": "w-1", "claim_token": "test-claim", "success": False,
                      "result": {"session_expired": True, "platform": "fiverr"}},
                headers=WORKER_HEADERS)
     assert r.status_code == 200
@@ -512,9 +511,55 @@ def test_session_expired_counts_toward_breaker(client):
     for _ in range(3):
         t = _task(db, u.id, status="claimed", claimed_by="w-1")
         r = c.post(f"/api/gigs/stealth-tasks/{t.id}/complete",
-                   json={"worker_id": "w-1", "success": False,
+                   json={"worker_id": "w-1", "claim_token": "test-claim", "success": False,
                          "result": {"session_expired": True,
                                     "platform": "fiverr"}},
                    headers=WORKER_HEADERS)
         assert r.status_code == 200
     assert circuit_breaker.get_state("fiverr", u.id)["state"] == "open"
+
+
+def test_reclaimed_task_rejects_previous_token_even_for_same_worker(client):
+    c, Session = client
+    with Session() as db:
+        user = _user(db, 'fencing@example.test')
+        task = _task(db, user.id)
+        first = c.post(f'/api/gigs/stealth-tasks/{task.id}/claim', json={'worker_id': 'w-1'}, headers=WORKER_HEADERS).json()
+        db.refresh(task)
+        task.status = 'pending'; task.claimed_by = None; task.claimed_at = None
+        db.commit()
+        second = c.post(f'/api/gigs/stealth-tasks/{task.id}/claim', json={'worker_id': 'w-1'}, headers=WORKER_HEADERS).json()
+        assert first['claim_token'] != second['claim_token']
+        body = {'worker_id': 'w-1', 'claim_token': first['claim_token'], 'success': True, 'result': {}}
+        assert c.post(f'/api/gigs/stealth-tasks/{task.id}/complete', json=body, headers=WORKER_HEADERS).status_code == 409
+        body['claim_token'] = second['claim_token']
+        assert c.post(f'/api/gigs/stealth-tasks/{task.id}/complete', json=body, headers=WORKER_HEADERS).status_code == 200
+        assert all('claim_token' not in row for row in c.get('/api/gigs/stealth-tasks?status=done', headers=WORKER_HEADERS).json())
+
+
+@pytest.mark.parametrize('change', ['disable', 'delete', 'expire'])
+def test_authorization_rechecks_account_and_claim(client, change):
+    c, Session = client
+    with Session() as db:
+        user = _user(db, f'{change}@example.test')
+        task = _task(db, user.id)
+        claim = c.post(f'/api/gigs/stealth-tasks/{task.id}/claim', json={'worker_id': 'w-1'}, headers=WORKER_HEADERS).json()
+        body = {'worker_id': 'w-1', 'claim_token': claim['claim_token']}
+        assert c.post(f'/api/gigs/stealth-tasks/{task.id}/authorize', json=body, headers=WORKER_HEADERS).status_code == 200
+        account = db.query(PlatformAccount).filter_by(user_id=user.id).one()
+        if change == 'disable': account.enabled = False
+        elif change == 'delete': db.delete(account)
+        else:
+            db.refresh(task)
+            task.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=16)
+        db.commit()
+        assert c.post(f'/api/gigs/stealth-tasks/{task.id}/authorize', json=body, headers=WORKER_HEADERS).status_code == 409
+
+
+def test_claim_requires_a_browser_enabled_account(client):
+    c, Session = client
+    with Session() as db:
+        user = _user(db, 'unenrolled@example.test')
+        task = StealthTask(user_id=user.id, platform='upwork', task_type='scrape_proposal_status', status='pending')
+        db.add(task); db.commit()
+        assert c.post(f'/api/gigs/stealth-tasks/{task.id}/claim', json={'worker_id': 'w-1'}, headers=WORKER_HEADERS).status_code == 409

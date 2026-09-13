@@ -25,6 +25,7 @@ class HandlerContext:
     config: Config
     client: WorkerClient
     browser: BrowserManager
+    external_write_started: bool = False
 
 
 def fetch_page(ctx: HandlerContext, platform: str, user_id: int, url: str):
@@ -32,6 +33,8 @@ def fetch_page(ctx: HandlerContext, platform: str, user_id: int, url: str):
     Raises CaptchaDetectedError when a challenge marker is present and
     SessionExpiredError when the session is logged out — so "no data" is
     never mistaken for a dead session."""
+    from ..security import validate_platform_url
+    validate_platform_url(platform, url)
     page = ctx.browser.new_page(platform, user_id)
     _warm_entry(page, platform, url)
     page.goto(url, wait_until="domcontentloaded")

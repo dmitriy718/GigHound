@@ -39,7 +39,7 @@ def list_jobs(
     status: str | None = Query(None),
     platform: str | None = Query(None),
     min_score: float | None = Query(None),
-    limit: int = Query(50, le=200),
+    limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -64,7 +64,9 @@ def get_job(job_id: int, db: Session = Depends(get_db),
         raise HTTPException(404, "job not found")
     from ..client_intel import client_history_for_job
     out = JobOut.model_validate(job)
-    out.client_history = client_history_for_job(db, user.id, job)
+    from ..schemas import ClientHistoryOut
+    history = client_history_for_job(db, user.id, job)
+    out.client_history = ClientHistoryOut.model_validate(history) if history else None
     return out
 
 
@@ -77,7 +79,7 @@ def archive_job(job_id: int, db: Session = Depends(get_db),
     job.status = "archived"
     db.commit()
     db.refresh(job)
-    cache.invalidate_prefix("preview:")
+    cache.invalidate_prefix(f"preview:{user.id}:")
     return job
 
 
@@ -94,7 +96,7 @@ def bulk_archive_jobs(body: BulkArchiveAction, db: Session = Depends(get_db),
         job.status = "archived"
         archived.append(jid)
     db.commit()
-    cache.invalidate_prefix("preview:")
+    cache.invalidate_prefix(f"preview:{user.id}:")
     return {"archived": archived, "skipped": skipped}
 
 
@@ -107,7 +109,7 @@ def unarchive_job(job_id: int, db: Session = Depends(get_db),
     job.status = "new"
     db.commit()
     db.refresh(job)
-    cache.invalidate_prefix("preview:")
+    cache.invalidate_prefix(f"preview:{user.id}:")
     return job
 
 

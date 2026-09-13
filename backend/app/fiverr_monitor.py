@@ -17,9 +17,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import circuit_breaker
-from .auth import platform_account_settings
+from .adapters.accounts import selected_principal
 from .cache import cache
-from .models import (AuditLog, GigTemplate, Job, ProposalQueueItem, StealthTask)
+from .models import (AuditLog, GigTemplate, Job, PlatformAccount, ProposalQueueItem, StealthTask)
 from .schemas import ClientInfo
 from .stealth import CREATE_GIG_DRAFT, FETCH_BUYER_REQUESTS
 
@@ -67,7 +67,7 @@ def _peek(key: str) -> int:
 def _offers_key(user_id: int) -> str:
     """Per-tenant daily counter key — the 10/day cap is per user, not global."""
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"fiverr:offers:{user_id}:{day}"
+    return f"fiverr:drafts:{user_id}:{day}"
 
 
 def offers_remaining_today(user_id: int) -> int:
@@ -86,7 +86,7 @@ def queue_gig_creation(db: Session, template: GigTemplate) -> tuple[StealthTask 
         log.info("gig creation skipped for platform %s: only fiverr gig drafts "
                  "are supported by the worker", template.platform)
         return None, f"gig creation not supported for '{template.platform}'"
-    allowed, reason = circuit_breaker.check(template.platform, template.user_id)
+    allowed, reason = circuit_breaker.check(template.platform, template.user_id, db=db)
     if not allowed:
         return None, reason
     count = _counter(f"gigdraft:{template.platform}:{template.user_id}", 3600)
@@ -119,7 +119,7 @@ def queue_upwork_catalog_upsert(db: Session, template: GigTemplate) -> tuple[Ste
     """Upwork Project Catalog drafts are not supported by the worker yet (no
     upwork gig-form config) — log and skip cleanly instead of queueing a
     stealth task that would fail 100% of the time."""
-    allowed, reason = circuit_breaker.check("upwork", template.user_id)
+    allowed, reason = circuit_breaker.check("upwork", template.user_id, db=db)
     if not allowed:
         return None, reason
     log.info("upwork catalog upsert skipped for template %d (user %d): "
@@ -169,18 +169,18 @@ def generate_custom_offer(request: dict, price: float | None = None,
     title = (request.get("title") or "your project")[:60]
     budget = request.get("budget")
     offer = price or budget or 50
-    return (f"I can handle \"{title}\" — done similar work this month. "
-            f"Custom offer: ${offer:g}, delivered in {turnaround_days} days. "
-            f"Happy to share a relevant sample before you decide.")
+    currency = request.get("currency") or "currency to confirm"
+    return (f"Draft scope for {title}. Proposed price: {currency} {offer:g}. "
+            "Delivery timing, scope and acceptance criteria need confirmation before agreement.")
 
 
-def process_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> dict:
+def process_buyer_requests(db: Session, user_id: int, requests: list[dict], *, account_id: int | None = None) -> dict:
     """Monitor tick: filter → generate offers → queue for approval.
 
     ALWAYS requires human approval (no auto-approve for buyer requests).
     Stops when the 10-offers/day platform cap is hit.
     """
-    allowed, reason = circuit_breaker.check("fiverr", user_id)
+    allowed, reason = circuit_breaker.check("fiverr", user_id, db=db)
     if not allowed:
         log.warning("buyer request monitor skipped: %s", reason)
         return {"queued": 0, "skipped_reason": reason}
@@ -221,7 +221,7 @@ def process_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> d
             currency=req.get("currency") or "USD",
             client_info=ClientInfo().model_dump(),
             quality_score=60.0,  # buyer requests: fixed neutral score
-            score_breakdown={"source": "buyer_request_monitor"},
+            score_breakdown={"source": "buyer_request_monitor", "source_account_id": account_id},
             status="new",
         )
         db.add(job)
@@ -236,6 +236,7 @@ def process_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> d
         item = ProposalQueueItem(
             user_id=user_id,
             job_id=job.id, platform="fiverr", request_type="buyer_request",
+            platform_account_id=account_id,
             proposal_text=offer_text, humanized_text=offer_text,
             bid_amount=req.get("budget") or 50,
             bid_period_days=3,
@@ -254,7 +255,7 @@ def process_buyer_requests(db: Session, user_id: int, requests: list[dict]) -> d
     return {"queued": queued, "offers_remaining": offers_remaining_today(user_id)}
 
 
-def enqueue_buyer_request_fetch(db: Session, user_id: int) -> StealthTask | None:
+def enqueue_buyer_request_fetch(db: Session, user_id: int, *, account_id: int | None = None) -> StealthTask | None:
     """Queue the stealth fetch task the browser worker executes each tick.
 
     The payload carries the tenant's fiverr seller username (account
@@ -262,7 +263,11 @@ def enqueue_buyer_request_fetch(db: Session, user_id: int) -> StealthTask | None
     the task is doomed to scrape /users/me — skip enqueueing instead of
     generating a failure that feeds the circuit breaker.
     """
-    allowed, reason = circuit_breaker.check("fiverr", user_id)
+    principal = selected_principal(db,user_id,'fiverr',account_id,'default')
+    account = db.query(PlatformAccount).filter_by(user_id=user_id,platform='fiverr',principal=principal,enabled=True).filter(PlatformAccount.mode.in_(['stealth','hybrid'])).first()
+    if account is None:
+        return None
+    allowed, reason = circuit_breaker.check("fiverr", user_id, db=db)
     if not allowed:
         log.warning("buyer request fetch skipped: %s", reason)
         task = StealthTask(user_id=user_id, platform="fiverr", task_type=FETCH_BUYER_REQUESTS,
@@ -271,13 +276,13 @@ def enqueue_buyer_request_fetch(db: Session, user_id: int) -> StealthTask | None
         db.add(task)
         db.commit()
         return None
-    username = platform_account_settings(db, user_id, "fiverr").get("username")
+    username = (account.settings or {}).get("username")
     if not username:
         log.warning("buyer request fetch skipped for user %d: no fiverr seller "
                     "username configured (account settings)", user_id)
         return None
     task = StealthTask(user_id=user_id, platform="fiverr", task_type=FETCH_BUYER_REQUESTS,
-                       payload={"username": username})
+                       payload={"username": username, "account_id": account.id})
     db.add(task)
     db.commit()
     db.refresh(task)

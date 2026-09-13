@@ -1,3 +1,5 @@
+from ..pagination import PageLimit, PageOffset
+from ..schemas import TemplateGenerateIn
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -10,6 +12,47 @@ from ..schemas import (PortfolioItemIn, PortfolioItemOut, ProfileTemplateIn,
 
 router = APIRouter(prefix="/api/profiles", tags=["profiles"])
 
+from ..writing_voice import WritingVoice, load_voice, voice_context
+from ..writing_voice import ApplicationStyle, TONES, load_style
+
+
+@router.get("/application-tones")
+def application_tones(user: User = Depends(get_current_user)):
+    return {"tones": [{"id": key, "label": label, "description": description} for key, (label, description) in TONES.items()],
+            "evidence": "Research informs clarity and job relevance; individual presets have not been proven to increase hires."}
+
+
+def _owned_style_job(db, user, job_id):
+    from ..models import Job
+    if get_owned(db, Job, job_id, user) is None:
+        raise HTTPException(404, "job not found")
+
+
+@router.get("/jobs/{job_id}/writing-style", response_model=ApplicationStyle)
+def get_application_style(job_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _owned_style_job(db, user, job_id)
+    return load_style(db, user.id, job_id)
+
+
+@router.put("/jobs/{job_id}/writing-style", response_model=ApplicationStyle)
+def save_application_style(job_id: int, body: ApplicationStyle, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    from ..adapters.vault import StateStore
+    _owned_style_job(db, user, job_id)
+    StateStore(db, user.id).set("writing", f"job_style:{job_id}", body.model_dump())
+    return body
+
+
+@router.get("/writing-voice", response_model=WritingVoice)
+def get_writing_voice(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return load_voice(db, user.id)
+
+
+@router.put("/writing-voice", response_model=WritingVoice)
+def save_writing_voice(body: WritingVoice, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    from ..adapters.vault import StateStore
+    StateStore(db, user.id).set("writing", "voice", body.model_dump())
+    return body
+
 
 # --- AI generation of profile pitch templates ---
 
@@ -20,12 +63,14 @@ _PROFILE_GEN_SYSTEM = (
     "{{deliverable}}, {{portfolio_piece}}, {{clarifying_question}}, "
     "{{rate_line}}, {{your_name}}. "
     "Write 120-180 words, first person, confident but not salesy. "
+    "Never invent experience, results, ratings or availability. "
     "Return only the template text."
 )
 
 
 @router.post("/templates/generate", response_model=dict)
-async def generate_profile_template(body: dict, user: User = Depends(get_current_user)):
+async def generate_profile_template(body: TemplateGenerateIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    body = body.model_dump()
     """Generate a pitch template via the configured text provider (Ollama
     by default). Returns draft text — the user reviews, then saves through
     the normal CRUD endpoints. Never auto-saves."""
@@ -34,11 +79,11 @@ async def generate_profile_template(body: dict, user: User = Depends(get_current
     from ..textgen import LLMUnavailable, generateText
 
     prompt = (f"Platform: {platform}. Style notes: {notes or 'none'}. "
-              f"Write the template now.")
+              f"Write the template now." + voice_context(load_voice(db, user.id)))
     check_llm_gen_rate(user)
     try:
         result = await generateText(
-            _PROFILE_GEN_SYSTEM.format(platform=platform), prompt,
+            _PROFILE_GEN_SYSTEM.replace("{platform}", platform), prompt,
             temperature=body.get("temperature"), max_tokens=body.get("max_tokens"),
             timeout=body.get("timeout"),
         )
@@ -48,11 +93,9 @@ async def generate_profile_template(body: dict, user: User = Depends(get_current
     except LLMUnavailable as exc:
         # deterministic offline fallback
         text = (
-            "Hi {{client_name}} — I read \"{{job_title}}\" and it maps closely to my recent work.\n\n"
-            "I've shipped similar projects ({{portfolio_piece}}), so {{deliverable}} is familiar "
-            "ground. On approach: I scope tightly, communicate daily, and deliver in milestones "
-            "so you always know where things stand. My rate for this kind of work: {{rate_line}}.\n\n"
-            "One question so I scope this right: {{clarifying_question}}\n"
+            "Hi {{client_name}} — I read \"{{job_title}}\".\n\n"
+            "Proposed deliverable: {{deliverable}}. Relevant evidence to review: {{portfolio_piece}}.\n\n"
+            "Before agreeing to scope, timing or price, I would confirm: {{clarifying_question}}\n"
             "— {{your_name}}"
         )
         return {"text": text, "model": "offline-fallback", "provider": "none",
@@ -62,11 +105,11 @@ async def generate_profile_template(body: dict, user: User = Depends(get_current
 # --- Profile templates (per-platform pitch styles) ---
 
 @router.get("/templates", response_model=list[ProfileTemplateOut])
-def list_templates(platform: str | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def list_templates(platform: str | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user), limit: PageLimit = 100, offset: PageOffset = 0):
     q = scoped(db, ProfileTemplate, user)
     if platform:
         q = q.filter(ProfileTemplate.platform == platform)
-    return q.all()
+    return q.order_by(ProfileTemplate.id).offset(offset).limit(limit).all()
 
 
 @router.post("/templates", response_model=ProfileTemplateOut, status_code=201)
@@ -102,8 +145,8 @@ def delete_template(tpl_id: int, db: Session = Depends(get_db), user: User = Dep
 # --- Portfolio ---
 
 @router.get("/portfolio", response_model=list[PortfolioItemOut])
-def list_portfolio(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return scoped(db, PortfolioItem, user).all()
+def list_portfolio(db: Session = Depends(get_db), user: User = Depends(get_current_user), limit: PageLimit = 100, offset: PageOffset = 0):
+    return scoped(db, PortfolioItem, user).order_by(PortfolioItem.id).offset(offset).limit(limit).all()
 
 
 @router.post("/portfolio", response_model=PortfolioItemOut, status_code=201)
@@ -139,8 +182,8 @@ def delete_portfolio(item_id: int, db: Session = Depends(get_db), user: User = D
 # --- Rate card ---
 
 @router.get("/rate-card", response_model=list[RateCardOut])
-def list_rate_card(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return scoped(db, RateCardEntry, user).all()
+def list_rate_card(db: Session = Depends(get_db), user: User = Depends(get_current_user), limit: PageLimit = 100, offset: PageOffset = 0):
+    return scoped(db, RateCardEntry, user).order_by(RateCardEntry.id).offset(offset).limit(limit).all()
 
 
 @router.post("/rate-card", response_model=RateCardOut, status_code=201)

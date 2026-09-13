@@ -1,3 +1,4 @@
+from ..pagination import PageLimit, PageOffset
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, selectinload
 
@@ -11,8 +12,8 @@ router = APIRouter(prefix="/api", tags=["keywords"])
 
 
 @router.get("/keyword-groups", response_model=list[KeywordGroupOut])
-def list_groups(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return scoped(db, KeywordGroup, user).options(selectinload(KeywordGroup.keywords)).all()
+def list_groups(db: Session = Depends(get_db), user: User = Depends(get_current_user), limit: PageLimit = 100, offset: PageOffset = 0):
+    return scoped(db, KeywordGroup, user).options(selectinload(KeywordGroup.keywords)).order_by(KeywordGroup.id).offset(offset).limit(limit).all()
 
 
 @router.post("/keyword-groups", response_model=KeywordGroupOut, status_code=201)

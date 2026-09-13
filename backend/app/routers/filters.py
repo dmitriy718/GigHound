@@ -1,3 +1,4 @@
+from ..pagination import PageLimit, PageOffset
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -5,7 +6,7 @@ from ..auth import get_current_user, get_owned, scoped
 from ..cache import cache
 from ..database import get_db
 from ..filtering import job_matches_filter
-from ..models import Job, SearchFilter, User
+from ..models import Job, KeywordGroup, SearchFilter, User
 from ..schemas import PreviewResult, SearchFilterIn, SearchFilterOut
 
 router = APIRouter(prefix="/api/filters", tags=["filters"])
@@ -24,19 +25,21 @@ def _apply(flt: SearchFilter, body: SearchFilterIn):
 
 
 @router.get("", response_model=list[SearchFilterOut])
-def list_filters(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return scoped(db, SearchFilter, user).all()
+def list_filters(db: Session = Depends(get_db), user: User = Depends(get_current_user), limit: PageLimit = 100, offset: PageOffset = 0):
+    return scoped(db, SearchFilter, user).order_by(SearchFilter.id).offset(offset).limit(limit).all()
 
 
 @router.post("", response_model=SearchFilterOut, status_code=201)
 def create_filter(body: SearchFilterIn, db: Session = Depends(get_db),
                   user: User = Depends(get_current_user)):
+    if body.keyword_group_id is not None and get_owned(db, KeywordGroup, body.keyword_group_id, user) is None:
+        raise HTTPException(404, "keyword group not found")
     flt = SearchFilter(user_id=user.id)
     _apply(flt, body)
     db.add(flt)
     db.commit()
     db.refresh(flt)
-    cache.invalidate_prefix("preview:")
+    cache.invalidate_prefix(f"preview:{user.id}:")
     return flt
 
 
@@ -46,10 +49,12 @@ def update_filter(filter_id: int, body: SearchFilterIn, db: Session = Depends(ge
     flt = get_owned(db, SearchFilter, filter_id, user)
     if not flt:
         raise HTTPException(404, "filter not found")
+    if body.keyword_group_id is not None and get_owned(db, KeywordGroup, body.keyword_group_id, user) is None:
+        raise HTTPException(404, "keyword group not found")
     _apply(flt, body)
     db.commit()
     db.refresh(flt)
-    cache.invalidate_prefix("preview:")
+    cache.invalidate_prefix(f"preview:{user.id}:")
     return flt
 
 
@@ -61,7 +66,7 @@ def delete_filter(filter_id: int, db: Session = Depends(get_db),
         raise HTTPException(404, "filter not found")
     db.delete(flt)
     db.commit()
-    cache.invalidate_prefix("preview:")
+    cache.invalidate_prefix(f"preview:{user.id}:")
 
 
 @router.post("/{filter_id}/preview", response_model=PreviewResult)

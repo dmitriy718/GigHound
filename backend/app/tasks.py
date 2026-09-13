@@ -125,30 +125,27 @@ def fiverr_buyer_request_tick_core() -> dict:
     db = SessionLocal()
     try:
         enqueued = []
-        for user in db.query(User).filter(User.is_active.is_(True)).all():
+        for user in users_in_batches(db):
             try:
                 # account-less users can't be scraped — don't generate doomed
                 # tasks that fail in the worker and feed the circuit breaker
-                has_fiverr = (db.query(PlatformAccount)
-                              .filter(PlatformAccount.user_id == user.id,
-                                      PlatformAccount.platform == "fiverr",
-                                      PlatformAccount.enabled.is_(True),
-                                      PlatformAccount.mode != "disabled")
-                              .first())
-                if has_fiverr is None:
-                    continue
-                # don't stack fetches while a previous one is still in flight
-                # (e.g. all workers down — dedupe like proposal_status_sync)
-                in_flight = (db.query(StealthTask)
-                             .filter(StealthTask.user_id == user.id,
-                                     StealthTask.platform == "fiverr",
-                                     StealthTask.task_type == FETCH_BUYER_REQUESTS,
-                                     StealthTask.status.in_(("pending", "claimed")))
-                             .first())
-                if in_flight is not None:
-                    continue
-                task = enqueue_buyer_request_fetch(db, user.id)
-                enqueued.append(task.id if task else None)
+                accounts = db.query(PlatformAccount).filter(
+                    PlatformAccount.user_id == user.id, PlatformAccount.platform == 'fiverr',
+                    PlatformAccount.enabled.is_(True),PlatformAccount.mode.in_(['stealth','hybrid'])
+                ).order_by(PlatformAccount.id).all()
+                for account in accounts:
+                    from sqlalchemy import or_
+                    in_flight = db.query(StealthTask.id).filter(
+                        StealthTask.user_id == user.id,StealthTask.platform == 'fiverr',
+                        StealthTask.task_type == FETCH_BUYER_REQUESTS,
+                        StealthTask.status.in_(('pending','claimed')),
+                        or_(StealthTask.payload['account_id'].as_integer() == account.id,
+                            StealthTask.payload['account_id'].as_integer().is_(None))).first()
+                    if in_flight is not None:
+                        continue
+                    task = enqueue_buyer_request_fetch(db,user.id,account_id=account.id)
+                    if task is not None:
+                        enqueued.append(task.id)
             except Exception as exc:  # noqa: BLE001 — per-user isolation
                 log.exception("buyer request fetch enqueue failed for user %d (%s)",
                               user.id, exc)
@@ -168,7 +165,7 @@ def gig_analytics_tick_core() -> dict:
     db = SessionLocal()
     try:
         enqueued = []
-        for user in db.query(User).filter(User.is_active.is_(True)).all():
+        for user in users_in_batches(db):
             try:
                 enqueued.extend(t.id for t in enqueue_metrics_scrape(db, user.id))
             except Exception as exc:  # noqa: BLE001 — per-user isolation
@@ -201,6 +198,11 @@ def generate_proposal_core(job_id: int) -> dict:
         job = db.get(Job, job_id)
         if job is None:
             return {"queued": False, "reason": "job not found"}
+        from .work_queue import claim_generation, finish_generation
+        lease = claim_generation(db, job)
+        if not lease:
+            return {"queued": False, "reason": "generation already claimed, completed, or retry budget exhausted"}
+        db.info["generation_lease"] = (job.id, lease)
         failed = (db.query(ProposalQueueItem)
                   .filter(ProposalQueueItem.job_id == job.id,
                           ProposalQueueItem.status == "generation_failed")
@@ -210,6 +212,7 @@ def generate_proposal_core(job_id: int) -> dict:
             item = asyncio.run(regenerate_failed_item(db, failed))
         else:
             item = asyncio.run(maybe_queue_proposal(db, job))
+        finish_generation(db, job.id, lease, item is not None and item.status == "pending_review")
         return {
             "queued": item is not None and item.status == "pending_review",
             "proposal_id": item.id if item else None,
@@ -290,7 +293,7 @@ def outcome_sync_tick_core() -> dict:
     db = SessionLocal()
     try:
         enqueued = []
-        for (user_id,) in db.query(User.id).filter(User.is_active.is_(True)).all():
+        for user_id in user_ids_in_batches(db):
             try:
                 outcome_sync_user_task.delay(user_id)
                 enqueued.append(user_id)
@@ -341,7 +344,7 @@ def upwork_outcome_tick_core() -> dict:
     db = SessionLocal()
     try:
         enqueued = []
-        for (user_id,) in db.query(User.id).filter(User.is_active.is_(True)).all():
+        for user_id in user_ids_in_batches(db):
             try:
                 upwork_outcome_user_task.delay(user_id)
                 enqueued.append(user_id)
@@ -390,6 +393,20 @@ def generation_retry_tick() -> dict:
 def generation_retry_tick_core() -> dict:
     db = SessionLocal()
     try:
+        from .models import GenerationWork
+        from sqlalchemy import or_
+        from .work_queue import expire_exhausted
+        expire_exhausted(db)
+        now = datetime.now(timezone.utc)
+        pending = db.query(GenerationWork).filter(GenerationWork.attempts < 3, or_(
+            GenerationWork.state == "pending",
+            (GenerationWork.state == "running") & (GenerationWork.lease_until < now),
+        )).order_by(GenerationWork.attempts, GenerationWork.job_id).limit(100).all()
+        for intent in pending:
+            try:
+                generate_proposal_task.delay(intent.job_id)
+            except Exception:
+                log.warning("broker unavailable; generation intent retained for job %s", intent.job_id)
         cutoff = datetime.now(timezone.utc) - GENERATION_RETRY_WINDOW
         items = (db.query(ProposalQueueItem)
                  .filter(ProposalQueueItem.status == "generation_failed",
@@ -517,7 +534,7 @@ def retention_tick_core() -> dict:
     """
     from sqlalchemy import func
 
-    from .models import AuditLog, StealthTask
+    from .models import AuditLog, StealthTask, AuthTransaction, AgencyAuditLog
 
     db = SessionLocal()
     try:
@@ -527,7 +544,7 @@ def retention_tick_core() -> dict:
         audit_cutoff = now - RETENTION_AUDIT_AGE
         totals = {"jobs_deleted": 0, "jobs_skipped_referenced": 0,
                   "stealth_tasks_deleted": 0, "audit_log_deleted": 0}
-        for (user_id,) in db.query(User.id).all():
+        for user_id in user_ids_in_batches(db, active_only=False):
             referenced = (db.query(ProposalQueueItem.job_id)
                           .filter(ProposalQueueItem.user_id == user_id))
             candidates = (db.query(Job)
@@ -551,6 +568,8 @@ def retention_tick_core() -> dict:
                 .filter(AuditLog.user_id == user_id,
                         AuditLog.created_at < audit_cutoff)
                 .delete(synchronize_session=False))
+        db.query(AuthTransaction).filter(AuthTransaction.expires_at < now - timedelta(days=1)).delete(synchronize_session=False)
+        db.query(AgencyAuditLog).filter(AgencyAuditLog.user_id.isnot(None), AgencyAuditLog.created_at < audit_cutoff).delete(synchronize_session=False)
         db.commit()
         log.info("retention sweep: %s", totals)
         return totals
@@ -569,7 +588,7 @@ def follow_up_due_tick_core() -> dict:
     db = SessionLocal()
     try:
         enqueued = []
-        for (user_id,) in db.query(User.id).filter(User.is_active.is_(True)).all():
+        for user_id in user_ids_in_batches(db):
             try:
                 follow_up_due_user_task.delay(user_id)
                 enqueued.append(user_id)
@@ -617,9 +636,9 @@ def stealth_reaper_tick_core() -> dict:
     `claimed` forever — its review-queue item would stay queued_for_browser
     and (for scrape tasks) block outcome sync for that tenant+platform.
 
-    claimed longer than STEALTH_CLAIM_TIMEOUT → back to `pending` (claim
-    fields cleared, reclaim_count incremented); once reclaim_count reaches
-    STEALTH_MAX_RECLAIMS the task is failed for good.
+    Expired reads return to pending until STEALTH_MAX_RECLAIMS. Writes and
+    unknown task kinds are never replayed: their proposals require human
+    reconciliation because the platform may already have accepted the action.
     """
     from .models import StealthTask
 
@@ -631,22 +650,63 @@ def stealth_reaper_tick_core() -> dict:
                            StealthTask.claimed_at < cutoff)
                    .all())
         reclaimed, failed = [], []
+        from sqlalchemy import update
+        from .stealth import canonical_kind, FETCH_BUYER_REQUESTS, SCRAPE_GIG_METRICS, SCRAPE_COMPETITORS, SCRAPE_PROPOSAL_STATUS
+        read_kinds = {FETCH_BUYER_REQUESTS, SCRAPE_GIG_METRICS, SCRAPE_COMPETITORS, SCRAPE_PROPOSAL_STATUS}
         for task in zombies:
-            if task.reclaim_count < STEALTH_MAX_RECLAIMS:
-                task.status = "pending"
-                task.claimed_by = None
-                task.claimed_at = None
-                task.reclaim_count += 1
-                reclaimed.append(task.id)
-                log.warning("stealth task %d reclaimed (dead worker; reclaim %d/%d)",
-                            task.id, task.reclaim_count, STEALTH_MAX_RECLAIMS)
-            else:
-                task.status = "failed"
-                task.result = {"error": "reclaim limit reached (worker died 3 times)"}
+            # A dead worker may already have clicked Submit. Replay only reads;
+            # unknown/new task kinds also require manual reconciliation.
+            uncertain = canonical_kind(task.task_type) not in read_kinds
+            terminal = uncertain or task.reclaim_count >= STEALTH_MAX_RECLAIMS
+            values = dict(status="pending", claimed_by=None, claimed_at=None, claim_token=None,
+                          reclaim_count=task.reclaim_count + 1)
+            if terminal:
+                values = dict(status="failed", completed_at=datetime.now(timezone.utc),
+                              result={"error": "worker claim expired; verify the platform before retrying",
+                                      "state": "submitted_unverified"} if uncertain else
+                              {"error": "reclaim limit reached (worker died 3 times)"})
+            changed = db.execute(update(StealthTask).where(
+                StealthTask.id == task.id, StealthTask.status == "claimed",
+                StealthTask.claimed_at == task.claimed_at,
+                StealthTask.reclaim_count == task.reclaim_count,
+            ).values(**values)).rowcount
+            if not changed:
+                continue
+            if terminal:
                 failed.append(task.id)
-                log.warning("stealth task %d failed: reclaim limit reached "
-                            "(worker died %d times)", task.id, STEALTH_MAX_RECLAIMS)
+                item_id = (task.payload or {}).get("proposal_queue_item_id")
+                if item_id:
+                    db.execute(update(ProposalQueueItem).where(
+                        ProposalQueueItem.id == item_id,
+                        ProposalQueueItem.user_id == task.user_id,
+                        ProposalQueueItem.platform == task.platform,
+                        ProposalQueueItem.status == "queued_for_browser",
+                    ).values(status="submitted_unverified" if uncertain else "failed",
+                             submission_result=values["result"]))
+            else:
+                reclaimed.append(task.id)
         db.commit()
         return {"reclaimed": reclaimed, "failed": failed}
     finally:
         db.close()
+
+
+def user_ids_in_batches(db, *, active_only=True):
+    """Keyset pages remain valid when individual tenant work commits."""
+    cursor = 0
+    while True:
+        query = db.query(User.id).filter(User.id > cursor)
+        if active_only:
+            query = query.filter(User.is_active.is_(True))
+        ids = [row[0] for row in query.order_by(User.id).limit(200).all()]
+        if not ids:
+            return
+        cursor = ids[-1]
+        yield from ids
+
+
+def users_in_batches(db):
+    for user_id in user_ids_in_batches(db):
+        user = db.get(User, user_id)
+        if user is not None and user.is_active:
+            yield user

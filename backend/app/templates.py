@@ -29,7 +29,7 @@ _BASE_TEMPERATURE = 0.7
 
 
 def save_as_template(db: Session, proposal: ProposalQueueItem, title: str | None = None,
-                     tags: list[str] | None = None) -> Template:
+                     tags: list[str] | None = None, *, commit: bool = True) -> Template:
     """Snapshot an approved proposal into the template library."""
     tpl = Template(
         user_id=proposal.user_id,
@@ -41,8 +41,11 @@ def save_as_template(db: Session, proposal: ProposalQueueItem, title: str | None
         source_proposal_id=proposal.id,
     )
     db.add(tpl)
-    db.commit()
-    db.refresh(tpl)
+    if commit:
+        db.commit()
+        db.refresh(tpl)
+    else:
+        db.flush()
     return tpl
 
 
@@ -54,73 +57,70 @@ def template_for_approval(db: Session, proposal: ProposalQueueItem) -> Template 
     Template when the item has no template_id and the item's
     `save_as_template` flag is on (reviewer opt-out).
 
-    `uses` is NOT incremented here — a use is counted only at selection time
-    (`top_templates`), so one proposal contributes at most one use.
+    A use is counted once when a reviewer approves this template selection.
     """
     if proposal.template_id:
         tpl = db.get(Template, proposal.template_id)
-        if tpl is not None:
+        if tpl is not None and tpl.user_id == proposal.user_id:
+            db.execute(update(Template).where(Template.id == tpl.id).values(uses=Template.uses + 1))
             return tpl
     if not proposal.save_as_template:
         return None
-    return save_as_template(db, proposal)
+    return save_as_template(db, proposal, commit=False)
 
 
-def record_outcome(db: Session, proposal: ProposalQueueItem, outcome: str) -> None:
-    """outcome: hired | rejected | ghosted — updates template win rates."""
-    proposal.outcome = outcome
-    # stamped once (idempotent re-marks keep the first timestamp) so the
-    # analytics trend can bucket outcomes by ISO week — there is no
-    # dedicated outcome timestamp column
-    result = dict(proposal.submission_result or {})
-    result.setdefault("outcome_recorded_at",
-                      datetime.now(timezone.utc).isoformat())
-    proposal.submission_result = result
+def record_outcome(db: Session, proposal: ProposalQueueItem, outcome: str, *, commit: bool = True) -> bool:
+    """Idempotent current outcome, serialized with corrections and derived totals."""
+    from sqlalchemy import func, or_
+    from .models import AuditLog
+    if outcome not in ("hired", "rejected", "ghosted"):
+        raise ValueError("unsupported outcome")
+    db.refresh(proposal, with_for_update=True)
+    if proposal.status != "submitted":
+        raise ValueError("only confirmed submitted proposals can have outcomes")
+    previous = proposal.outcome
+    if previous == outcome:
+        return False
     tpl = None
     if proposal.template_id:
-        tpl = db.get(Template, proposal.template_id)
+        tpl = db.query(Template).filter_by(id=proposal.template_id, user_id=proposal.user_id).with_for_update().one_or_none()
     if tpl is None:
-        tpl = (db.query(Template)
-               .filter(Template.user_id == proposal.user_id,
-                       Template.source_proposal_id == proposal.id)
-               .first())
+        tpl = db.query(Template).filter_by(user_id=proposal.user_id, source_proposal_id=proposal.id).with_for_update().first()
+    proposal.outcome = outcome
+    proposal.outcome_at = datetime.now(timezone.utc)
+    proposal.submission_result = {**(proposal.submission_result or {}),
+                                 "outcome_recorded_at": proposal.outcome_at.isoformat()}
+    db.add(AuditLog(user_id=proposal.user_id, action_type="proposal_outcome", platform=proposal.platform,
+                    detail={"proposal_id": proposal.id, "previous": previous, "outcome": outcome}))
+    db.flush()
     if tpl:
-        # SQL atomic increments: concurrent outcome syncs must not lose
-        # updates to a read-modify-write race
-        if outcome == "hired":
-            db.execute(update(Template).where(Template.id == tpl.id)
-                       .values(wins=Template.wins + 1))
-        elif outcome in ("rejected", "ghosted"):
-            db.execute(update(Template).where(Template.id == tpl.id)
-                       .values(losses=Template.losses + 1))
-        db.flush()
-        db.refresh(tpl)  # pick up the atomic increments for win_rate
+        rows = db.query(ProposalQueueItem.outcome, func.count()).filter(
+            ProposalQueueItem.user_id == proposal.user_id, ProposalQueueItem.status == "submitted",
+            or_(ProposalQueueItem.template_id == tpl.id, ProposalQueueItem.id == tpl.source_proposal_id),
+        ).group_by(ProposalQueueItem.outcome).all()
+        counts = dict(rows)
+        tpl.wins = counts.get("hired", 0)
+        tpl.losses = counts.get("rejected", 0) + counts.get("ghosted", 0)
         total = tpl.wins + tpl.losses
         tpl.win_rate = round(100 * tpl.wins / total, 1) if total else 0.0
-    if outcome == "hired" and proposal.bid_amount:
-        # won-bid learning: the winning amount feeds future bid suggestions
-        # for the matched rate-card category (Phase 3.4)
-        from .orchestrator import pick_rate
-        from .rate_learning import record_winning_bid
-
-        job = db.get(Job, proposal.job_id)
-        if job is not None:
-            rate = pick_rate(db, proposal.user_id, job)
-            category = rate.skill_category if rate else "general"
-            record_winning_bid(db, proposal.user_id, category, proposal.bid_amount)
-    db.commit()
+    if commit:
+        db.commit()
+    return True
 
 
 def record_rejection(db: Session, proposal: ProposalQueueItem, reason: str,
-                     notes: str = "") -> RejectionFeedback:
+                     notes: str = "", *, commit: bool = True) -> RejectionFeedback:
     fb = RejectionFeedback(
         user_id=proposal.user_id,
         proposal_id=proposal.id, platform=proposal.platform,
         reason=reason if reason in _REASON_EFFECTS else "other", notes=notes,
     )
     db.add(fb)
-    db.commit()
-    db.refresh(fb)
+    if commit:
+        db.commit()
+        db.refresh(fb)
+    else:
+        db.flush()
     return fb
 
 
@@ -152,14 +152,13 @@ def top_templates(db: Session, user_id: int, platform: str, skills: list[str] | 
                   limit: int = 3) -> list[Template]:
     """Best templates for few-shot prompting: platform + skill overlap + win rate.
 
-    Selecting a template COUNTS as a use: `uses` is incremented for every
-    template returned here (they get injected as few-shot examples or shown
-    as reviewer suggestions).
+    Suggestions are read-only. Uses are counted on human selection approval.
     """
     candidates = (
         db.query(Template)
         .filter(Template.user_id == user_id,
                 Template.platform == platform)
+        .order_by(Template.win_rate.desc(), Template.id.desc()).limit(500)
         .all()
     )
     skills = [s.lower() for s in (skills or [])]
@@ -174,8 +173,4 @@ def top_templates(db: Session, user_id: int, platform: str, skills: list[str] | 
 
     candidates.sort(key=score, reverse=True)
     selected = candidates[:limit]
-    for tpl in selected:
-        tpl.uses += 1
-    if selected:
-        db.commit()
     return selected

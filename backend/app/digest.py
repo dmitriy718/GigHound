@@ -6,6 +6,8 @@ plain local relays without STARTTLS). Without SMTP_HOST the digest is
 generated but only logged/returned — nothing is sent.
 """
 import logging
+import json
+import hashlib
 import os
 import smtplib
 from datetime import datetime, timedelta, timezone
@@ -13,7 +15,8 @@ from email.mime.text import MIMEText
 
 from sqlalchemy.orm import Session
 
-from .models import AlertSettings, Job, User
+from .models import AlertSettings, Job, User, AuthTransaction
+from sqlalchemy.exc import IntegrityError
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +65,25 @@ def send_user_digest(db: Session, user_id: int) -> int:
     settings, jobs = digest_jobs_for_user(db, user_id)
     if settings is None or not jobs:
         return 0
-    if not send_digest_email(jobs, settings.digest_mode):
+    user = db.get(User, user_id)
+    try:
+        verified = json.loads(os.getenv("GIGHOUND_VERIFIED_DIGEST_RECIPIENTS", "{}"))
+    except ValueError:
+        return 0
+    recipient = verified.get(str(user_id)) if isinstance(verified, dict) else None
+    if not user or not user.is_active or recipient != user.email or not os.getenv("SMTP_HOST"):
+        return 0
+    now = datetime.now(timezone.utc)
+    window = now.strftime("%Y-%m-%d-%H" if settings.digest_mode == "hourly" else "%Y-%m-%d")
+    key = "digest:" + hashlib.sha256(f"{user_id}:{settings.digest_mode}:{window}".encode()).hexdigest()
+    db.add(AuthTransaction(id=key, user_id=user_id, kind="digest_attempt", payload={},
+                           expires_at=now + timedelta(days=7)))
+    try:
+        db.commit()  # reserve before SMTP; uncertain deliveries are not retried blindly
+    except IntegrityError:
+        db.rollback()
+        return 0
+    if not send_digest_email(jobs, settings.digest_mode, recipient=recipient):
         log.warning("digest_mode active but SMTP not configured; digest not emailed")
         return 0
     return len(jobs)
@@ -79,18 +100,18 @@ def render_digest(jobs: list, mode: str) -> str:
     return "\n".join(lines)
 
 
-def send_digest_email(jobs: list, mode: str) -> bool:
+def send_digest_email(jobs: list, mode: str, *, recipient: str | None = None) -> bool:
     """Send the digest via SMTP if configured. Returns True when sent."""
     host = os.getenv("SMTP_HOST")
     body = render_digest(jobs, mode)
-    if not host:
-        log.info("SMTP_HOST not set — digest not emailed.\n%s", body)
+    if not host or not recipient:
+        log.info("SMTP or verified tenant destination unavailable — digest not emailed")
         return False
     msg = MIMEText(body)
     msg["Subject"] = f"GigHound {mode} digest — {len(jobs)} jobs"
     msg["From"] = os.getenv("DIGEST_FROM", "gighound@localhost")
-    msg["To"] = os.getenv("DIGEST_TO", "")
-    with smtplib.SMTP(host, int(os.getenv("SMTP_PORT", "587"))) as smtp:
+    msg["To"] = recipient
+    with smtplib.SMTP(host, int(os.getenv("SMTP_PORT", "587")), timeout=15) as smtp:
         # STARTTLS by default; SMTP_TLS=false for plain local relays
         if os.getenv("SMTP_TLS", "true").strip().lower() not in ("0", "false", "no"):
             smtp.starttls()

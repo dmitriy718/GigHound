@@ -4,7 +4,7 @@ x-backend-env: &backend-env
 
 services:
   db:
-    image: postgres:16.15-alpine
+    image: postgres:16.15-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     restart: unless-stopped
     environment:
       POSTGRES_USER: gighound
@@ -24,7 +24,10 @@ services:
     # Valkey: BSD-licensed drop-in fork of Redis 7 (Redis ≥7.4 is SSPL/RSALv2).
     # Protocol-compatible; ships a redis-cli compat binary, so the healthcheck
     # below and the redis==5.0.* Python client work unchanged.
-    image: valkey/valkey:8-alpine
+    image: valkey/valkey:8-alpine@sha256:cfb2aa4c8352930130fd45eb231a57310ac326d7323edae12b384b9270c46dda
+    command: valkey-server --appendonly yes --appendfsync everysec
+    volumes:
+      - broker-data:/data
     restart: unless-stopped
     ports:
       - "127.0.0.1:6379:6379"
@@ -139,7 +142,7 @@ services:
   #   docker compose --profile llm up -d
   # then pull a model:  docker compose exec ollama ollama pull qwen3:4b
   ollama:
-    image: ollama/ollama:0.33.2
+    image: ollama/ollama:0.33.2@sha256:020e4134285e2ef4d8fd801234176de3b4faadc992a3eb06c8e66a2f9d4c4ba2
     profiles: ["llm"]
     ports:
       - "127.0.0.1:11434:11434"
@@ -150,3 +153,4 @@ volumes:
   pgdata:
   ollama:
   celerybeat-data:
+  broker-data:

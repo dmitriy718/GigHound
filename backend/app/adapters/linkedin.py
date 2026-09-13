@@ -101,7 +101,7 @@ class LinkedInJobsAdapter(PlatformAdapter):
             title=j.get("job_title", ""),
             description=j.get("description", ""),
             url=j.get("url", ""),
-            job_type="hourly" if j.get("employment_statuses") and "Contract" in j["employment_statuses"] else None,
+            job_type="annual" if j.get("min_annual_salary_usd") is not None or j.get("max_annual_salary_usd") is not None else None,
             budget_min=j.get("min_annual_salary_usd"),
             budget_max=j.get("max_annual_salary_usd"),
             currency="USD",

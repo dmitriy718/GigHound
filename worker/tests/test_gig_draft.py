@@ -67,7 +67,7 @@ def _run(monkeypatch, page, template=TEMPLATE):
     monkeypatch.setattr("worker.handlers.gig_draft.fetch_page",
                         lambda ctx, platform, user_id, url: page)
     ctx = HandlerContext(config=Config(worker_token="t"),
-                         client=None, browser=_FakeBrowser())
+                         client=SimpleNamespace(authorize_task=lambda task_id: {"authorized": True}), browser=_FakeBrowser())
     task = _FakeTask({"template_id": 3, "template": template,
                       "typing_plan": []})
     return handle_create_gig_draft(task, ctx)
@@ -96,9 +96,9 @@ def test_drifted_form_aborts_save_with_missed_selectors(monkeypatch):
         assert field in msg  # the drift report is actionable
 
 
-def test_majority_filled_still_saves_and_lists_misses(monkeypatch):
+def test_partial_form_does_not_save(monkeypatch):
     page = _FakePage(present=[FORM["title"], FORM["category"],
                               FORM["price"]])  # 3/5 — at the floor
-    result = _run(monkeypatch, page)
-    assert FORM["save_draft"] in page.clicked
-    assert sorted(result["missed"]) == ["description", "tags"]
+    with pytest.raises(RuntimeError):
+        _run(monkeypatch, page)
+    assert FORM["save_draft"] not in page.clicked

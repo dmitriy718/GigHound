@@ -6,11 +6,7 @@ that went unanswered for FOLLOW_UP_AFTER_DAYS days get an auto-drafted
 follow-up parked in the review queue (status pending_review — the human
 boundary is unchanged; nothing is ever sent automatically).
 
-Submission-time proxy: there is no dedicated `submitted_at` column, so the
-proxy is `reviewed_at` (set at approval, the last step before submission),
-falling back to `created_at`. Upwork items sit in `queued_for_browser` until
-the browser worker confirms and flips them to `submitted`, so only truly
-submitted items are eligible.
+Only confirmed submissions with a known submitted_at timestamp are eligible.
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -28,9 +24,8 @@ FOLLOW_UP_CAP_PER_RUN = 5
 
 
 def _submission_proxy():
-    """coalesce(reviewed_at, created_at) — the submission-time proxy."""
-    return func.coalesce(ProposalQueueItem.reviewed_at,
-                         ProposalQueueItem.created_at)
+    """Observed confirmation time; historical unknown timestamps are excluded."""
+    return ProposalQueueItem.submitted_at
 
 
 def _due_items(db: Session, user_id: int) -> list[ProposalQueueItem]:

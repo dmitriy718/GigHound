@@ -97,7 +97,7 @@ def test_approve_buyer_request_dispatches_stealth_task(client):
         db.close()
 
     r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-               json={"reviewer": "op"})
+               json={"expected_revision": 1, "reviewer": "op"})
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "queued_for_browser"
 
@@ -129,7 +129,7 @@ def test_approve_buyer_request_without_account_stays_approved(client):
         db.close()
 
     r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-               json={"reviewer": "op"})
+               json={"expected_revision": 1, "reviewer": "op"})
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "approved"
 
@@ -161,7 +161,7 @@ def test_approve_buyer_request_circuit_open_stays_approved(client):
     circuit_breaker.open_circuit("fiverr", "test kill switch", user_id=uid)
     try:
         r = c.post(f"/api/proposals/{item_id}/approve", headers=_auth(token),
-                   json={"reviewer": "op"})
+                   json={"expected_revision": 1, "reviewer": "op"})
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "approved"
 
@@ -194,7 +194,7 @@ def test_bulk_approve_dispatches_buyer_request(client):
         db.close()
 
     r = c.post("/api/proposals/bulk-approve", headers=_auth(token),
-               json={"ids": [item_id], "reviewer": "op"})
+               json={"expected_revisions": {item_id: 1}, "ids": [item_id], "reviewer": "op"})
     assert r.status_code == 200, r.text
     assert r.json()["approved"] == [item_id]
 

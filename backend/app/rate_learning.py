@@ -54,12 +54,26 @@ def record_winning_bid(db: Session, user_id: int, skill_category: str, bid_amoun
                 pass
 
 
-def winning_bid_samples(db: Session, user_id: int, skill_category: str) -> list[dict]:
-    from .adapters.vault import StateStore
-
-    data = StateStore(db, user_id).get(_PLATFORM, _key(skill_category), {"samples": []})
-    return [s for s in (data.get("samples") or [])
-            if isinstance(s, dict) and s.get("bid_amount")]
+def winning_bid_samples(db: Session, user_id: int, skill_category: str, *, currency: str | None = None, job_type: str | None = None) -> list[dict]:
+    # Only attributable, unit-compatible confirmed outcomes feed new estimates.
+    # Legacy untyped aggregate samples are deliberately excluded.
+    if not currency or not job_type:
+        return []
+    from .models import Job, ProposalQueueItem
+    from .orchestrator import pick_rate
+    rows = db.query(ProposalQueueItem, Job).join(Job, ProposalQueueItem.job_id == Job.id).filter(
+        ProposalQueueItem.user_id == user_id, ProposalQueueItem.status == "submitted",
+        ProposalQueueItem.outcome == "hired", ProposalQueueItem.outcome_at.isnot(None),
+        Job.currency == currency, Job.job_type == job_type,
+        ProposalQueueItem.bid_amount > 0,
+    ).order_by(ProposalQueueItem.outcome_at.desc()).limit(100).all()
+    result = []
+    for proposal, job in rows:
+        rate = pick_rate(db, user_id, job)
+        if (rate.skill_category if rate else "general") == skill_category:
+            result.append({"bid_amount": proposal.bid_amount, "proposal_id": proposal.id,
+                           "currency": currency, "job_type": job_type})
+    return result[:_MAX_SAMPLES]
 
 
 def nudge_toward_wins(estimate: float, samples: list[dict]) -> tuple[float, str | None]:
@@ -72,4 +86,4 @@ def nudge_toward_wins(estimate: float, samples: list[dict]) -> tuple[float, str 
     nudged = min(max(nudged, estimate * 0.8), estimate * 1.2)
     if abs(nudged - estimate) < 0.01:
         return estimate, None
-    return nudged, f"nudged toward {len(samples)} past winning bids (avg ${avg:,.0f})"
+    return nudged, f"nudged toward {len(samples)} past winning bids (avg {avg:,.0f} in matching currency/unit)"

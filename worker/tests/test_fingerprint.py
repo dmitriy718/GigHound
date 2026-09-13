@@ -12,6 +12,9 @@ from worker.browser import BrowserManager, build_fingerprint
 
 
 class _FakeContext:
+    def route(self, pattern, handler):
+        self.navigation_guard = handler
+
     def __init__(self):
         self.init_scripts = []
 

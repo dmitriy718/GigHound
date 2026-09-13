@@ -37,11 +37,6 @@ def _identity_key(client_info: dict) -> tuple | None:
     ci = client_info or {}
     if ci.get("client_id"):
         return ("id", str(ci["client_id"]))
-    if ci.get("name"):
-        return ("name", str(ci["name"]).strip().lower())
-    if ci.get("country") or ci.get("rating") is not None or ci.get("total_spent") is not None:
-        return ("composite", ci.get("country"), ci.get("rating"),
-                _spent_bucket(ci.get("total_spent")))
     return None
 
 
@@ -57,7 +52,11 @@ def client_key_for(client_info: dict, platform: str) -> str | None:
     key = _identity_key(client_info)
     if key is None:
         return None
-    return "|".join(str(p) for p in (platform, *key))
+    value = "|".join(str(p) for p in (platform, *key))
+    if len(value) > 160:
+        import hashlib
+        return platform + "|sha256|" + hashlib.sha256(value.encode()).hexdigest()
+    return value
 
 
 def client_history_for_job(db: Session, user_id: int, job: Job) -> dict | None:
@@ -68,7 +67,7 @@ def client_history_for_job(db: Session, user_id: int, job: Job) -> dict | None:
     client_info blobs. Proposals on THIS job are excluded — history means
     prior engagements. Returns None when the client has never been seen (or
     cannot be identified)."""
-    if not job.client_key:
+    if not _identity_key(job.client_info) or not job.client_key:
         return None
     rows = (db.query(ProposalQueueItem.outcome, func.count())
             .join(Job, ProposalQueueItem.job_id == Job.id)

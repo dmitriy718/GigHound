@@ -79,8 +79,10 @@ def test_4xx_raises_backend_error():
     def handler(request):
         return httpx.Response(422, json={"detail": "user_id required"})
 
+    client = make_client(handler)
+    client._claims[1] = "test-claim"
     with pytest.raises(BackendError):
-        make_client(handler).post_buyer_requests(1, [])
+        client.post_buyer_requests(1, [])
 
 
 def test_complete_and_result_posts():
@@ -93,6 +95,7 @@ def test_complete_and_result_posts():
         return httpx.Response(200, json={"queued": 2})
 
     client = make_client(handler)
+    client._claims[1] = "test-claim"
     assert client.complete_task(1, True, {"fetched": 2})["status"] == "done"
     assert b'"worker_id": "w-1"' in sent[0][2] or b'"worker_id":"w-1"' in sent[0][2]
     assert client.post_buyer_requests(5, [{"title": "x"}])["queued"] == 2
@@ -109,7 +112,10 @@ def test_get_stealth_session():
         return httpx.Response(200, json={"storage_state": state,
                                          "credentials_present": True})
 
-    session = make_client(handler).get_stealth_session("fiverr", 7)
+    client = make_client(handler)
+    client._claims[1] = "test-claim"
+    client._active_tasks[("fiverr", 7)] = 1
+    session = client.get_stealth_session("fiverr", 7)
     assert session == {"storage_state": state, "credentials_present": True}
 
 
@@ -118,6 +124,41 @@ def test_get_stealth_session_absent():
         return httpx.Response(200, json={"storage_state": None,
                                          "credentials_present": False})
 
-    session = make_client(handler).get_stealth_session("guru", 3)
+    client = make_client(handler)
+    client._claims[1] = "test-claim"
+    client._active_tasks[("guru", 3)] = 1
+    session = client.get_stealth_session("guru", 3)
     assert session["storage_state"] is None
     assert session["credentials_present"] is False
+
+
+def test_claim_token_is_carried_to_authorization_completion_and_session():
+    import json
+    seen = []
+    def handler(request):
+        if request.url.path.endswith('/claim'):
+            return httpx.Response(200, json={'id': 5, 'user_id': 7, 'platform': 'fiverr',
+                'task_type': 'fetch_buyer_requests', 'status': 'claimed', 'claim_token': 'unique-lease'})
+        if request.url.path.endswith('/stealth-session'):
+            assert request.headers['X-Worker-Claim'] == 'unique-lease'
+            assert request.headers['X-Worker-ID'] == 'w-1'
+            assert 'unique-lease' not in str(request.url)
+            return httpx.Response(200, json={'storage_state': None})
+        body = json.loads(request.content)
+        assert body['claim_token'] == 'unique-lease' and body['worker_id'] == 'w-1'
+        seen.append(request.url.path)
+        return httpx.Response(200, json={'authorized': True})
+    client = make_client(handler)
+    client.claim_task(5)
+    client.authorize_task(5)
+    client.get_stealth_session('fiverr', 7)
+    client.complete_task(5, True, {})
+    assert len(seen) == 2
+
+
+def test_worker_rejects_backend_without_fencing_protocol():
+    def handler(request):
+        return httpx.Response(200, json={'id': 5, 'user_id': 7, 'platform': 'fiverr',
+            'task_type': 'fetch_buyer_requests', 'status': 'claimed'})
+    with pytest.raises(BackendError, match='fenced'):
+        make_client(handler).claim_task(5)

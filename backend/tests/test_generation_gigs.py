@@ -195,7 +195,7 @@ async def test_generate_fiverr_is_ultra_brief(db, job):
 def test_template_win_rate_lifecycle(db, user, job):
     item = ProposalQueueItem(user_id=user.id, job_id=job.id, platform="upwork",
                              proposal_text="winning text", bid_amount=5000,
-                             status="approved")
+                             status="submitted")
     db.add(item)
     db.commit()
     tpl = save_as_template(db, item, title="React Dashboard", tags=["react"])
@@ -206,7 +206,7 @@ def test_template_win_rate_lifecycle(db, user, job):
     assert tpl.wins == 1 and tpl.win_rate == 100.0
     record_outcome(db, item, "rejected")
     db.refresh(tpl)
-    assert tpl.win_rate == 50.0
+    assert tpl.win_rate == 0.0 and tpl.wins == 0 and tpl.losses == 1
 
 
 def test_rejection_learning_adjusts_temperature(db, user, job):

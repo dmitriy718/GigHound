@@ -232,6 +232,7 @@ def test_client_post_proposal_status():
                               base_url="http://backend",
                               transport=httpx.MockTransport(handler),
                               headers={"Authorization": "Bearer secret-token"}))
+    client._claims[5] = "test-claim"
     resp = client.post_proposal_status(5, [{"proposal_queue_item_id": 11,
                                             "platform_status": "hired",
                                             "has_unread_reply": False}])

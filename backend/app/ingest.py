@@ -37,7 +37,7 @@ def _market_rate_for(db: Session, user_id: int, item, rate_entries=None) -> floa
     probe = _Job(title=item.title, external_id=item.external_id,
                  platform=item.platform, skills=item.skills)
     entry = pick_rate(db, user_id, probe, entries=rate_entries)
-    return entry.hourly_rate if entry and entry.hourly_rate else None
+    return to_usd(entry.hourly_rate, entry.currency) if entry and entry.hourly_rate else None
 
 
 def _find_duplicate(db: Session, user_id: int, job: Job) -> Job | None:
@@ -99,20 +99,28 @@ async def run_ingest(body: IngestJobsIn, db: Session, user: User) -> IngestResul
             .first()
         )
         if existing:
-            continue
-
-        job = Job(user_id=user.id, **item.model_dump())
+            job = existing
+            for key, value in item.model_dump().items():
+                setattr(job, key, value)
+        else:
+            job = Job(user_id=user.id, **item.model_dump())
+        job.fetched_at = datetime.now(timezone.utc)
         job.budget_usd_min = to_usd(item.budget_min, item.currency)
         job.budget_usd_max = to_usd(item.budget_max, item.currency)
 
-        # Score against the union of all keyword groups referenced by filters;
-        # fall back to all groups if no filter references one.
-        referenced = {f.keyword_group_id for f in filters if f.keyword_group_id}
-        kws = []
-        for gid in (referenced or set(groups.keys())):
-            g = groups.get(gid)
-            if g:
-                kws.extend(g.keywords)
+        # Profiles own their exclusions. A negative in one profile must not
+        # globally archive a job which another profile explicitly accepts.
+        if ctx.profile_asts is None:
+            referenced = {f.keyword_group_id for f in filters if f.keyword_group_id}
+            kws = [k for gid in (referenced or set(groups)) if gid in groups for k in groups[gid].keywords]
+            active_filters = filters
+        else:
+            from .orchestrator import _matching_profile_asts
+            matched = _matching_profile_asts(ctx, job) or []
+            active_filters = [ctx.filters[p.filter_id] for p in matched if p.filter_id in ctx.filters]
+            group_ids = {p.keyword_group_id for p in matched if p.keyword_group_id}
+            group_ids.update(f.keyword_group_id for f in active_filters if f.keyword_group_id)
+            kws = [k for gid in group_ids if gid in groups for k in groups[gid].keywords if k.kind != "negative"]
         scored = compute_quality_score(item, kws, market_rate=_market_rate_for(
             db, user.id, item, rate_entries=ctx.rate_entries))
         job.quality_score = scored["quality_score"]
@@ -127,7 +135,7 @@ async def run_ingest(body: IngestJobsIn, db: Session, user: User) -> IngestResul
             db.rollback()
             continue
 
-        dup = _find_duplicate(db, user.id, job)
+        dup = _find_duplicate(db, user.id, job) if not existing else None
         if dup:
             job.is_duplicate = True
             job.duplicate_of = dup.id
@@ -143,16 +151,20 @@ async def run_ingest(body: IngestJobsIn, db: Session, user: User) -> IngestResul
         # Auto-archive only below the LOWEST active threshold: a job at or
         # above it may still pass the most lenient filter (per-filter gating
         # lives in filtering.py), so min() is the correct cutoff here
-        thresholds = [f.quality_threshold for f in filters]
+        thresholds = [f.quality_threshold for f in active_filters]
         if thresholds and job.quality_score < min(thresholds):
             job.status = "archived"
             auto_archived += 1
             db.commit()
             continue
 
+        from .orchestrator import generation_gates_pass
+        from .models import GenerationWork
+        if generation_gates_pass(db, job, ctx) and db.get(GenerationWork, job.id) is None:
+            db.add(GenerationWork(job_id=job.id, user_id=user.id, state="pending"))
         db.commit()
         db.refresh(job)
-        ingested += 1
+        ingested += int(existing is None)
 
         # Real-time feed: every ingested job streams to the dashboard
         job_payload = JobOut.model_validate(job).model_dump(mode="json")
@@ -180,7 +192,7 @@ async def run_ingest(body: IngestJobsIn, db: Session, user: User) -> IngestResul
     # jobs are already committed — a Redis failure here must not 500 the
     # ingest; a stale preview cache is the lesser evil
     try:
-        cache.invalidate_prefix("preview:")
+        cache.invalidate_prefix(f"preview:{user.id}:")
     except redis.RedisError as exc:
         log.warning("preview cache invalidation failed (%s); continuing", exc)
     return IngestResult(ingested=ingested, auto_archived=auto_archived, alerts_sent=alerts_sent)

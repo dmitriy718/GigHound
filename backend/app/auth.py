@@ -6,11 +6,12 @@ The signing secret comes from GIGHOUND_SECRET_KEY; startup fails fast when
 it is unset unless GIGHOUND_DEV_NOAUTH=1, in which case every request runs
 as a single implicit dev user so local development needs no login.
 
-Revocation is Redis-backed (jwt:deny:{jti} denylist + jwt:notbefore:{user}
-per-user invalidation) and fails open when Redis is down, matching the
-cache layer's degradation philosophy.
+Durable session versions and token revocation rows enforce security changes.
+Redis denylist entries are an additional compatibility cache.
 """
+
 import hmac
+import json
 import logging
 import os
 import time
@@ -20,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 import bcrypt
 import jwt
 from cryptography.fernet import Fernet
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Header
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -40,13 +41,14 @@ _bearer = HTTPBearer(auto_error=False)
 
 def validate_auth_config() -> None:
     """Fail fast at startup when secrets are missing/invalid (unless dev mode)."""
+    _worker_registry()  # validate configured worker identities at startup
     if not SECRET_KEY and not DEV_NOAUTH:
         raise RuntimeError(
             "GIGHOUND_SECRET_KEY is not set — refusing to start with auth "
             "enabled and no signing secret. Set it, or GIGHOUND_DEV_NOAUTH=1 "
             "for local development without auth."
         )
-    if not WORKER_TOKEN and not DEV_NOAUTH:
+    if not WORKER_TOKEN and not _worker_registry() and not DEV_NOAUTH:
         raise RuntimeError(
             "GIGHOUND_WORKER_TOKEN is not set — the stealth worker pool would "
             "be unauthenticated. Set it, or GIGHOUND_DEV_NOAUTH=1 for local "
@@ -62,8 +64,8 @@ def validate_auth_config() -> None:
     if not vault_key and not DEV_NOAUTH:
         raise RuntimeError(
             "GIGHOUND_VAULT_KEY is not set — the credential vault would 500 "
-            "on first use. Generate one with: python -c \"from "
-            "cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\" "
+            'on first use. Generate one with: python -c "from '
+            'cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" '
             "or set GIGHOUND_DEV_NOAUTH=1 for local development."
         )
     if vault_key:
@@ -72,15 +74,18 @@ def validate_auth_config() -> None:
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
                 "GIGHOUND_VAULT_KEY is not a valid Fernet key (urlsafe base64 "
-                "32-byte). Generate one with: python -c \"from "
-                "cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+                '32-byte). Generate one with: python -c "from '
+                'cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
             ) from exc
     if DEV_NOAUTH:
-        log.warning("GIGHOUND_DEV_NOAUTH=1 — auth disabled, all requests run "
-                    "as the implicit dev user. Do NOT use in production.")
+        log.warning(
+            "GIGHOUND_DEV_NOAUTH=1 — auth disabled, all requests run "
+            "as the implicit dev user. Do NOT use in production."
+        )
 
 
 # ---------------- passwords ----------------
+
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
@@ -95,10 +100,12 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 # ---------------- tokens ----------------
 
+
 def create_access_token(user: User) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user.id),
+        "session_version": user.session_version or 0,
         "email": user.email,
         "jti": uuid.uuid4().hex,
         "iat": now,
@@ -113,6 +120,7 @@ def decode_token(token: str) -> dict:
 
 
 # ---------------- revocation (Redis-backed, fail-open) ----------------
+
 
 def revoke_token(token: str) -> None:
     """Denylist a token's jti for its remaining lifetime (logout, password
@@ -133,8 +141,11 @@ def revoke_token(token: str) -> None:
 
 def invalidate_user_tokens(user_id: int) -> None:
     """Reject all of the user's tokens minted before now (iat < not-before)."""
-    cache.set_json(f"jwt:notbefore:{user_id}", int(time.time()),
-                   ttl=int(ACCESS_TOKEN_TTL.total_seconds()))
+    cache.set_json(
+        f"jwt:notbefore:{user_id}",
+        int(time.time()),
+        ttl=int(ACCESS_TOKEN_TTL.total_seconds()),
+    )
 
 
 def _is_token_revoked(payload: dict) -> bool:
@@ -166,19 +177,31 @@ def get_user_from_token(db: Session, token: str | None) -> User | None:
     except (TypeError, ValueError):
         return None
     user = db.get(User, user_id)
-    if not user or not user.is_active:
+    if (
+        not user
+        or not user.is_active
+        or payload.get("session_version", 0) != user.session_version
+    ):
+        return None
+    from .models import AuthTransaction
+
+    if db.get(AuthTransaction, "revoked:" + str(payload.get("jti", ""))):
         return None
     return user
 
 
 # ---------------- dependencies ----------------
 
+
 def get_or_create_dev_user(db: Session) -> User:
     """The single implicit tenant for GIGHOUND_DEV_NOAUTH=1 local development."""
     user = db.query(User).filter(User.email == DEV_USER_EMAIL).first()
     if not user:
-        user = User(email=DEV_USER_EMAIL, password_hash=hash_password("dev-noauth"),
-                    display_name="Dev User")
+        user = User(
+            email=DEV_USER_EMAIL,
+            password_hash=hash_password("dev-noauth"),
+            display_name="Dev User",
+        )
         db.add(user)
         db.commit()
         db.refresh(user)
@@ -194,8 +217,11 @@ def get_current_user(
         return get_or_create_dev_user(db)
     user = get_user_from_token(db, creds.credentials if creds else None)
     if user is None:
-        raise HTTPException(401, "invalid or missing credentials",
-                            headers={"WWW-Authenticate": "Bearer"})
+        raise HTTPException(
+            401,
+            "invalid or missing credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return user
 
 
@@ -204,35 +230,82 @@ def get_current_user(
 # user JWT: it serves every tenant, so worker endpoints resolve tenancy from
 # the task/row itself (or an explicit user_id), never from the token.
 
+
+def _worker_registry():
+    raw = os.getenv("GIGHOUND_WORKER_CREDENTIALS")
+    if not raw:
+        return {}
+    try:
+        mapping = json.loads(raw)
+        if (
+            not isinstance(mapping, dict)
+            or not mapping
+            or any(
+                not isinstance(name, str)
+                or not 1 <= len(name) <= 100
+                or not isinstance(token, str)
+                or len(token) < 32
+                for name, token in mapping.items()
+            )
+            or len(set(mapping.values())) != len(mapping)
+        ):
+            raise ValueError()
+        return mapping
+    except (ValueError, TypeError):
+        raise RuntimeError(
+            "GIGHOUND_WORKER_CREDENTIALS must map unique worker IDs to unique secrets of at least 32 characters"
+        ) from None
+
+
+def worker_identity(creds):
+    if not creds:
+        return None
+    mapping = _worker_registry()
+    for name, token in mapping.items():
+        if hmac.compare_digest(creds.credentials, token):
+            return name
+    if (
+        not mapping
+        and WORKER_TOKEN
+        and hmac.compare_digest(creds.credentials, WORKER_TOKEN)
+    ):
+        return "worker"  # legacy single-pool deployment; registry disables this key
+    return None
+
+
 def is_worker_token(creds: HTTPAuthorizationCredentials | None) -> bool:
-    return bool(WORKER_TOKEN and creds
-                and hmac.compare_digest(creds.credentials, WORKER_TOKEN))
+    return worker_identity(creds) is not None
 
 
 def get_worker(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    worker_id: str | None = Header(None, alias="X-Worker-ID"),
 ) -> str:
-    """FastAPI dependency: worker-token-only gate for mutation endpoints."""
-    if DEV_NOAUTH and not WORKER_TOKEN:
+    identity = worker_identity(creds)
+    if identity and (not _worker_registry() or worker_id == identity):
+        return identity
+    if DEV_NOAUTH and not WORKER_TOKEN and not _worker_registry():
         return "dev-worker"
-    if is_worker_token(creds):
-        return "worker"
-    raise HTTPException(401, "invalid or missing worker token",
-                        headers={"WWW-Authenticate": "Bearer"})
+    raise HTTPException(
+        401,
+        "invalid or missing worker identity",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 def get_worker_or_user(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
     db: Session = Depends(get_db),
+    worker_id: str | None = Header(None, alias="X-Worker-ID"),
 ) -> User | None:
-    """Dual-auth dependency: returns None for a valid worker token (worker =
-    cross-tenant principal), otherwise the authenticated user (UI path)."""
     if is_worker_token(creds):
+        get_worker(creds, worker_id)
         return None
     return get_current_user(creds, db)
 
 
 # ---------------- tenancy scoping (AD-1) ----------------
+
 
 def scoped(db: Session, model, user: User):
     """Query factory: only rows owned by `user`."""
@@ -249,23 +322,39 @@ def get_owned(db: Session, model, pk: int, user: User):
 
 # ---------------- platform kill switches ----------------
 
+
 def _active_accounts(db: Session, user_id: int, platform: str) -> list[PlatformAccount]:
-    return (db.query(PlatformAccount)
-            .filter(PlatformAccount.user_id == user_id,
-                    PlatformAccount.platform == platform,
-                    PlatformAccount.enabled.is_(True),
-                    PlatformAccount.mode != "disabled")
-            .all())
+    return (
+        db.query(PlatformAccount)
+        .filter(
+            PlatformAccount.user_id == user_id,
+            PlatformAccount.platform == platform,
+            PlatformAccount.enabled.is_(True),
+            PlatformAccount.mode != "disabled",
+        )
+        .all()
+    )
 
 
 def platform_enabled(db: Session, user_id: int, platform: str) -> bool:
     """Kill switch: False when the user has PlatformAccount row(s) for the
     platform and none of them is active (enabled and mode != 'disabled').
     No account row = allowed (default-on for platforms without accounts)."""
-    accounts = (db.query(PlatformAccount)
-                .filter(PlatformAccount.user_id == user_id,
-                        PlatformAccount.platform == platform)
-                .all())
+    from .models import AuthTransaction
+    if db.get(AuthTransaction,f"circuitstop:{user_id}:{platform}") is not None:
+        return False
+    from . import circuit_breaker
+    for scope in (None, user_id):
+        state = circuit_breaker.get_state(platform, scope, db=db)
+        if state.get("manual_stop"):
+            return False
+    accounts = (
+        db.query(PlatformAccount)
+        .filter(
+            PlatformAccount.user_id == user_id, PlatformAccount.platform == platform
+        )
+        .all()
+    )
     if not accounts:
         return True
     return any(a.enabled and a.mode != "disabled" for a in accounts)

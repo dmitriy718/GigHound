@@ -1,6 +1,11 @@
 .git
 .env
 **/.env
+**/.env.*
+.env.*
+worker/.sessions
+worker/.venv
+astra
 **/node_modules
 **/__pycache__
 **/.pytest_cache

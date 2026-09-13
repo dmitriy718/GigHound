@@ -1,0 +1,48 @@
+backend
+365 passed, 14 skipped, 208 warnings in 200.43s (0:03:20)
+
+backend-services
+379 passed, 221 warnings in 106.10s (0:01:46)
+
+worker
+122 passed in 0.88s
+
+ui
+PASS: register, proof library, evidence linking, decimal scope/capacity, team review/edit invalidation, URL reload, keyboard trap and focus restoration
+PASS: first event, burst ordering, no replay on rerender, session reset
+PASS: edit exact text, revision approval, return to review, renewed approval and synthetic manual submission tracking
+
+migrations
+No new upgrade operations detected.
+
+backend-audit
+No known vulnerabilities found
+
+worker-audit
+No known vulnerabilities found
+
+docker-backend
+#25 naming to docker.io/library/gighound-audit-backend:20260913 0.0s done
+#25 unpacking to docker.io/library/gighound-audit-backend:20260913 0.0s done
+#25 DONE 0.2s
+
+docker-worker
+#11 naming to docker.io/library/gighound-audit-worker:20260913 0.0s done
+#11 unpacking to docker.io/library/gighound-audit-worker:20260913 0.0s done
+#11 DONE 0.2s
+
+docker-frontend
+#17 naming to docker.io/library/gighound-audit-frontend:20260913 0.0s done
+#17 unpacking to docker.io/library/gighound-audit-frontend:20260913 0.0s done
+#17 DONE 0.2s
+
+concurrent-backend
+47 passed, 2 warnings in 1.55s
+
+concurrent-worker
+130 passed in 0.91s
+
+concurrent-frontend
+dist/assets/index-Cijz6Ieu.js                                   360.00 kB │ gzip: 98.77 kB
+
+✓ built in 156ms

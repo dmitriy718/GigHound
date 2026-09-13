@@ -58,19 +58,28 @@ def process_task(task, ctx: HandlerContext) -> None:
         return
     task = claimed  # server returns the authoritative payload
 
+    ctx.external_write_started = False
+
+    def report_completion(task_id, success, result):
+        if not success and LEGACY_ALIASES.get(task.task_type, task.task_type) in SUBMIT_KINDS:
+            result = {**result, "submitted": None if ctx.external_write_started else False,
+                      "state": "submitted_unverified" if ctx.external_write_started else "confirmed_not_submitted"}
+        return ctx.client.complete_task(task_id, success, result)
+
     handler = get_handler(task.task_type)
     if handler is None:
-        ctx.client.complete_task(task.id, False,
+        report_completion(task.id, False,
                                  {"error": f"no handler for task_type '{task.task_type}'"})
         return
     _browser.arm_task_deadline(ctx.config.task_timeout_sec)
     try:
+        ctx.client.authorize_task(task.id)
         result = handler(task, ctx)
     except _browser.TaskTimeoutError:
         log.error("task %d (%s) exceeded the %ss wall-clock budget",
                   task.id, task.task_type, ctx.config.task_timeout_sec)
         try:
-            ctx.client.complete_task(task.id, False,
+            report_completion(task.id, False,
                                      {"error": "task timeout",
                                       "timeout_sec": ctx.config.task_timeout_sec})
         except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
@@ -79,7 +88,7 @@ def process_task(task, ctx: HandlerContext) -> None:
         log.warning("task %d hit a challenge on %s (%s) — escalating",
                     task.id, exc.platform, exc.marker)
         try:
-            ctx.client.complete_task(task.id, False,
+            report_completion(task.id, False,
                                      {"captcha": True, "marker": exc.marker,
                                       "platform": exc.platform})
         except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
@@ -88,7 +97,7 @@ def process_task(task, ctx: HandlerContext) -> None:
         log.warning("task %d found a dead session on %s (%s) — the account "
                     "needs re-enrollment", task.id, exc.platform, exc.detail)
         try:
-            ctx.client.complete_task(task.id, False,
+            report_completion(task.id, False,
                                      {"session_expired": True,
                                       "platform": exc.platform})
         except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
@@ -98,7 +107,7 @@ def process_task(task, ctx: HandlerContext) -> None:
         log.warning("task %d extracted nothing on %s — selectors suspect: %s",
                     task.id, task.platform, exc)
         try:
-            ctx.client.complete_task(task.id, False,
+            report_completion(task.id, False,
                                      {"selector_suspect": True,
                                       "error": str(exc)[:500]})
         except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
@@ -107,20 +116,20 @@ def process_task(task, ctx: HandlerContext) -> None:
     except Exception as exc:  # noqa: BLE001 — crash-safe: report, don't die
         log.exception("task %d (%s) failed", task.id, task.task_type)
         try:
-            ctx.client.complete_task(task.id, False,
+            report_completion(task.id, False,
                                      {"error": str(exc)[:500],
                                       "error_type": type(exc).__name__})
         except (BackendError, ClaimConflictError, httpx.TransportError) as report_exc:
             log.error("could not report failure for task %d: %s", task.id, report_exc)
     else:
         try:
-            ctx.client.complete_task(task.id, True, result or {})
+            report_completion(task.id, True, result or {})
         except ClaimConflictError:
             # the handler already finalized the task server-side (e.g. the
             # proposal-status endpoint marks the task done) — benign
             log.info("task %d already finalized server-side, skipping completion",
                      task.id)
-        except httpx.TransportError as exc:
+        except (BackendError, httpx.TransportError) as exc:
             log.error("could not report completion for task %d: %s", task.id, exc)
     finally:
         _browser.disarm_task_deadline()
@@ -133,6 +142,12 @@ def process_task(task, ctx: HandlerContext) -> None:
                 close_pages(task.platform, task.user_id)
             except Exception as exc:  # noqa: BLE001 — never fail the report path
                 log.warning("could not close pages after task %d: %s", task.id, exc)
+        purge = getattr(ctx.browser, "purge_session", None)
+        if purge is not None:
+            try:
+                purge(task.platform, task.user_id)
+            except Exception as exc:
+                log.error("credential artifact erasure failed for task %d: %s", task.id, exc)
 
 
 def poll_once(ctx: HandlerContext) -> int:
@@ -176,6 +191,10 @@ def main(argv: list[str] | None = None) -> int:
         with BrowserManager(config, client=client) as browser:
             ctx = HandlerContext(config=config, client=client, browser=browser)
             while True:
+                try:
+                    client.heartbeat(config.platforms)
+                except (BackendError, ClaimConflictError, httpx.TransportError, httpx.HTTPStatusError) as exc:
+                    log.warning("worker heartbeat failed: %s", exc)
                 executed = poll_once(ctx)
                 if args.once:
                     log.info("--once: %d task(s) executed, exiting", executed)

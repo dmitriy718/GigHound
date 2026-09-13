@@ -45,7 +45,8 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --require-hashes -r backend/requirements.lock
-          pip install -r backend/requirements-dev.txt
+          python scripts/runtime_constraints.py backend/requirements.lock > /tmp/backend-constraints.txt
+          pip install -r backend/requirements-dev.txt -c /tmp/backend-constraints.txt
       - name: Run tests (SQLite)
         working-directory: backend
         run: python -m pytest -q
@@ -57,7 +58,8 @@ jobs:
         working-directory: backend
         env:
           DATABASE_URL: postgresql+psycopg2://gighound:postgres@localhost:5432/gighound
-          REDIS_URL: redis://localhost:6379/0
+          GIGHOUND_TEST_REDIS_URL: redis://localhost:6379/15
+          GIGHOUND_TEST_POSTGRES_URL: postgresql+psycopg2://gighound:postgres@localhost:5432/gighound
         run: python -m pytest -q
       # Catches broken/unapplied migrations against real Postgres (the test
       # suite itself runs on SQLite). Uses a dedicated throwaway database so
@@ -70,6 +72,7 @@ jobs:
         run: |
           python -c "import psycopg2; c=psycopg2.connect('postgresql://gighound:postgres@localhost:5432/gighound'); c.autocommit=True; c.cursor().execute('CREATE DATABASE alembic_smoke')"
           alembic upgrade head
+          alembic check
           test "$(alembic heads | awk '{print $1}')" = "$(alembic current | awk '{print $1}')"
 
   worker:
@@ -83,7 +86,10 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --require-hashes -r worker/requirements.lock
-          pip install -r worker/requirements-dev.txt
+          python scripts/runtime_constraints.py worker/requirements.lock > /tmp/worker-constraints.txt
+          pip install -r worker/requirements-dev.txt -c /tmp/worker-constraints.txt
+      - name: Install Chromium for browser regressions
+        run: python -m playwright install --with-deps chromium
       - name: Run tests
         run: python -m pytest -q worker/tests
 
@@ -111,6 +117,26 @@ jobs:
         working-directory: frontend
         run: npx vite build
 
+  ui-journey:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 26
+      - run: pip install --require-hashes -r backend/requirements.lock
+      - run: pip install --require-hashes -r worker/requirements.lock
+      - run: python -m playwright install --with-deps chromium
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend run build
+      - run: python scripts/check_ui.py
+        env:
+          GIGHOUND_UI_TEST_PYTHON: python
+
   pip-audit:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -123,10 +149,10 @@ jobs:
         run: pip install pip-audit==2.10.1
       # Fails the build on known vulnerabilities (hard gate, no ignores).
       - name: Audit backend runtime dependencies
-        run: pip-audit -r backend/requirements.txt
+        run: pip-audit -r backend/requirements.lock
       # The worker is internet-facing automation code; audit it too.
       - name: Audit worker runtime dependencies
-        run: pip-audit -r worker/requirements.txt
+        run: pip-audit -r worker/requirements.lock
 
   # Build-only check that all three images still compile (no push). The
   # backend image's stage 1 also covers the frontend bundle build.

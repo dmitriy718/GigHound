@@ -76,7 +76,7 @@ export const forceUnauthorized = () => {
   onUnauthorized?.();
 };
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   const token = getToken();
   try {
@@ -115,6 +115,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+// Read bounded server pages with a visible client-side collection ceiling.
+async function collection<T>(path: string): Promise<T[]> {
+  const result: T[] = [];
+  for (let offset = 0; offset <= 5000; offset += 100) {
+    const page = await request<T[]>(`${path}${path.includes('?') ? '&' : '?'}limit=100&offset=${offset}`);
+    if (result.length + page.length > 5000) throw new Error('This collection exceeds the 5,000-record interactive limit. Use the paginated API to export or narrow the collection.');
+    result.push(...page);
+    if (page.length < 100) return result;
+  }
+  throw new Error('Collection exceeds the interactive limit.');
+}
+
 // ---- Auth ----
 
 export interface AuthResponse {
@@ -143,7 +155,7 @@ export interface KeywordGroupPayload {
   keywords: Keyword[];
 }
 
-export const getKeywordGroups = () => request<KeywordGroup[]>('/api/keyword-groups');
+export const getKeywordGroups = () => collection<KeywordGroup>('/api/keyword-groups');
 export const createKeywordGroup = (body: KeywordGroupPayload) =>
   request<KeywordGroup>('/api/keyword-groups', { method: 'POST', body: JSON.stringify(body) });
 export const updateKeywordGroup = (id: number, body: KeywordGroupPayload) =>
@@ -159,7 +171,7 @@ export const suggestSkills = (platform: Platform, q: string) =>
 
 export type SearchFilterPayload = Omit<SearchFilter, 'id' | 'created_at'>;
 
-export const getFilters = () => request<SearchFilter[]>('/api/filters');
+export const getFilters = () => collection<SearchFilter>('/api/filters');
 export const createFilter = (body: SearchFilterPayload) =>
   request<SearchFilter>('/api/filters', { method: 'POST', body: JSON.stringify(body) });
 export const updateFilter = (id: number, body: SearchFilterPayload) =>
@@ -237,8 +249,13 @@ export interface ProfileTemplatePayload {
   pitch_template: string;
 }
 
+export interface WritingVoice { notes: string; samples: string[] }
+export const getWritingVoice = () => request<WritingVoice>('/api/profiles/writing-voice');
+export const saveWritingVoice = (body: WritingVoice) => request<WritingVoice>(
+  '/api/profiles/writing-voice', { method: 'PUT', body: JSON.stringify(body) });
+
 export const getProfileTemplates = (platform?: Platform) =>
-  request<ProfileTemplate[]>(
+  collection<ProfileTemplate>(
     `/api/profiles/templates${platform ? `?platform=${encodeURIComponent(platform)}` : ''}`,
   );
 export const createProfileTemplate = (body: ProfileTemplatePayload) =>
@@ -255,7 +272,7 @@ export interface PortfolioItemPayload {
   tags: string[];
 }
 
-export const getPortfolioItems = () => request<PortfolioItem[]>('/api/profiles/portfolio');
+export const getPortfolioItems = () => collection<PortfolioItem>('/api/profiles/portfolio');
 export const createPortfolioItem = (body: PortfolioItemPayload) =>
   request<PortfolioItem>('/api/profiles/portfolio', { method: 'POST', body: JSON.stringify(body) });
 export const updatePortfolioItem = (id: number, body: PortfolioItemPayload) =>
@@ -270,7 +287,7 @@ export interface RateCardEntryPayload {
   currency: string;
 }
 
-export const getRateCard = () => request<RateCardEntry[]>('/api/profiles/rate-card');
+export const getRateCard = () => collection<RateCardEntry>('/api/profiles/rate-card');
 export const createRateCardEntry = (body: RateCardEntryPayload) =>
   request<RateCardEntry>('/api/profiles/rate-card', { method: 'POST', body: JSON.stringify(body) });
 export const updateRateCardEntry = (id: number, body: RateCardEntryPayload) =>
@@ -281,6 +298,7 @@ export const deleteRateCardEntry = (id: number) =>
 // ---- Proposal review queue (human-in-the-loop boundary) ----
 
 export interface ProposalsQuery {
+  job_id?: number;
   status?: ProposalStatus;
   request_type?: string;
   limit?: number;
@@ -289,6 +307,7 @@ export interface ProposalsQuery {
 
 export const getProposals = (query: ProposalsQuery = {}) => {
   const params = new URLSearchParams();
+  if (query.job_id !== undefined) params.set('job_id', String(query.job_id));
   if (query.status) params.set('status', query.status);
   if (query.request_type) params.set('request_type', query.request_type);
   if (query.limit !== undefined) params.set('limit', String(query.limit));
@@ -318,10 +337,10 @@ export const markProposalSubmitted = (id: number, channel?: string) =>
 
 // ---- Proposals v3 (learning loop) ----
 
-export const bulkApproveProposals = (ids: number[], reviewer: string) =>
+export const bulkApproveProposals = (ids: number[], reviewer: string, expected_revisions: Record<number, number>) =>
   request<{ approved: number[]; skipped: number[] }>('/api/proposals/bulk-approve', {
     method: 'POST',
-    body: JSON.stringify({ ids, reviewer }),
+    body: JSON.stringify({ ids, reviewer, expected_revisions }),
   });
 export const markProposalOutcome = (id: number, outcome: Exclude<ProposalOutcome, 'pending'>) =>
   request<ProposalQueueItem>(`/api/proposals/${id}/outcome`, {
@@ -354,7 +373,7 @@ export const retryProposalGeneration = (id: number) =>
 export interface GigPayload {
   platform: Platform;
   title: string;
-  external_id: string | null;
+  external_id: string;
   url: string;
   status: GigStatus;
   price_min: number | null;
@@ -362,7 +381,7 @@ export interface GigPayload {
 }
 
 export const getGigs = (platform?: Platform) =>
-  request<Gig[]>(`/api/gigs${platform ? `?platform=${encodeURIComponent(platform)}` : ''}`);
+  collection<Gig>(`/api/gigs${platform ? `?platform=${encodeURIComponent(platform)}` : ''}`);
 export const registerGig = (body: GigPayload) =>
   request<Gig>('/api/gigs', { method: 'POST', body: JSON.stringify(body) });
 export const getGigMetrics = (gigId: number) =>
@@ -378,7 +397,7 @@ export interface GigTemplatePayload {
 }
 
 export const getGigTemplates = (platform?: Platform) =>
-  request<GigTemplate[]>(
+  collection<GigTemplate>(
     `/api/gigs/templates${platform ? `?platform=${encodeURIComponent(platform)}` : ''}`,
   );
 export const createGigTemplate = (body: GigTemplatePayload) =>
@@ -412,7 +431,7 @@ export const getCompetitors = (platform: Platform, category: string) =>
     `/api/gigs/competitors?platform=${encodeURIComponent(platform)}&category=${encodeURIComponent(category)}`,
   );
 export const getBuyerRequests = () =>
-  request<{ offers_remaining_today: number; daily_limit: number; count: number }>(
+  request<{ offers_remaining_today: number | null; daily_limit: number; count: number }>(
     '/api/gigs/buyer-requests',
   );
 
@@ -420,7 +439,7 @@ export const getBuyerRequests = () =>
 
 export type SearchProfilePayload = Omit<SearchProfile, 'id' | 'created_at'>;
 
-export const getSearchProfiles = () => request<SearchProfile[]>('/api/search-profiles');
+export const getSearchProfiles = () => collection<SearchProfile>('/api/search-profiles');
 export const createSearchProfile = (body: SearchProfilePayload) =>
   request<SearchProfile>('/api/search-profiles', { method: 'POST', body: JSON.stringify(body) });
 export const updateSearchProfile = (id: number, body: SearchProfilePayload) =>
@@ -450,7 +469,7 @@ export const getAnalyticsTrend = (weeks = 8) =>
 
 export type PlatformAccountPayload = Omit<PlatformAccount, 'id' | 'created_at'>;
 
-export const getAccounts = () => request<PlatformAccount[]>('/api/accounts');
+export const getAccounts = () => collection<PlatformAccount>('/api/accounts');
 export const createAccount = (body: PlatformAccountPayload) =>
   request<PlatformAccount>('/api/accounts', { method: 'POST', body: JSON.stringify(body) });
 export const updateAccount = (id: number, body: PlatformAccountPayload) =>
@@ -470,9 +489,17 @@ export const getCredentialStatus = (accountId: number) =>
 export const deleteCredentials = (accountId: number) =>
   request<void>(`/api/accounts/${accountId}/credentials`, { method: 'DELETE' });
 export const startFreelancerOAuth = (accountId: number) =>
-  request<{ authorize_url: string }>(`/api/accounts/${accountId}/oauth/freelancer/start`);
-export const completeFreelancerOAuth = (accountId: number, code: string) =>
+  request<{ authorize_url: string; state: string }>(`/api/accounts/${accountId}/oauth/freelancer/start`);
+export const completeFreelancerOAuth = (accountId: number, code: string, state: string) =>
   request<void>(`/api/accounts/${accountId}/oauth/freelancer/complete`, {
     method: 'POST',
-    body: JSON.stringify({ code }),
+    body: JSON.stringify({ code, state }),
   });
+
+export const reconcileProposalSubmission = (id: number, submitted: boolean, evidence: string) =>
+  request<ProposalQueueItem>(`/api/proposals/${id}/reconcile`, {
+    method: 'POST', body: JSON.stringify({ submitted, evidence }),
+  });
+
+export const returnProposalToReview = (id: number): Promise<ProposalQueueItem> =>
+  request(`/api/proposals/${id}/return-to-review`, {method:'POST'});

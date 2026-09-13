@@ -169,6 +169,7 @@ export default function SearchProfiles() {
   return (
     <div>
       <h1>Search Profiles</h1>
+      <p className="muted">Scheduled discovery supports Freelancer, Upwork and configured LinkedIn sources. Indeed jobs can be imported manually; Indeed has no discovery connector.</p>
       <p className="page-sub">
         Named boolean queries wired to keyword groups and filters · auto-queue drafts proposals for
         matches

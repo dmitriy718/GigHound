@@ -36,8 +36,8 @@ class PipelineContext:
     """Per-ingest-call preload: everything the pipeline would otherwise
     re-query per job (kills the N+1 storm on bulk ingest).
 
-    `profile_asts` is None when the user has no auto-queue search profiles
-    (match-all semantics, unchanged); otherwise (profile, parsed AST) pairs.
+    `profile_asts` is None when the user has no search profiles at all
+    (legacy match-all semantics); an empty list disables auto-queue; otherwise (profile, parsed AST) pairs.
     """
     rate_entries: list[RateCardEntry]
     portfolio_items: list[PortfolioItem]
@@ -54,7 +54,8 @@ def build_pipeline_context(db: Session, user_id: int) -> PipelineContext:
                 .filter(SearchProfile.user_id == user_id,
                         SearchProfile.auto_queue_proposals.is_(True))
                 .all())
-    profile_asts = None
+    has_profiles = db.query(SearchProfile.id).filter(SearchProfile.user_id == user_id).first() is not None
+    profile_asts = [] if has_profiles else None
     filters: dict[int, SearchFilter] = {}
     if profiles:
         profile_asts = [(p, parse_boolean_query(p.boolean_query)) for p in profiles]
@@ -114,7 +115,7 @@ def pick_rate(db: Session, user_id: int, job: Job,
 def _matching_profile_asts(ctx: PipelineContext, job: Job) -> list[SearchProfile] | None:
     """Boolean-query match against pre-parsed profile ASTs.
 
-    Returns None when no auto-queue profiles exist (match all, unchanged);
+    Returns None when no search profiles exist (legacy match-all);
     otherwise the profiles whose boolean query matches the job.
     """
     if ctx.profile_asts is None:
@@ -130,7 +131,7 @@ def _matching_profiles(db: Session, user_id: int, job: Job) -> list[SearchProfil
                         SearchProfile.auto_queue_proposals.is_(True))
                 .all())
     if not profiles:
-        return None
+        return [] if db.query(SearchProfile.id).filter(SearchProfile.user_id == user_id).first() else None
     text = f"{job.title}\n{job.description}"
     return [p for p in profiles
             if evaluate(parse_boolean_query(p.boolean_query), text)]
@@ -170,7 +171,7 @@ def generation_gates_pass(db: Session, job: Job, ctx: PipelineContext | None = N
         .filter(ProposalQueueItem.job_id == job.id,
                 ProposalQueueItem.status.in_(
                     ["pending_review", "approved", "submitting", "submitted",
-                     "queued_for_browser", "generation_failed"]))
+                     "queued_for_browser", "submitted_unverified", "generation_failed"]))
         .first()
     )
     if existing:
@@ -191,7 +192,19 @@ def generation_gates_pass(db: Session, job: Job, ctx: PipelineContext | None = N
     if profiles is not None:
         if not profiles:
             return False
-        if not _passes_profile_filters(filters, job, profiles):
+        from .models import Keyword, KeywordGroup
+        from .scoring import compute_quality_score
+        eligible_profiles = []
+        for profile in profiles:
+            flt = filters.get(profile.filter_id)
+            group_id = profile.keyword_group_id or (flt.keyword_group_id if flt else None)
+            group = db.get(KeywordGroup, group_id) if group_id else None
+            if group is not None and group.user_id == job.user_id:
+                scored = compute_quality_score(job, group.keywords)
+                if scored["score_breakdown"].get("excluded_by_negative_keyword"):
+                    continue
+            eligible_profiles.append(profile)
+        if not _passes_profile_filters(filters, job, eligible_profiles):
             return False
     return True
 
@@ -200,16 +213,18 @@ def enqueue_generation_if_eligible(db: Session, job: Job,
                                    ctx: PipelineContext | None = None) -> bool:
     """Ingest path: run the gates inline, hand the LLM work to a Celery task.
 
-    Broker-down degrades to "no generation" (logged) — the request path must
+    Broker-down retains durable pending intent (logged) — the request path must
     never block on (or crash because of) LLM work.
     """
     if not generation_gates_pass(db, job, ctx):
         return False
     from .tasks import generate_proposal_task
+    from .work_queue import ensure_generation
+    ensure_generation(db, job)
     try:
         generate_proposal_task.delay(job.id)
     except Exception as exc:  # noqa: BLE001 — broker unavailable
-        log.warning("generation enqueue failed for job %d (%s); left ungenerated",
+        log.warning("generation enqueue failed for job %d (%s); durable intent retained",
                     job.id, exc)
         return False
     return True
@@ -227,6 +242,8 @@ async def regenerate_failed_item(db: Session, item: ProposalQueueItem,
                                  ctx: PipelineContext | None = None) -> ProposalQueueItem | None:
     """Re-run generation for a generation_failed queue item, reusing the row
     (bounded retry path — see the generation_retry beat)."""
+    if item.status != "generation_failed":
+        return None
     job = db.get(Job, item.job_id)
     if job is None or job.status == "archived":
         return None
@@ -260,6 +277,26 @@ def _commit_generation_item(db: Session, job: Job,
     return item, True
 
 
+def _generation_write_allowed(db, job, item):
+    from datetime import datetime, timezone
+    from .models import GenerationWork
+    lease = db.info.get("generation_lease")
+    if lease:
+        row = db.query(GenerationWork).filter_by(job_id=job.id).populate_existing().with_for_update().one_or_none()
+        until = row.lease_until if row else None
+        if until and until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        if not row or row.state != "running" or row.lease_token != lease[1] or not until or until <= datetime.now(timezone.utc):
+            db.rollback()
+            return False
+    if item is not None:
+        db.refresh(item, with_for_update=True)
+        if item.status != "generation_failed":
+            db.rollback()
+            return False
+    return True
+
+
 async def generate_and_queue(db: Session, job: Job, ctx: PipelineContext | None = None,
                              item: ProposalQueueItem | None = None) -> ProposalQueueItem | None:
     """The LLM path: tuning → few-shot → generate → persist → WS notify.
@@ -281,6 +318,8 @@ async def generate_and_queue(db: Session, job: Job, ctx: PipelineContext | None 
         )
     except Exception as exc:  # noqa: BLE001 — LLM timeout/rate limit/etc.
         log.exception("proposal generation failed for job %d", job.id)
+        if not _generation_write_allowed(db, job, item):
+            return None
         if item is None:
             item = ProposalQueueItem(user_id=job.user_id, job_id=job.id, platform=job.platform,
                                      status="generation_failed", needs_review=True)
@@ -297,6 +336,8 @@ async def generate_and_queue(db: Session, job: Job, ctx: PipelineContext | None 
         })
         return item
 
+    if not _generation_write_allowed(db, job, item):
+        return None
     if item is None:
         item = ProposalQueueItem(user_id=job.user_id, job_id=job.id, platform=job.platform)
         db.add(item)
@@ -321,6 +362,9 @@ async def generate_and_queue(db: Session, job: Job, ctx: PipelineContext | None 
     db.add(AuditLog(user_id=job.user_id, action_type="proposal_generated", platform=job.platform, detail={
         "job_id": job.id, "llm_model": gen["llm_model"],
         "prompt_version": proposal_gen_llm_version(),
+        "style_template_ids": [t.id for t in few_shot],
+        "portfolio_item_ids": gen["portfolio_item_ids"],
+        "evidence_basis": "tenant-supplied portfolio; style templates do not certify claims",
         "latency_ms": gen["latency_ms"], "humanized": bool(gen["humanized_text"]),
         "confidence": gen["confidence"],
     }))

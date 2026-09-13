@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
-from app.models import StealthTask, User
+from app.models import Job, ProposalQueueItem, StealthTask, User
 from app.tasks import STEALTH_MAX_RECLAIMS, stealth_reaper_tick_core
 
 
@@ -32,7 +32,7 @@ def _user(db, email):
 
 def _claimed(db, user_id, *, age_minutes=20, reclaim_count=0):
     t = StealthTask(user_id=user_id, platform="upwork",
-                    task_type="submit_upwork_proposal", status="claimed",
+                    task_type="scrape_proposal_status", status="claimed",
                     claimed_by="worker-1",
                     claimed_at=(datetime.now(timezone.utc)
                                 - timedelta(minutes=age_minutes)),
@@ -87,3 +87,25 @@ def test_reaper_leaves_recent_claims_alone(Session, monkeypatch):
     assert t.reclaim_count == 0
     assert t.claimed_by == "worker-1"
     db.close()
+
+
+def test_reaper_never_replays_an_expired_submission(Session, monkeypatch):
+    monkeypatch.setattr("app.tasks.SessionLocal", Session)
+    with Session() as db:
+        user = _user(db, "uncertain@example.com")
+        job = Job(user_id=user.id, platform='upwork', external_id='reaper-proof', title='Test')
+        db.add(job); db.flush()
+        item = ProposalQueueItem(user_id=user.id, job_id=job.id, platform='upwork',
+                                 proposal_text='Reviewed text', status='queued_for_browser')
+        db.add(item); db.flush()
+        task = _claimed(db, user.id)
+        task.payload = {'proposal_queue_item_id': item.id}
+        task.task_type = "submit_upwork_proposal"
+        db.commit()
+        assert stealth_reaper_tick_core() == {"reclaimed": [], "failed": [task.id]}
+        db.refresh(task)
+        assert task.status == "failed"
+        assert task.result["state"] == "submitted_unverified"
+        assert task.completed_at is not None
+        db.refresh(item)
+        assert item.status == "submitted_unverified"

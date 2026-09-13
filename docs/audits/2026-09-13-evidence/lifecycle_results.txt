@@ -1,0 +1,9 @@
+Redis unavailable (Error 111 connecting to 127.0.0.1:1. Connection refused.); cache disabled (reconnect retried on each operation)
+circuit breaker upwork (user 123) → open (synthetic automatic stop)
+P1 CONFIRMED: deleting platform account retains usable vault credentials; legacy selection resolves them
+P2 CONFIRMED: third-attempt crash leaves expired running intent neither claimable nor manually resettable
+P3 CONFIRMED: message with no sender is classified as client reply
+P4 CONFIRMED: quota endpoint raises unhandled AdapterAuthError for two active accounts
+P5 CONFIRMED: automatic circuit opens then becomes closed in a fresh process with unavailable Redis
+P6 CONFIRMED: two concurrent bids reach external API with monthly quota=1; no pre-send reservation
+P9 CONFIRMED: after 1000 newer feedback records, explicit skip is ignored by daily brief

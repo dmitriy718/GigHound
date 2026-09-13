@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from sqlalchemy import (JSON, Boolean, DateTime, Float, ForeignKey, Index,
                         Integer, String, Text, UniqueConstraint, text)
@@ -24,6 +25,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(200), nullable=False)
     display_name: Mapped[str] = mapped_column(String(200), default="")
+    session_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -89,6 +91,7 @@ class Job(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "platform", "external_id",
                          name="uq_jobs_user_platform_external"),
+        Index("ix_jobs_tenant_status_fetched", "user_id", "status", "fetched_at"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -222,6 +225,7 @@ class AgencyAuditLog(Base):
     __tablename__ = "agency_audit_log"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     actor: Mapped[str] = mapped_column(String(100), nullable=False)  # agency manager principal
     action: Mapped[str] = mapped_column(String(100), nullable=False)  # e.g. proposal.submit
     target: Mapped[str] = mapped_column(String(500), default="")  # job id / member id
@@ -236,6 +240,8 @@ class PlatformAccount(Base):
     AdapterCredential — no secrets are stored here.
     """
     __tablename__ = "platform_accounts"
+
+    identity_epoch: Mapped[str] = mapped_column(String(36), nullable=False, default=lambda: str(uuid4()))
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = _user_fk()
@@ -273,6 +279,7 @@ class ProposalQueueItem(Base):
     """AI-drafted proposals awaiting mandatory human review."""
     __tablename__ = "proposal_queue"
     __table_args__ = (
+        Index("ix_proposals_tenant_platform_status_id", "user_id", "platform", "status", "id"),
         # one live generated proposal per job — rejected/failed rows may pile
         # up, and follow_up/buyer_request rows share job_id legitimately.
         # Guards the select-then-insert race in generation_gates_pass.
@@ -288,6 +295,9 @@ class ProposalQueueItem(Base):
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), index=True)
     platform: Mapped[str] = mapped_column(String(30), nullable=False)
     proposal_text: Mapped[str] = mapped_column(Text, default="")  # current working text
+    revision: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    approved_snapshot: Mapped[dict | None] = mapped_column(JSONType, nullable=True)
+    platform_account_id: Mapped[int | None] = mapped_column(ForeignKey("platform_accounts.id", name="fk_proposal_account", ondelete="SET NULL"), nullable=True)
     humanized_text: Mapped[str] = mapped_column(Text, default="")  # stealth-typing version
     typing_plan: Mapped[list] = mapped_column(JSONType, default=list)  # typo/correction ops
     bid_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -313,6 +323,8 @@ class ProposalQueueItem(Base):
     # pending | hired | rejected | ghosted
     reviewed_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     submission_result: Mapped[dict] = mapped_column(JSONType, default=dict)
     request_type: Mapped[str] = mapped_column(String(30), default="job")  # job|buyer_request|follow_up
     # when False, approving does NOT mint a new Template (reviewer opt-out)
@@ -395,10 +407,10 @@ class GigMetric(Base):
     user_id: Mapped[int] = _user_fk()
     gig_id: Mapped[int] = mapped_column(ForeignKey("gigs.id", ondelete="CASCADE"), index=True)
     week: Mapped[str] = mapped_column(String(10), nullable=False)  # ISO week, e.g. 2026-W32
-    impressions: Mapped[int] = mapped_column(Integer, default=0)
-    clicks: Mapped[int] = mapped_column(Integer, default=0)
-    orders: Mapped[int] = mapped_column(Integer, default=0)
-    revenue: Mapped[float] = mapped_column(Float, default=0.0)
+    impressions: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    clicks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    orders: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revenue: Mapped[float | None] = mapped_column(Float, nullable=True)
     suggestions: Mapped[list] = mapped_column(JSONType, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -424,6 +436,7 @@ class StealthTask(Base):
     `status=pending`, executes, and posts results back.
     """
     __tablename__ = "stealth_tasks"
+    __table_args__ = (Index("ix_tasks_tenant_platform_status_created", "user_id", "platform", "status", "created_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = _user_fk()
@@ -439,6 +452,7 @@ class StealthTask(Base):
     # pending | claimed | done | failed | skipped_circuit_open
     claimed_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # times the reaper (app.tasks.stealth_reaper_tick) reset a dead worker's
     # claim back to pending; >= STEALTH_MAX_RECLAIMS → failed for good
     reclaim_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0,
@@ -451,6 +465,7 @@ class StealthTask(Base):
 class AuditLog(Base):
     """General audit trail (proposals, gigs, buyer requests, LLM usage)."""
     __tablename__ = "audit_log"
+    __table_args__ = (Index("ix_audit_tenant_action_created", "user_id", "action_type", "created_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = _user_fk()
@@ -476,3 +491,128 @@ def _sync_job_client_key(mapper, connection, target: Job) -> None:
     from .client_intel import client_key_for
 
     target.client_key = client_key_for(target.client_info, target.platform)
+
+
+class AuthTransaction(Base):
+    __tablename__ = "auth_transactions"
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    user_id: Mapped[int] = _user_fk()
+    kind: Mapped[str] = mapped_column(String(30), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONType, default=dict)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class GenerationWork(Base):
+    __tablename__ = "generation_work"
+    __table_args__ = (Index("ix_generation_state_attempts_lease", "state", "attempts", "lease_until"),)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[int] = _user_fk()
+    state: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    lease_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str] = mapped_column(String(500), default="")
+
+
+# Only a confirmed transition receives an observed submission timestamp.
+# Legacy rows remain unknown; approval time is not submission evidence.
+from sqlalchemy import event, inspect
+
+@event.listens_for(ProposalQueueItem, "before_update")
+def _stamp_confirmed_submission(mapper, connection, target):
+    history = inspect(target).attrs.status.history
+    if target.status == "submitted" and history.has_changes() and target.submitted_at is None:
+        target.submitted_at = utcnow()
+
+
+class WorkbenchRecord(Base):
+    __tablename__ = "workbench_records"
+    __table_args__ = (UniqueConstraint("user_id", "reference", name="uq_workbench_reference"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = _user_fk()
+    kind: Mapped[str] = mapped_column(String(30), index=True)
+    reference: Mapped[str | None] = mapped_column(String(250), nullable=True)
+    data: Mapped[dict] = mapped_column(JSONType)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Workspace(Base):
+    __tablename__ = "workspaces"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+
+class WorkspaceMember(Base):
+    __tablename__ = "workspace_members"
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    role: Mapped[str] = mapped_column(String(20))
+    accepted: Mapped[bool] = mapped_column(Boolean, default=False)
+
+class SharedDraft(Base):
+    __tablename__ = "shared_drafts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    creator_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    assignee_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    title: Mapped[str] = mapped_column(String(200))
+    text: Mapped[str] = mapped_column(Text)
+    destination: Mapped[str] = mapped_column(String(2000))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(30), default="pending_review")
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    review_note: Mapped[str] = mapped_column(String(2000), default="")
+
+class WorkspaceEvent(Base):
+    __tablename__ = "workspace_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    action: Mapped[str] = mapped_column(String(30))
+    detail: Mapped[dict] = mapped_column(JSONType, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+@event.listens_for(ProposalQueueItem, "before_insert")
+def _snapshot_new_approval(mapper, connection, target):
+    if target.status == "approved":
+        from .approval import snapshot
+        target.approved_snapshot = snapshot(connection, target)
+
+@event.listens_for(ProposalQueueItem, "before_update")
+def _version_and_snapshot_review(mapper, connection, target):
+    target.revision = (target.revision or 1) + 1
+    changed_status = inspect(target).attrs.status.history.has_changes()
+    if changed_status and target.status == "approved":
+        from .approval import snapshot
+        target.approved_snapshot = snapshot(connection, target)
+    elif target.status == "pending_review":
+        target.approved_snapshot = None
+
+
+@event.listens_for(StealthTask, "before_insert")
+def _bind_task_account(mapper, connection, target):
+    from sqlalchemy import select
+    if (target.payload or {}).get("account_id") is not None:
+        return  # Preserve explicit selection; claim authorization validates ownership.
+    candidates = connection.execute(select(PlatformAccount.id).where(
+        PlatformAccount.user_id == target.user_id, PlatformAccount.platform == target.platform,
+        PlatformAccount.enabled.is_(True), PlatformAccount.mode.in_(["stealth", "hybrid"]),
+    ).limit(2)).scalars().all()
+    if len(candidates) == 1:
+        target.payload = {**(target.payload or {}), "account_id": candidates[0]}
+
+
+class AutomationCircuit(Base):
+    """Durable automation admission state; Redis is not dispatch authority."""
+    __tablename__ = 'automation_circuits'
+    key: Mapped[str] = mapped_column(String(150), primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), nullable=True, index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    state: Mapped[str] = mapped_column(String(20), default='closed')
+    opened_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason: Mapped[str] = mapped_column(Text, default='')
+    manual_stop: Mapped[bool] = mapped_column(Boolean, default=False)
+    trial_until: Mapped[float] = mapped_column(Float, default=0)

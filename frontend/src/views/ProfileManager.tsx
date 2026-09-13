@@ -9,6 +9,8 @@ import {
   getPortfolioItems,
   getProfileTemplates,
   getRateCard,
+  getWritingVoice,
+  saveWritingVoice,
   updatePortfolioItem,
   updateProfileTemplate,
   updateRateCardEntry,
@@ -17,7 +19,7 @@ import type { Platform, PortfolioItem, ProfileTemplate, RateCardEntry } from '..
 import { PLATFORMS } from '../types';
 import { ErrorBanner, Modal, TagInput } from '../components/common';
 
-type Tab = 'templates' | 'portfolio' | 'ratecard';
+type Tab = 'templates' | 'portfolio' | 'ratecard' | 'voice';
 
 export default function ProfileManager() {
   const [tab, setTab] = useState<Tab>('templates');
@@ -46,6 +48,9 @@ export default function ProfileManager() {
       {notice && <div className="info-banner">{notice}</div>}
 
       <div className="tabs">
+        <button className={`tab ${tab === 'voice' ? 'active' : ''}`} onClick={() => setTab('voice')}>
+          My writing voice
+        </button>
         <button className={`tab ${tab === 'templates' ? 'active' : ''}`} onClick={() => setTab('templates')}>
           Profile templates
         </button>
@@ -60,6 +65,7 @@ export default function ProfileManager() {
       {tab === 'templates' && <TemplatesTab setError={setError} flash={flash} />}
       {tab === 'portfolio' && <PortfolioTab setError={setError} flash={flash} />}
       {tab === 'ratecard' && <RateCardTab setError={setError} flash={flash} />}
+      {tab === 'voice' && <VoiceTab setError={setError} flash={flash} />}
     </div>
   );
 }
@@ -67,6 +73,51 @@ export default function ProfileManager() {
 interface TabProps {
   setError: (e: string | null) => void;
   flash: (msg: string) => void;
+}
+
+function VoiceTab({ setError, flash }: TabProps) {
+  const [notes, setNotes] = useState('');
+  const [samples, setSamples] = useState<string[]>([]);
+  const [ready, setReady] = useState(false);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    let active = true;
+    getWritingVoice().then((voice) => {
+      if (!active) return;
+      setNotes(voice.notes); setSamples(voice.samples); setReady(true);
+    }).catch((e: Error) => { if (active) setError(e.message); });
+    return () => { active = false; };
+  }, [setError]);
+  const save = async () => {
+    setSaving(true);
+    try {
+      await saveWritingVoice({ notes, samples: samples.filter((sample) => sample.trim()) });
+      setError(null); flash('Writing voice saved. It will guide newly generated drafts.');
+    } catch (e) { setError((e as Error).message); }
+    finally { setSaving(false); }
+  };
+  return <div className="panel">
+    <h2>Write like me</h2>
+    <p>Describe how you speak and add up to five short messages you wrote. New AI proposals,
+      follow-ups and profile templates use these as style examples. Your portfolio supplies experience and results.</p>
+    <p className="muted">Examples are sent to your configured text provider when generating drafts.
+      Use samples you are comfortable sharing. Saved proposals stay as reviewed.</p>
+    <fieldset disabled={!ready || saving} style={{ border: 0, padding: 0 }}>
+      <div className="field"><label htmlFor="voice-notes">My style</label>
+        <textarea id="voice-notes" maxLength={2000} rows={3} value={notes}
+          placeholder="For example: direct, friendly, short sentences. Avoid sales jargon."
+          onChange={(e) => setNotes(e.target.value)} /></div>
+      {samples.map((sample, index) => <div className="field" key={index}>
+        <label htmlFor={`voice-sample-${index}`}>Writing sample {index + 1}</label>
+        <textarea id={`voice-sample-${index}`} maxLength={2000} rows={4} value={sample}
+          onChange={(e) => setSamples(samples.map((value, i) => i === index ? e.target.value : value))} />
+        <button className="btn secondary small" onClick={() => setSamples(samples.filter((_, i) => i !== index))}>
+          Remove sample {index + 1}</button>
+      </div>)}
+      <button className="btn secondary" disabled={samples.length >= 5} onClick={() => setSamples([...samples, ''])}>Add writing sample</button>{' '}
+      <button className="btn" onClick={save}>{saving ? 'Saving…' : 'Save writing voice'}</button>
+    </fieldset>
+  </div>;
 }
 
 function TemplatesTab({ setError, flash }: TabProps) {

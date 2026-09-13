@@ -66,6 +66,7 @@ def test_password_hash_roundtrip():
 
 
 class _FakeUser:
+    session_version = 0
     id = 42
     email = "jwt@example.com"
 
@@ -177,7 +178,7 @@ def test_per_user_isolation(client, monkeypatch):
     prop_id = alice_props[0]["id"]
     assert c.get(f"/api/proposals/{prop_id}", headers=_auth(bob)).status_code == 404
     assert c.post(f"/api/proposals/{prop_id}/approve", headers=_auth(bob),
-                  json={"reviewer": "bob"}).status_code == 404
+                  json={"expected_revision": 1, "reviewer": "bob"}).status_code == 404
 
     # --- alert settings are per-user ---
     assert c.put("/api/alerts/settings", headers=_auth(alice),
@@ -203,10 +204,11 @@ def test_ws_rejects_missing_or_bad_token(client):
             pass
 
 
-def test_ws_accepts_valid_token(client):
+def test_ws_accepts_valid_ticket(client, redis_up):
     c, _ = client
     token = _register(c, "ws@example.com")["access_token"]
-    with c.websocket_connect(f"/ws/alerts?token={token}") as ws:
+    ticket = c.post("/api/alerts/ws-ticket", headers=_auth(token)).json()["ticket"]
+    with c.websocket_connect(f"/ws/alerts?ticket={ticket}") as ws:
         ws.send_text("ping")  # server keeps the socket open for pings
 
 

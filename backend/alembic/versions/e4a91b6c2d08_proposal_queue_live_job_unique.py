@@ -25,6 +25,15 @@ _PREDICATE = sa.text("status NOT IN ('rejected','failed') AND request_type = 'jo
 
 
 def upgrade() -> None:
+    duplicates = op.get_bind().execute(sa.text(
+        "SELECT job_id, count(*) FROM proposal_queue WHERE status NOT IN ('rejected','failed') "
+        "AND request_type = 'job' GROUP BY job_id HAVING count(*) > 1 LIMIT 20"
+    )).all()
+    if duplicates:
+        raise RuntimeError(
+            f"Duplicate live proposals prevent migration: {duplicates}. Run scripts/deployment_preflight.py "
+            "and reconcile platform evidence before changing statuses; no rows were deleted."
+        )
     op.create_index('uq_proposal_queue_live_job', 'proposal_queue', ['job_id'],
                     unique=True,
                     sqlite_where=_PREDICATE,

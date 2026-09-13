@@ -56,7 +56,9 @@ export function useAlertsSocket({ onMessage, token }: Options = {}) {
         url = `${wsUrl('/ws/alerts')}?ticket=${encodeURIComponent(ticket)}`;
       } catch {
         if (disposed) return;
-        url = `${wsUrl('/ws/alerts')}?token=${encodeURIComponent(token)}`;
+        setStatus('closed');
+        retryTimer = window.setTimeout(connect, 5000);
+        return;
       }
       ws = new WebSocket(url);
 
@@ -171,14 +173,17 @@ export function useNewAlertMessages(
   messages: AlertMessage[],
   handler: (msg: AlertMessage) => void,
 ) {
-  const lastSeenRef = useRef<AlertMessage | null>(null);
+  const lastSeenRef = useRef<AlertMessage | null>(messages[0] ?? null);
   const handlerRef = useRef(handler);
   handlerRef.current = handler;
 
   useEffect(() => {
-    if (messages.length === 0) return;
+    if (messages.length === 0) {
+      lastSeenRef.current = null;
+      return;
+    }
     const prev = lastSeenRef.current;
-    const idx = prev ? messages.indexOf(prev) : 0;
+    const idx = prev ? messages.indexOf(prev) : messages.length;
     // idx === -1: the last-seen message rolled out of the 50-entry cap — catch up from
     // the newest message only rather than replaying history.
     const fresh = idx === -1 ? [messages[0]] : messages.slice(0, idx).reverse();

@@ -195,7 +195,10 @@ async def generateText(
                 },
             )
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise LLMUnavailable(f"{provider} returned invalid JSON") from exc
     except httpx.TimeoutException as exc:
         raise LLMTimeout(f"{provider} timed out after {wait}s") from exc
     except httpx.ConnectError as exc:
@@ -208,7 +211,11 @@ async def generateText(
     latency_ms = int((time.monotonic() - start) * 1000)
     try:
         choice = data["choices"][0]
-        text = choice["message"]["content"] or ""
+        text = choice["message"]["content"]
+        if text is None:
+            text = ""
+        if not isinstance(text, str):
+            raise TypeError("completion content must be text")
     except (KeyError, IndexError, TypeError) as exc:
         raise LLMUnavailable(f"{provider} returned an unexpected payload shape") from exc
 
@@ -229,6 +236,8 @@ async def generateText(
             f"{provider} model '{use_model}' returned only reasoning tokens — "
             "increase OLLAMA_MAX_TOKENS or use a non-reasoning model variant"
         )
+    if not text.strip():
+        raise LLMUnavailable(f"{provider} returned an empty completion")
     return {
         "text": text,
         "model": data.get("model", use_model),

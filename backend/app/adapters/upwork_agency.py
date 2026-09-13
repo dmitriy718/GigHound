@@ -1,21 +1,13 @@
-"""Upwork Agency Plus adapter (compliant hybrid path).
+"""Upwork agency discovery and permission-dependent browser handoff.
 
-Upwork's public GraphQL API is read-only for the application loop: job search
-and job details work, but there is NO mutation for proposal submission.
-The only compliant scaled submission path is the Agency Plus plan, where an
-agency Business Manager submits proposals on behalf of agency freelancers.
-
-This adapter therefore:
-  * uses the official GraphQL API (OAuth 2.0) for discovery;
-  * never submits proposals programmatically against Upwork's web UI itself —
-    `submit_proposal` records an audited, human-review-gated submission request
-    that is handed off to the agency manager's authenticated browser session
-    (the stealth-browser worker picks it up from the pending queue);
-  * stores agency-manager credentials under principal "agency_manager",
-    strictly separate from the freelancer's own credentials;
-  * writes an immutable AgencyAuditLog row for every action.
+API availability and platform permission must be verified for each deployment.
+An agency subscription alone is not evidence of permission for browser automation.
+The adapter records reviewed submission requests and tenant-owned audit events;
+the worker's external-write gate remains independently controlled.
 """
 import logging
+import hashlib
+import copy
 from datetime import datetime, timezone
 
 import httpx
@@ -75,9 +67,14 @@ class UpworkAgencyAdapter(PlatformAdapter):
     platform = "upwork"
     rate_per_sec = 8.0  # Upwork documents 10 req/s per IP; stay under
 
-    def __init__(self, db: Session, user_id: int, client: httpx.AsyncClient | None = None):
-        super().__init__(client, principal=f"user{user_id}:{AGENCY_PRINCIPAL}")
+    def __init__(self, db: Session, user_id: int, client: httpx.AsyncClient | None = None, *, principal: str | None = None):
+        if principal is None:
+            from .accounts import default_principal
+            principal = default_principal(db, user_id, self.platform, AGENCY_PRINCIPAL)
+        super().__init__(client, principal=f"user{user_id}:{principal}")
+        self.account_principal = principal
         self.db = db
+        self.user_id = user_id
         self.vault = CredentialVault(db, user_id)
         self.state = StateStore(db, user_id)
 
@@ -85,21 +82,25 @@ class UpworkAgencyAdapter(PlatformAdapter):
 
     def _audit(self, action: str, target: str = "", detail: dict | None = None):
         self.db.add(AgencyAuditLog(
-            actor=AGENCY_PRINCIPAL, action=action, target=target, detail=detail or {}
+            user_id=self.user_id, actor=self.account_principal, action=action, target=target, detail=detail or {}
         ))
         self.db.commit()
 
     # ---------------- OAuth 2.0 (agency manager account) ----------------
 
     async def _access_token(self) -> str:
-        creds = self.vault.load(self.platform, AGENCY_PRINCIPAL)
+        creds = self.vault.load(self.platform, self.account_principal)
         if not creds:
             raise AdapterAuthError("upwork: no agency_manager credentials in vault")
+        if not creds.get("expires_at"):
+            return creds["access_token"]
         expires_at = datetime.fromisoformat(creds["expires_at"])
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at > datetime.now(timezone.utc):
             return creds["access_token"]
+        if not all(creds.get(k) for k in ("client_id", "client_secret", "refresh_token")):
+            raise AdapterAuthError("upwork: expired token requires refresh metadata; re-enroll credentials")
         resp = await self._request("POST", TOKEN_URL, data={
             "grant_type": "refresh_token",
             "client_id": creds["client_id"],
@@ -115,7 +116,7 @@ class UpworkAgencyAdapter(PlatformAdapter):
                 datetime.now(timezone.utc).timestamp() + expires_in - 60, timezone.utc
             ).isoformat(),
         })
-        self.vault.store(self.platform, AGENCY_PRINCIPAL, creds)
+        self.vault.store(self.platform, self.account_principal, creds)
         self._audit("oauth.token_refresh")
         log.info("upwork: agency manager access token refreshed")
         return creds["access_token"]
@@ -153,29 +154,42 @@ class UpworkAgencyAdapter(PlatformAdapter):
 
     # ---------------- Agency member management ----------------
 
+    @property
+    def _roster_key(self):
+        # Historical unscoped rosters require explicit assignment by their owner.
+        return "agency_roster:" + hashlib.sha256(self.account_principal.encode()).hexdigest()
+
     def list_agency_members(self) -> list[dict]:
-        return self.state.get(self.platform, "agency_roster", {"members": []})["members"]
+        return self.state.get(self.platform, self._roster_key, {"members": []})["members"]
+
+    def _lock_roster(self):
+        from ..models import User
+        owner = self.db.query(User).filter_by(id=self.user_id).populate_existing().with_for_update().one()
+        if not owner.is_active:
+            raise AdapterAuthError('account owner is inactive')
 
     def add_agency_member(self, freelancer_username: str) -> list[dict]:
         """Track a roster addition. The actual invitation must be completed in
         Upwork's UI by the agency manager (Upwork exposes no API for this);
         the roster records intent + audit so the hybrid flow stays consistent.
         """
-        roster = self.state.get(self.platform, "agency_roster", {"members": []})
+        self._lock_roster()
+        roster = copy.deepcopy(self.state.get(self.platform, self._roster_key, {"members": []}))
         if not any(m["username"] == freelancer_username for m in roster["members"]):
             roster["members"].append({
                 "username": freelancer_username,
                 "status": "invitation_pending",
                 "added_at": datetime.now(timezone.utc).isoformat(),
             })
-            self.state.set(self.platform, "agency_roster", roster)
+            self.state.set(self.platform, self._roster_key, roster)
         self._audit("agency.member_add", target=freelancer_username)
         return roster["members"]
 
     def remove_agency_member(self, freelancer_username: str) -> list[dict]:
-        roster = self.state.get(self.platform, "agency_roster", {"members": []})
+        self._lock_roster()
+        roster = copy.deepcopy(self.state.get(self.platform, self._roster_key, {"members": []}))
         roster["members"] = [m for m in roster["members"] if m["username"] != freelancer_username]
-        self.state.set(self.platform, "agency_roster", roster)
+        self.state.set(self.platform, self._roster_key, roster)
         self._audit("agency.member_remove", target=freelancer_username)
         return roster["members"]
 
@@ -183,13 +197,13 @@ class UpworkAgencyAdapter(PlatformAdapter):
 
     def submit_proposal(self, job_external_id: str, proposal_text: str,
                         on_behalf_of: str, connects_required: int = 0,
-                        approved_by: str | None = None) -> dict:
+                        approved_by: str | None = None, *, persist: bool = True) -> dict:
         """Queue an agency-manager proposal submission for browser execution.
 
         Hard requirements (enforced here):
           * `on_behalf_of` must be a current agency roster member;
-          * `approved_by` must be set — Upwork's 2026 AI policy requires
-            human-in-the-loop review before any submission.
+          * `approved_by` must identify the app reviewer. Provider permission
+            is a separate deployment requirement.
 
         Returns the queued submission record; a browser worker with the agency
         manager's authenticated session performs the actual submission and
@@ -215,6 +229,8 @@ class UpworkAgencyAdapter(PlatformAdapter):
             "status": "pending_browser_execution",
             "queued_at": datetime.now(timezone.utc).isoformat(),
         }
+        if not persist:
+            return record
         queue["items"].append(record)
         self.state.set(self.platform, "pending_submissions", queue)
         self._audit("proposal.submit_queued", target=job_external_id, detail={

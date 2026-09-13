@@ -40,15 +40,20 @@ def _manual_assist(task, ctx: HandlerContext, form_key: str,
     shot = ctx.browser.screenshot(page, task.platform, task.user_id,
                                   f"task{task.id}-manual-assist")
     submitted = False
-    if ctx.config.allow_submit_for(task.platform):
+    attempted = ctx.config.allow_submit_for(task.platform)
+    if attempted:
         # explicit operator opt-in: WORKER_ALLOW_SUBMIT[_<PLATFORM>]=1
+        ctx.client.authorize_task(task.id)
+        ctx.external_write_started = True
         page.click(form[submit_gate_selector])
         page.wait_for_load_state("domcontentloaded")
         human_delay(1.5, 3.0)
         raise_if_challenge(page, task.platform)
-        submitted = True
-        log.info("manual-assist task %d SUBMITTED (allow_submit_for(%s))",
-                 task.id, task.platform)
+        # A successful click/load is not proof the platform accepted the offer.
+        from .upwork_proposal import _verify_submission
+        outcome = _verify_submission(page, cfg)
+        submitted = outcome["submitted"]
+        log.info("manual-assist task %d submission verdict: %r", task.id, submitted)
     else:
         log.info("manual-assist task %d filled, awaiting human final submit "
                  "(screenshot %s)", task.id, shot)
@@ -56,10 +61,12 @@ def _manual_assist(task, ctx: HandlerContext, form_key: str,
         "manual_assist": True,
         "filled": True,
         "submitted": submitted,
+        **(outcome if attempted else {"state": "manual_action_required"}),
         "screenshot": shot,
-        "note": (f"submitted under the allow-submit gate for {task.platform}"
-                 if submitted else
-                 "form filled only — a human must click the final submit"),
+        "note": (("Submission confirmed" if submitted is True else
+                  "Check the platform before another submission; this attempt was not confirmed")
+                 if attempted else
+                 "Submit the reviewed text on the platform, then mark it submitted in GigHound"),
     }
 
 

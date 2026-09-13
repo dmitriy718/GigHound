@@ -2,60 +2,103 @@ from datetime import datetime
 from typing import Literal, Optional
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+class BoundedModel(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def bound_payload(cls, data):
+        def check(value, depth=0):
+            if depth > 12:
+                raise ValueError("payload is too deeply nested")
+            if isinstance(value, str) and len(value) > 50000:
+                raise ValueError("text exceeds 50000 characters")
+            if isinstance(value, (list, dict)):
+                if len(value) > 1000:
+                    raise ValueError("collection exceeds 1000 entries")
+                for child in (value.values() if isinstance(value, dict) else value):
+                    check(child, depth + 1)
+        check(data)
+        return data
+
 
 # Canonical platform sets live in app/platforms.py (ALL_PLATFORMS mirrors this
 # Literal; a test keeps them in sync). "indeed" is accepted for forward-compat
 # but served by no subsystem yet.
 Platform = Literal["upwork", "fiverr", "freelancer", "peopleperhour", "guru", "linkedin", "indeed"]
 KeywordKind = Literal["primary", "secondary", "negative"]
-JobType = Literal["fixed", "hourly", "retainer", "contest", "gig"]
+JobType = Literal["fixed", "hourly", "retainer", "contest", "gig", "annual"]
 ExperienceLevel = Literal["entry", "intermediate", "expert"]
 WorkArrangement = Literal["remote", "onsite", "hybrid"]
 
 
 # ---------- Auth ----------
 
-class UserOut(BaseModel):
+class UserOut(BoundedModel):
     id: int
     email: str
     display_name: str
     is_active: bool
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class RegisterIn(BaseModel):
+class RegisterIn(BoundedModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=8, max_length=72)  # 72 = bcrypt input limit
     display_name: str = Field(default="", max_length=200)
 
+    @field_validator("email")
+    @classmethod
+    def canonical_email(cls, value: str) -> str:
+        from .email_identity import normalize_email
+        return normalize_email(value)
 
-class LoginIn(BaseModel):
+    @field_validator("password")
+    @classmethod
+    def password_byte_limit(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 72:
+            raise ValueError("password must be at most 72 UTF-8 bytes")
+        return value
+
+
+class LoginIn(BoundedModel):
     email: str
     password: str
 
 
-class TokenOut(BaseModel):
+class TokenOut(BoundedModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
 
 
-class PasswordChangeIn(BaseModel):
+class PasswordChangeIn(BoundedModel):
     current_password: str
     new_password: str = Field(min_length=8, max_length=72)  # 72 = bcrypt input limit
 
 
-class AccountDeleteIn(BaseModel):
+    @field_validator("new_password")
+    @classmethod
+    def password_byte_limit(cls, value: str) -> str:
+        return RegisterIn.password_byte_limit(value)
+
+
+class SubmissionReconcileIn(BoundedModel):
+    submitted: bool
+    evidence: str = Field(min_length=10, max_length=2000)
+
+
+class AccountDeleteIn(BoundedModel):
     password: str
 
 
 # ---------- Keywords ----------
 
-class KeywordIn(BaseModel):
+class KeywordIn(BoundedModel):
     term: str
     kind: KeywordKind
     weight: float = Field(default=1.0, ge=0.0, le=1.0)
@@ -64,44 +107,42 @@ class KeywordIn(BaseModel):
 class KeywordOut(KeywordIn):
     id: int
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class KeywordGroupIn(BaseModel):
+class KeywordGroupIn(BoundedModel):
     name: str
     service_type: str = ""
     keywords: list[KeywordIn] = []
 
 
-class KeywordGroupOut(BaseModel):
+class KeywordGroupOut(BoundedModel):
     id: int
     name: str
     service_type: str
     created_at: datetime
     keywords: list[KeywordOut] = []
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ---------- Search filters ----------
 
-class ClientFilters(BaseModel):
+class ClientFilters(BoundedModel):
     payment_verified: Optional[bool] = None
     min_hire_rate: Optional[float] = None
     min_total_spent: Optional[float] = None
     countries: list[str] = []
 
 
-class PlatformBudget(BaseModel):
+class PlatformBudget(BoundedModel):
     platform: Platform
     min: Optional[float] = None
     max: Optional[float] = None
     currency: str = "USD"
 
 
-class SearchFilterIn(BaseModel):
+class SearchFilterIn(BoundedModel):
     name: str
     keyword_group_id: Optional[int] = None
     platforms: list[Platform] = []
@@ -121,13 +162,12 @@ class SearchFilterOut(SearchFilterIn):
     id: int
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ---------- Jobs ----------
 
-class ClientInfo(BaseModel):
+class ClientInfo(BoundedModel):
     payment_verified: Optional[bool] = None
     identity_verified: Optional[bool] = None
     hire_rate: Optional[float] = None
@@ -140,7 +180,7 @@ class ClientInfo(BaseModel):
     name: Optional[str] = None       # client display name/username, when exposed
 
 
-class JobIngest(BaseModel):
+class JobIngest(BoundedModel):
     external_id: str
     platform: Platform
     title: str
@@ -168,18 +208,18 @@ class JobIngest(BaseModel):
         return v
 
 
-class IngestJobsIn(BaseModel):
+class IngestJobsIn(BoundedModel):
     jobs: list[JobIngest] = []
 
 
-class ClientHistoryOut(BaseModel):
+class ClientHistoryOut(BoundedModel):
     past_proposals: int
     hired: int
     rejected: int
     ghosted: int
 
 
-class JobOut(BaseModel):
+class JobOut(BoundedModel):
     id: int
     external_id: str
     platform: str
@@ -210,38 +250,37 @@ class JobOut(BaseModel):
     # populated only by GET /api/jobs/{id}; null when this client was never seen
     client_history: Optional[ClientHistoryOut] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class IngestResult(BaseModel):
+class IngestResult(BoundedModel):
     ingested: int
     auto_archived: int
     alerts_sent: int
 
 
-class BulkArchiveAction(BaseModel):
+class BulkArchiveAction(BoundedModel):
     ids: list[int]
 
 
-class ScorePreviewIn(BaseModel):
+class ScorePreviewIn(BoundedModel):
     job: JobIngest
 
 
-class ScorePreviewOut(BaseModel):
+class ScorePreviewOut(BoundedModel):
     quality_score: float
     score_breakdown: dict
     red_flags: list[str]
 
 
-class PreviewResult(BaseModel):
+class PreviewResult(BoundedModel):
     matched: list[JobOut]
     excluded_count: int
 
 
 # ---------- Alerts ----------
 
-class AlertSettingsSchema(BaseModel):
+class AlertSettingsSchema(BoundedModel):
     realtime_enabled: bool = True
     min_score_alert: float = Field(default=70.0, ge=0, le=100)
     digest_mode: Literal["off", "hourly", "daily"] = "off"
@@ -250,13 +289,12 @@ class AlertSettingsSchema(BaseModel):
     hot_job_posted_hours: int = 1         # posted <1 hour ago
     hot_job_min_score: float = Field(default=90.0, ge=0, le=100)  # and score >90
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ---------- Orchestration: search profiles, accounts, proposal queue ----------
 
-class SearchProfileIn(BaseModel):
+class SearchProfileIn(BoundedModel):
     name: str
     keyword_group_id: Optional[int] = None
     filter_id: Optional[int] = None
@@ -268,14 +306,13 @@ class SearchProfileOut(SearchProfileIn):
     id: int
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class PlatformAccountIn(BaseModel):
+class PlatformAccountIn(BoundedModel):
     platform: Platform
-    label: str
-    principal: str = "default"
+    label: str = Field(min_length=1, max_length=200)
+    principal: str = Field(default="default", pattern=r"^[A-Za-z0-9_.@-]{1,100}$")
     mode: Literal["api", "stealth", "hybrid", "disabled"] = "api"
     enabled: bool = True
     credential_ref: str = ""
@@ -288,11 +325,10 @@ class PlatformAccountOut(PlatformAccountIn):
     id: int
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class CredentialsIn(BaseModel):
+class CredentialsIn(BoundedModel):
     """Secret key/value pairs to store in the vault for a platform account.
 
     Recognized keys per platform (others are rejected 422):
@@ -303,23 +339,27 @@ class CredentialsIn(BaseModel):
     secrets: dict[str, str]
 
 
-class CredentialStatusOut(BaseModel):
+class CredentialStatusOut(BoundedModel):
     enrolled: bool
     keys: list[str]
     updated_at: Optional[datetime] = None
 
 
-class OAuthCompleteIn(BaseModel):
-    code: str
+class OAuthCompleteIn(BoundedModel):
+    code: str = Field(min_length=1, max_length=4096)
+    state: str = Field(min_length=20, max_length=200)
     redirect_uri: Optional[str] = None  # defaults to FREELANCER_REDIRECT_URI
 
 
-class BidAdviceOut(BaseModel):
+class BidAdviceOut(BoundedModel):
     recommendation: Literal["bid", "caution", "skip"]
     reason: str
 
 
-class ProposalQueueOut(BaseModel):
+class ProposalQueueOut(BoundedModel):
+    revision: int = 1
+    approved_snapshot: Optional[dict] = None
+    platform_account_id: Optional[int] = None
     id: int
     job_id: int
     platform: str
@@ -341,17 +381,20 @@ class ProposalQueueOut(BaseModel):
     outcome: str = "pending"
     request_type: str = "job"
     reviewed_by: Optional[str]
+    submitted_at: Optional[datetime] = None
+    outcome_at: Optional[datetime] = None
     reviewed_at: Optional[datetime]
     client_replied_at: Optional[datetime] = None
     submission_result: dict
     created_at: datetime
     job: Optional[JobOut] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class ProposalReviewAction(BaseModel):
+class ProposalReviewAction(BoundedModel):
+    platform_account_id: Optional[int] = Field(default=None, ge=1)
+    expected_revision: int = Field(ge=1)
     reviewer: str
     proposal_text: Optional[str] = None   # reviewer may edit before approving
     bid_amount: Optional[float] = None
@@ -363,31 +406,32 @@ class ProposalReviewAction(BaseModel):
     save_as_template: bool = True
 
 
-class ProposalRejectAction(BaseModel):
+class ProposalRejectAction(BoundedModel):
     reviewer: str
     reason: Literal["too_generic", "too_expensive", "wrong_tone", "overpromising", "other"] = "other"
     notes: str = ""
 
 
-class BulkApproveAction(BaseModel):
+class BulkApproveAction(BoundedModel):
+    expected_revisions: dict[int, int]
     ids: list[int]
     reviewer: str
 
 
-class OutcomeAction(BaseModel):
+class OutcomeAction(BoundedModel):
     outcome: Literal["hired", "rejected", "ghosted"]
 
 
-class MarkSubmittedAction(BaseModel):
+class MarkSubmittedAction(BoundedModel):
     channel: Optional[str] = None
 
 
-class InterviewQuestion(BaseModel):
+class InterviewQuestion(BoundedModel):
     question: str
     suggested_answer: str
 
 
-class InterviewPrepOut(BaseModel):
+class InterviewPrepOut(BoundedModel):
     questions: list[InterviewQuestion]
     pain_points: list[str] = []
     red_flags: list[str] = []
@@ -396,7 +440,7 @@ class InterviewPrepOut(BaseModel):
 
 # ---------- Proposal generation v3 / templates / gigs ----------
 
-class TemplateOut(BaseModel):
+class TemplateOut(BoundedModel):
     id: int
     title: str
     platform: str
@@ -409,11 +453,10 @@ class TemplateOut(BaseModel):
     win_rate: float
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class GigTemplateIn(BaseModel):
+class GigTemplateIn(BoundedModel):
     platform: Platform
     name: str
     template_json: dict = {}
@@ -425,11 +468,10 @@ class GigTemplateOut(GigTemplateIn):
     is_active: bool
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class GigOut(BaseModel):
+class GigOut(BoundedModel):
     id: int
     platform: str
     template_id: Optional[int]
@@ -440,21 +482,23 @@ class GigOut(BaseModel):
     price_min: Optional[float]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class StealthTaskClaimIn(BaseModel):
+class StealthTaskClaimIn(BoundedModel):
     worker_id: str
 
 
-class GigMetricIn(BaseModel):
+class GigMetricIn(BoundedModel):
     gig_id: int
-    impressions: int = 0
-    clicks: int = 0
-    orders: int = 0
-    revenue: float = 0.0
-    week: Optional[str] = None
+    impressions: Optional[int] = Field(default=None, ge=0)
+    clicks: Optional[int] = Field(default=None, ge=0)
+    orders: Optional[int] = Field(default=None, ge=0)
+    revenue: Optional[float] = Field(default=None, ge=0)
+    week: Optional[str] = Field(default=None, pattern=r"^\d{4}-W(0[1-9]|[1-4][0-9]|5[0-3])$")
+    task_id: Optional[int] = None
+    worker_id: Optional[str] = None
+    claim_token: Optional[str] = None
 
 
 class GigMetricOut(GigMetricIn):
@@ -462,11 +506,10 @@ class GigMetricOut(GigMetricIn):
     suggestions: list[dict]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class CompetitorSnapshotOut(BaseModel):
+class CompetitorSnapshotOut(BoundedModel):
     id: int
     platform: str
     category: str
@@ -474,13 +517,12 @@ class CompetitorSnapshotOut(BaseModel):
     insights: list[str]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ---------- Profiles ----------
 
-class ProfileTemplateIn(BaseModel):
+class ProfileTemplateIn(BoundedModel):
     platform: Platform
     name: str
     pitch_template: str = ""
@@ -490,11 +532,10 @@ class ProfileTemplateOut(ProfileTemplateIn):
     id: int
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class PortfolioItemIn(BaseModel):
+class PortfolioItemIn(BoundedModel):
     title: str
     description: str = ""
     url: str = ""
@@ -505,11 +546,10 @@ class PortfolioItemOut(PortfolioItemIn):
     id: int
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
-class RateCardIn(BaseModel):
+class RateCardIn(BoundedModel):
     skill_category: str
     hourly_rate: Optional[float] = None
     fixed_min: Optional[float] = None
@@ -519,5 +559,54 @@ class RateCardIn(BaseModel):
 class RateCardOut(RateCardIn):
     id: int
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SeoTitleIn(BoundedModel):
+    title: str = Field(default="", max_length=500)
+    keywords: list[str] = Field(default_factory=list, max_length=100)
+
+
+class FaqGenerateIn(BoundedModel):
+    gig_type: str = Field(default="", max_length=200)
+    title: str = Field(default="", max_length=500)
+    count: int = Field(default=4, ge=1, le=20)
+
+
+class GigRegisterIn(BoundedModel):
+    platform: Platform
+    title: str = Field(default="", max_length=300)
+    external_id: str = Field(default="", max_length=300)
+    url: str = Field(default="", max_length=1000)
+    status: Literal["draft", "active", "paused", "deleted"] = "draft"
+    price_min: float | None = Field(default=None, ge=0, le=100000000)
+    template_id: int | None = Field(default=None, ge=1)
+
+    @field_validator("url")
+    @classmethod
+    def listing_url(cls, value):
+        if value:
+            parsed = urlparse(value)
+            if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+                raise ValueError("listing URL must be an absolute http or https URL")
+        return value
+
+
+class TemplateGenerateIn(BoundedModel):
+    platform: Platform = "upwork"
+    title: str = Field(default="", max_length=500)
+    notes: str = Field(default="", max_length=10000)
+    tone: str = Field(default="", max_length=1000)
+    skills: list[str] = Field(default_factory=list, max_length=100)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    max_tokens: int | None = Field(default=None, ge=1, le=4096)
+    timeout: float | None = Field(default=None, gt=0, le=120)
+    save: bool = False
+
+
+class BooleanValidateIn(BoundedModel):
+    query: str = Field(default="", max_length=10000)
+
+
+class AgencyMemberIn(BoundedModel):
+    username: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.@-]+$")

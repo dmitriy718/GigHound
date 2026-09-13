@@ -1,10 +1,10 @@
-import { Component, useEffect, useState } from 'react';
+import { Component, useEffect, useState, useRef } from 'react';
 import type { ReactNode } from 'react';
 import type { ScoreBreakdown } from '../types';
 
 export function ErrorBanner({ error }: { error: string | null }) {
   if (!error) return null;
-  return <div className="error-banner">{error}</div>;
+  return <div className="error-banner" role="alert">{error}</div>;
 }
 
 interface ErrorBoundaryProps {
@@ -29,7 +29,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     const { error } = this.state;
     if (error) {
       return (
-        <div className="error-banner">
+        <div className="error-banner" role="alert">
           {this.props.label ?? 'This panel'} crashed: {error.message}
           {this.props.reload ? (
             <button
@@ -63,18 +63,37 @@ interface ModalProps {
 }
 
 export function Modal({ title, onClose, children, dirty = false }: ModalProps) {
+  const dialog = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    const focusable = () => Array.from(dialog.current?.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href], [tabindex="0"]'
+    ) ?? []).filter(el => el.getClientRects().length > 0);
+    (focusable()[0] ?? dialog.current)?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (Array.from(document.querySelectorAll('[role="dialog"]')).slice(-1)[0] !== dialog.current) return;
+      if (e.key === 'Escape') { e.preventDefault(); closeRef.current(); }
+      if (e.key === 'Tab') {
+        const items = focusable();
+        const first = items[0], last = items[items.length - 1];
+        if (!first) { e.preventDefault(); dialog.current?.focus(); }
+        else if (e.shiftKey && (document.activeElement === first || !dialog.current?.contains(document.activeElement))) {
+          e.preventDefault(); last?.focus();
+        } else if (!e.shiftKey && (document.activeElement === last || !dialog.current?.contains(document.activeElement))) {
+          e.preventDefault(); first.focus();
+        }
+      }
     };
     document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
+    return () => { document.removeEventListener('keydown', onKey); if (previous?.isConnected) previous.focus(); };
+  }, []);
 
   return (
     <>
       <div className="modal-backdrop" onClick={() => { if (!dirty) onClose(); }} />
-      <div className="modal" role="dialog" aria-modal="true" aria-label={title}>
+      <div ref={dialog} tabIndex={-1} className="modal" role="dialog" aria-modal="true" aria-label={title}>
         <div className="spread" style={{ marginBottom: 14 }}>
           <h2 style={{ margin: 0 }}>{title}</h2>
           <button className="btn secondary small" onClick={onClose}>

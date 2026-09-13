@@ -69,24 +69,24 @@ def search_terms_for_profile(db: Session, profile: SearchProfile) -> list[str]:
 def platforms_for_profile(db: Session, profile: SearchProfile) -> list[str]:
     """Platforms to search: the linked filter's platform list intersected
     with the supported discovery platforms; all of them when unrestricted."""
-    selected: list[str] = []
+    selected: list[str] | None = None
     if profile.filter_id:
         from .models import SearchFilter
         # defense-in-depth: a foreign/missing filter is treated as absent
         flt = db.get(SearchFilter, profile.filter_id)
         if flt and flt.user_id == profile.user_id and flt.platforms:
             selected = [p for p in flt.platforms if p in DISCOVERY_PLATFORMS]
-    if not selected:
+    if selected is None:
         selected = list(DISCOVERY_PLATFORMS)
     return [p for p in selected if platform_enabled(db, profile.user_id, p)]
 
 
-def _acquire_platform_slot(user_id: int, platform: str) -> bool:
+def _acquire_platform_slot(user_id: int, platform: str, profile_id: int | None = None) -> bool:
     """Per-(user, platform) pacing lock. Redis down → proceed (graceful)."""
     if cache._r is None:
         return True
     try:
-        return bool(cache._r.set(f"discovery:{user_id}:{platform}", "1",
+        return bool(cache._r.set(f"discovery:{user_id}:{platform}:{profile_id}", "1",
                                  nx=True, ex=DISCOVERY_LOCK_SECONDS))
     except Exception:  # noqa: BLE001 — pacing must never block discovery
         log.warning("discovery pacing lock unavailable; proceeding")
@@ -95,29 +95,53 @@ def _acquire_platform_slot(user_id: int, platform: str) -> bool:
 
 async def _search_platform(db: Session, user: User, platform: str,
                            terms: list[str]) -> list:
+    from .models import PlatformAccount
+    if platform not in ('freelancer', 'upwork'):
+        return await _search_account(db, user, platform, terms)
+    accounts = db.query(PlatformAccount).filter(
+        PlatformAccount.user_id == user.id, PlatformAccount.platform == platform,
+        PlatformAccount.enabled.is_(True), PlatformAccount.mode != 'disabled'
+    ).order_by(PlatformAccount.id).all()
+    if not accounts:
+        return await _search_account(db, user, platform, terms)
+    postings = []
+    succeeded = False
+    for account in accounts:
+        found = await _search_account(db, user, platform, terms, account.principal)
+        if found is not None:
+            succeeded = True
+            postings.extend(found)
+    return postings if succeeded else None
+
+
+async def _search_account(db: Session, user: User, platform: str,
+                          terms: list[str], principal: str | None = None) -> list:
     """Run the platform adapter's search for each term; auth errors and
     adapter failures skip the platform (logged), never raise."""
     postings = []
-    if platform == "freelancer":
-        adapter = FreelancerAdapter(db, user.id)
-    elif platform == "upwork":
-        adapter = UpworkAgencyAdapter(db, user.id)
-    else:
-        import os
-        adapter = LinkedInJobsAdapter(db, user_id=user.id,
-                                      provider=os.getenv("LINKEDIN_PROVIDER", "theirstack"))
+    adapter = None
     try:
+        if platform == "freelancer":
+            adapter = FreelancerAdapter(db, user.id, **({"principal": principal} if principal is not None else {}))
+        elif platform == "upwork":
+            adapter = UpworkAgencyAdapter(db, user.id, **({"principal": principal} if principal is not None else {}))
+        else:
+            import os
+            adapter = LinkedInJobsAdapter(db, user_id=user.id,
+                                          provider=os.getenv("LINKEDIN_PROVIDER", "theirstack"))
         for term in terms:
             postings.extend(await adapter.search_jobs(term, limit=25))
     except AdapterAuthError as exc:
         log.warning("discovery: skipping %s for user %d (auth): %s",
                     platform, user.id, exc)
-        return []
+        return None
     except AdapterError as exc:
         log.warning("discovery: %s search failed for user %d: %s",
                     platform, user.id, exc)
+        return None
     finally:
-        await adapter.close()
+        if adapter is not None:
+            await adapter.close()
     return postings
 
 
@@ -133,14 +157,19 @@ async def run_profile_discovery(db: Session, user: User,
     terms = search_terms_for_profile(db, profile)
     searched, ingested = [], 0
     for platform in platforms_for_profile(db, profile):
-        if respect_pacing and not _acquire_platform_slot(user.id, platform):
+        if respect_pacing and not _acquire_platform_slot(user.id, platform, profile.id):
             log.info("discovery: %s for user %d skipped (paced)", platform, user.id)
             continue
         postings = await _search_platform(db, user, platform, terms)
+        if postings is None:
+            continue
+        searched.append(platform)
         if not postings:
             continue
         result = await run_ingest(
             IngestJobsIn(jobs=[p.to_ingest() for p in postings]), db, user)
         ingested += result.ingested
-        searched.append(platform)
+    from .models import AuditLog
+    db.add(AuditLog(user_id=user.id,action_type="discovery_succeeded" if searched else "discovery_no_source",platform="local",detail={"profile_id":profile.id,"platforms":searched,"ingested":ingested}))
+    db.commit()
     return {"queued": True, "platforms": searched, "ingested": ingested}

@@ -42,13 +42,14 @@ def canonical_kind(task_type: str) -> str:
 
 
 def enqueue_stealth_task(db: Session, user_id: int, platform: str,
-                         task_type: str, payload: dict) -> StealthTask:
+                         task_type: str, payload: dict, *, commit: bool = True) -> StealthTask:
     """Create a pending stealth task, honoring the platform circuit breaker.
 
+    Pass commit=False when the caller owns the task/proposal transaction.
     When the circuit is open the row is recorded as skipped_circuit_open so
     the kill switch is visible in the UI instead of silently dropping work.
     """
-    allowed, reason = circuit_breaker.check(platform, user_id)
+    allowed, reason = circuit_breaker.check(platform, user_id, db=db)
     task = StealthTask(
         user_id=user_id, platform=platform, task_type=task_type,
         payload=payload,
@@ -56,6 +57,9 @@ def enqueue_stealth_task(db: Session, user_id: int, platform: str,
         result={} if allowed else {"reason": reason},
     )
     db.add(task)
-    db.commit()
-    db.refresh(task)
+    if commit:
+        db.commit()
+        db.refresh(task)
+    else:
+        db.flush()
     return task
