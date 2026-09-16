@@ -11,4 +11,4 @@ cryptography==50.*
 celery==5.6.*
 bcrypt>=4.2,<6
 PyJWT==2.*
-alembic==1.19.*
+alembic==1.20.*
