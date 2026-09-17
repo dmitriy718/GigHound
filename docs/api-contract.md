@@ -128,9 +128,11 @@ Write actions take an APPROVED review-queue item id and send exactly the queued 
 ### WebSocket
 - Auth handshake: `POST /api/alerts/ws-ticket` → `{ticket}` — a one-time, 30s
   ticket (keeps the JWT out of WS query strings / access logs). **503** when
-  the Redis ticket store is down; the client then falls back to the legacy
-  path. Connect `WS /ws/alerts?ticket=<ticket>` — single-use, verified before
-  `accept()`. Legacy fallback: `WS /ws/alerts?token=<jwt>`. Auth failure →
+  the Redis ticket store is down; the client then retries with backoff (no
+  JWT fallback by default). Connect `WS /ws/alerts?ticket=<ticket>` —
+  single-use, verified before `accept()`. Legacy fallback:
+  `WS /ws/alerts?token=<jwt>`, served only when the operator sets
+  `GIGHOUND_WS_TOKEN_FALLBACK=1`. Auth failure →
   close code **4401** (the SPA drops the session, same as a 401).
 - Server pushes JSON messages:
   - `{type: 'job_alert', job: Job}` — high-match job
