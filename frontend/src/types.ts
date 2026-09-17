@@ -360,6 +360,10 @@ export interface ProposalAnalysis {
   red_flags: string[];
   strengths: string[];
   gaps: string[];
+  /** generator provenance: model name, or "offline-composer"/"offline-template"
+   *  when the LLM was unavailable and a deterministic template path produced
+   *  the draft ("heuristic-offline" on legacy rows) */
+  llm_model?: string;
 }
 
 // Template (proposal learning loop — saved on approve, win rate from outcomes)

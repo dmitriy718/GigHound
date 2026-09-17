@@ -661,6 +661,20 @@ export default function ProposalQueue({ messages, status: socketStatus, user }: 
                         {item.needs_review && (
                           <span className="chip flag">needs review</span>
                         )}
+                        {item.analysis.llm_model &&
+                          (item.analysis.llm_model.startsWith('offline') ||
+                            item.analysis.llm_model === 'heuristic-offline' ? (
+                            <span
+                              className="chip flag"
+                              title="The LLM was unreachable, so this draft came from the deterministic template composer — review it as template output, not AI-generated text."
+                            >
+                              template draft — LLM offline
+                            </span>
+                          ) : (
+                            <span className="muted" style={{ fontSize: 12 }}>
+                              drafted by {item.analysis.llm_model}
+                            </span>
+                          ))}
                         {item.analysis.tone && (
                           <span className="muted" style={{ fontSize: 12 }}>
                             tone: {item.analysis.tone}
