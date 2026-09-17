@@ -308,7 +308,11 @@ async def generate_and_queue(db: Session, job: Job, ctx: PipelineContext | None 
     item.bid_rationale = gen["bid_rationale"]
     item.portfolio_item_ids = gen["portfolio_item_ids"]
     item.portfolio_match = gen["portfolio_match"]
-    item.analysis = gen["analysis"]
+    # llm_model rides along in analysis so the review queue can label which
+    # drafts are deterministic offline-composer output (LLM outage) rather
+    # than LLM-generated — the reviewer must see that provenance, not just
+    # the audit log.
+    item.analysis = {**gen["analysis"], "llm_model": gen["llm_model"]}
     item.confidence = gen["confidence"]
     item.needs_review = gen["needs_review"]
     from .client_intel import compute_bid_advice

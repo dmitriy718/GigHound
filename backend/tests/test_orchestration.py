@@ -194,6 +194,29 @@ async def test_maybe_queue_proposal_pipeline(db, user):
     assert await maybe_queue_proposal(db, good) is None
 
 
+@pytest.mark.asyncio
+async def test_queued_item_records_generator_provenance(db, user, monkeypatch):
+    """The review queue must be able to label offline-composer (template)
+    drafts: llm_model is persisted into the item's analysis, not only the
+    audit log, so the reviewer sees when the LLM was down."""
+    monkeypatch.setattr("app.proposal_gen.llm.llm_available", lambda: False)
+    _seed_profile_assets(db, user.id)
+    db.add(SearchProfile(user_id=user.id, name="react only",
+                         boolean_query="(React OR Next.js) AND (NOT WordPress)",
+                         auto_queue_proposals=True))
+    good = Job(user_id=user.id, external_id="prov-1", platform="upwork",
+               title="React app", skills=["React"], description="react work",
+               status="new", job_type="fixed")
+    db.add(good)
+    db.commit()
+
+    item = await maybe_queue_proposal(db, good)
+    assert item is not None
+    # seeded ProfileTemplate for upwork → deterministic template path
+    assert item.analysis["llm_model"] == "offline-template"
+
+
+
 def test_generation_gate_refuses_negative_keyword_excluded(db, user):
     excluded = Job(user_id=user.id, external_id="neg-g1", platform="upwork",
                    title="WordPress site", description="wordpress work",

@@ -461,12 +461,14 @@ async def generate(db: Session, job: Job, *, sender_name: str = "GigHound user",
                 tpl.pitch_template, job, analysis, match,
                 rate_line=rate_line, bid_amount=bid_amount,
                 bid_days=bid_days, sender_name=sender_name)
+            meta = {**meta, "model": "offline-template"}
         else:
             from .antidetect import pick_opening
             opening = pick_opening(title=job.title,
                                    tech=(analysis.get("required_skills") or [""])[0])
             draft = _generate_offline(job.platform, job, analysis, match,
                                       opening, bid_amount)
+            meta = {**meta, "model": "offline-composer"}
 
     # Output filter (both paths): a draft that leaks prompt internals is
     # stripped and forced through human review before it can be approved.

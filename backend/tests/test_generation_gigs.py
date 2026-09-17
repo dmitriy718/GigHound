@@ -16,8 +16,8 @@ from app.gig_templates import (create_template, generate_faqs, seo_title_score,
                                validate_fiverr_template)
 from app.auth import hash_password
 from app.models import (AuditLog, Gig, GigTemplate, Job, PortfolioItem,
-                        ProposalQueueItem, RateCardEntry, StealthTask, Template,
-                        User)
+                        ProfileTemplate, ProposalQueueItem, RateCardEntry,
+                        StealthTask, Template, User)
 from app.proposal_gen import (_heuristic_analysis, analyze_job, calculate_bid,
                               generate)
 from app.templates import (generation_tuning, record_outcome, record_rejection,
@@ -179,8 +179,23 @@ async def test_generate_offline_pipeline(db, job):
     assert 0 <= result["confidence"] <= 100
     assert result["analysis"]["required_skills"]
     assert result["latency_ms"] >= 0
+    # provenance: no LLM and no user template → the deterministic composer
+    assert result["llm_model"] == "offline-composer"
     # upwork profile: no numbered lists, contains a question
     assert "?" in result["draft_text"]
+
+
+@pytest.mark.asyncio
+async def test_generate_offline_with_user_template_labels_provenance(db, job, user):
+    """An LLM-outage draft rendered from the user's own pitch template is
+    labeled offline-template — never mistaken for LLM output."""
+    db.add(ProfileTemplate(user_id=user.id, platform="upwork", name="pitch",
+                           pitch_template="Hi {{client_name}}, re {{job_title}}: "
+                                          "{{deliverable}} — {{portfolio_piece}}. "
+                                          "{{rate_line}}. {{your_name}}"))
+    db.commit()
+    result = await generate(db, job)
+    assert result["llm_model"] == "offline-template"
 
 
 @pytest.mark.asyncio
