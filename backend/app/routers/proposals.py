@@ -290,7 +290,10 @@ async def draft_follow_up(item_id: int, db: Session = Depends(get_db), user: Use
         proposal_text=gen["humanized_text"] or gen["draft_text"],
         humanized_text=gen["humanized_text"],
         typing_plan=gen["typing_plan"],
-        analysis=item.analysis or {},
+        # the parent's analysis carries over, minus its llm_model — that label
+        # describes the parent's generator, and follow-up generation doesn't
+        # record its own provenance, so showing it here would mislabel
+        analysis={k: v for k, v in (item.analysis or {}).items() if k != "llm_model"},
         portfolio_item_ids=list(item.portfolio_item_ids or []),
         portfolio_match=item.portfolio_match or {},
         confidence=item.confidence,
