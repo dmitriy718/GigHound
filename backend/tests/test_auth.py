@@ -203,7 +203,21 @@ def test_ws_rejects_missing_or_bad_token(client):
             pass
 
 
-def test_ws_accepts_valid_token(client):
+def test_ws_query_token_rejected_by_default(client):
+    """Fail-closed default: a valid session JWT in ?token= is NOT accepted —
+    tokens in query strings land in access logs. Auth is the one-time ticket
+    (or GIGHOUND_WS_TOKEN_FALLBACK=1 as an explicit operator trade-off)."""
+    c, _ = client
+    token = _register(c, "ws-default@example.com")["access_token"]
+    with pytest.raises(WebSocketDisconnect):
+        with c.websocket_connect(f"/ws/alerts?token={token}"):
+            pass
+
+
+def test_ws_accepts_valid_token_with_legacy_fallback(client, monkeypatch):
+    """The legacy ?token= path still works when the operator opts in via
+    GIGHOUND_WS_TOKEN_FALLBACK=1 (bound into the alerts router at import)."""
+    monkeypatch.setattr("app.routers.alerts.WS_TOKEN_FALLBACK", True)
     c, _ = client
     token = _register(c, "ws@example.com")["access_token"]
     with c.websocket_connect(f"/ws/alerts?token={token}") as ws:

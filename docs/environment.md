@@ -57,8 +57,10 @@ Until re-enrollment, credential-dependent adapters fail with an auth error.
 Every row in the tenant-owned tables carries `user_id`; all API endpoints
 except the public-by-design ones (`GET /api/health`, `POST /api/auth/register`,
 `POST /api/auth/login`) require `Authorization: Bearer <jwt>`. The WebSocket
-`/ws/alerts` takes the token as `?token=` (browsers can't set WS headers) and
-broadcasts are per-user. `POST /api/auth/password` (change password) and
+`/ws/alerts` authenticates via a one-time 30-second ticket (`POST
+/api/alerts/ws-ticket`, then `/ws/alerts?ticket=`) so the session JWT never
+appears in a query string (access logs); broadcasts are per-user.
+`POST /api/auth/password` (change password) and
 `DELETE /api/auth/account` (password-verified account deletion; every tenant
 FK is `ON DELETE CASCADE`, so the user-row delete wipes all tenant data) are
 JWT-protected and drive the user-menu account flows in the SPA.
@@ -68,6 +70,7 @@ JWT-protected and drive the user-menu account flows in the SPA.
 | `GIGHOUND_SECRET_KEY` | — | HS256 JWT signing secret (12h access tokens). Startup **fails fast** when unset, unless `GIGHOUND_DEV_NOAUTH=1`. |
 | `GIGHOUND_DEV_NOAUTH` | off | `1` disables auth: every request runs as a single implicit dev user (`dev@gighound.local`). Local development only — never set in production. |
 | `GIGHOUND_ALLOW_REGISTRATION` | `true` | `false` closes `POST /api/auth/register` (self-hosted default is open; set false for a closed SaaS). |
+| `GIGHOUND_WS_TOKEN_FALLBACK` | off | `1` re-enables the legacy `/ws/alerts?token=<jwt>` auth path for when the Redis ticket store is down. Off by default: a JWT in a query string lands in access/proxy logs, so with the flag unset the WS simply stays unavailable (client retries with backoff) until the ticket store recovers. |
 | `GIGHOUND_WORKER_TOKEN` | — | Shared token for the stealth-browser worker pool (AD-4), separate from user JWTs. Gates stealth-task claim/complete and worker result-posting endpoints; startup **fails fast** when unset, unless `GIGHOUND_DEV_NOAUTH=1`. Set the same value in the worker's environment (see `worker/README.md`). |
 
 Schema is managed by Alembic: run `alembic upgrade head` (from `backend/`)

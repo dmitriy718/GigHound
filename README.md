@@ -143,9 +143,11 @@ for the full reference and run modes. Key variables:
   item; the Upwork adapter requires `approved_by`; there is no free-text
   submission endpoint. This is a deliberate product invariant, not a config.
 - **Auth**: every endpoint except `/api/health`, `/api/auth/register` and
-  `/api/auth/login` requires a Bearer JWT; the WebSocket authenticates via
-  `?token=` before `accept()`. The user menu offers password change and
-  password-verified account deletion (cascades to all tenant data).
+  `/api/auth/login` requires a Bearer JWT; the WebSocket authenticates via a
+  one-time 30s ticket (`?ticket=`) before `accept()` — the legacy `?token=`
+  JWT path is off unless `GIGHOUND_WS_TOKEN_FALLBACK=1` is set explicitly.
+  The user menu offers password change and password-verified account
+  deletion (cascades to all tenant data).
 - **Credential vault**: platform credentials are Fernet-encrypted at rest,
   per-user scoped; without `GIGHOUND_VAULT_KEY` the vault fails fast.
 - **Broker hardening**: Celery accepts JSON only (no pickle); Postgres and

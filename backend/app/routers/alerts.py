@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from ..auth import (get_current_user, get_or_create_dev_user,
                     get_user_from_token)
 from ..cache import cache
-from ..config import DEV_NOAUTH
+from ..config import DEV_NOAUTH, WS_TOKEN_FALLBACK
 from ..database import get_db
 from ..models import AlertSettings, Job, User
 from ..schemas import AlertSettingsSchema, JobOut
@@ -80,7 +80,8 @@ def digest_send(db: Session = Depends(get_db), user: User = Depends(get_current_
 def issue_ws_ticket(user: User = Depends(get_current_user)):
     """One-time, 30s ticket for WS auth — keeps the JWT out of query strings
     (access logs). 503 when the Redis ticket store is down; the client then
-    falls back to the legacy ?token= JWT path."""
+    retries with backoff (the legacy ?token= JWT path is only served when the
+    operator explicitly enables GIGHOUND_WS_TOKEN_FALLBACK=1)."""
     if cache._client() is None:
         raise HTTPException(503, "ws ticket store unavailable")
     ticket = secrets.token_urlsafe(32)
@@ -116,8 +117,10 @@ async def alerts_ws(ws: WebSocket, token: str | None = Query(None),
                     db: Session = Depends(get_db)):
     """Browser WS can't set headers, so auth arrives as a one-time ?ticket=
     (from POST /api/alerts/ws-ticket), verified before accept(). The legacy
-    ?token= JWT path is kept as a fallback for when the Redis ticket store
-    is down. GIGHOUND_DEV_NOAUTH=1 skips the check."""
+    ?token= JWT path exists only for deployments that set
+    GIGHOUND_WS_TOKEN_FALLBACK=1 — a JWT in a query string lands in access
+    logs, so the default is fail-closed. GIGHOUND_DEV_NOAUTH=1 skips the
+    check."""
     if DEV_NOAUTH:
         user = get_or_create_dev_user(db)
     else:
@@ -127,7 +130,7 @@ async def alerts_ws(ws: WebSocket, token: str | None = Query(None),
             candidate = db.get(User, ticket_user_id)
             if candidate and candidate.is_active:
                 user = candidate
-        if user is None:
+        if user is None and WS_TOKEN_FALLBACK:
             user = get_user_from_token(db, token)
         if user is None:
             await ws.close(code=4401)

@@ -26,3 +26,11 @@ ALLOW_REGISTRATION = os.getenv("GIGHOUND_ALLOW_REGISTRATION", "true").lower() in
 # Shared deployment-level token authenticating the browser worker pool.
 # Separate from user JWTs; mandatory outside dev (see auth.validate_auth_config).
 WORKER_TOKEN = os.getenv("GIGHOUND_WORKER_TOKEN")
+
+# --- WebSocket auth ---
+# Legacy fallback: accept the session JWT as ?token= on /ws/alerts when the
+# Redis ticket store is down. Off by default — a JWT in a query string lands
+# in access/proxy logs. The preferred path is the one-time 30s ticket
+# (POST /api/alerts/ws-ticket). Set to 1 only as a deliberate, temporary
+# availability trade-off while the ticket store is unreliable.
+WS_TOKEN_FALLBACK = os.getenv("GIGHOUND_WS_TOKEN_FALLBACK") == "1"

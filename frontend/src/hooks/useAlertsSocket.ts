@@ -48,15 +48,22 @@ export function useAlertsSocket({ onMessage, token }: Options = {}) {
       setStatus('connecting');
       let url: string;
       try {
-        // Preferred path: one-time ticket, so the JWT never lands in the WS
-        // query string (access logs). Falls back to the legacy ?token= URL
-        // when the ticket store is unavailable (Redis down).
+        // One-time ticket only: the session JWT must never land in the WS
+        // query string (access logs). When the ticket store is unavailable
+        // (Redis down) there is deliberately no ?token= fallback — the socket
+        // stays closed and the backoff loop retries until tickets work again.
         const { ticket } = await getWsTicket();
         if (disposed) return;
         url = `${wsUrl('/ws/alerts')}?ticket=${encodeURIComponent(ticket)}`;
       } catch {
         if (disposed) return;
-        url = `${wsUrl('/ws/alerts')}?token=${encodeURIComponent(token)}`;
+        // no JWT fallback — stay closed and retry the ticket path with the
+        // same backoff the reconnect loop uses
+        setStatus('closed');
+        const delay = Math.min(1000 * 2 ** attempts, 30_000);
+        attempts += 1;
+        retryTimer = window.setTimeout(connect, delay);
+        return;
       }
       ws = new WebSocket(url);
 
