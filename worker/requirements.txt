@@ -1,4 +1,4 @@
-playwright==1.62.*
+playwright==1.63.*
 httpx==0.28.*
 pydantic==2.*
 python-dotenv==1.2.*
